@@ -1,6 +1,6 @@
 allprojects {
     plugins.withId("com.vanniktech.maven.publish.base") {
-        // JitPack sets VERSION to the git tag (e.g. v1.0.0). The leading v is
+        // The release workflow sets VERSION to the git tag (e.g. v1.0.0). The leading v is
         // stripped so the POM carries 1.0.0. Without VERSION the default is kept.
         String envVersion = System.getenv("VERSION")
         String defaultVersion = "0.7.0"
@@ -18,7 +18,7 @@ allprojects {
             publishToMavenCentral("CENTRAL_PORTAL", true)
 
             // Signing is applied only when signing credentials are configured,
-            // so local and JitPack builds (publishToMavenLocal) need no keys.
+            // so local and CI builds (publishToMavenLocal, GhPages) need no keys.
             String signingKey = project.findProperty("signingInMemoryKey") as String
             String signingKeyId = project.findProperty("signing.keyId") as String
             boolean hasSigningCredentials = signingKey || signingKeyId

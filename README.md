@@ -1,6 +1,13 @@
-# centrifuge-java
+# ImpulseM.Centrifugo.Client.Java
 
-Websocket client for [Centrifugo](https://github.com/centrifugal/centrifugo) server and [Centrifuge](https://github.com/centrifugal/centrifuge) library.
+Android and Java client for the ImpulseM build of [Centrifugo](https://github.com/Impulse-m/ImpulseM.Centrifugo) (Docker: `ghcr.io/impulse-m/impulsem.centrifugo`).
+
+This is the ImpulseM fork of [centrifuge-java](https://github.com/centrifugal/centrifuge-java). The API matches upstream.
+
+Sibling ImpulseM SDKs:
+
+- JavaScript: [ImpulseM.Centrifugo.Client.JS](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.JS), npm `@impulsem/centrifuge`
+- Swift: [ImpulseM.Centrifugo.Client.Swift](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Swift), Swift Package Manager
 
 There is no v1 release of this library yet – API still evolves. At the moment patch version updates only contain backwards compatible changes, minor version updates can have backwards incompatible API changes.
 
@@ -12,19 +19,41 @@ The features implemented by this SDK can be found in [SDK feature matrix](https:
 
 ## Installation
 
-Library available in Maven: https://search.maven.org/artifact/io.github.centrifugal/centrifuge-java
+The library is published to a Maven repository hosted on GitHub Pages. No account or token is needed.
 
-This library depends on `streamsupport-minifuture`. In case your project has a dependency to `streamsupport-cfuture` and you have a class name conflicts, you can exclude minifuture safely. Example for Gradle: 
+Gradle (Groovy DSL):
+
+```groovy
+repositories {
+    maven { url "https://impulse-m.github.io/ImpulseM.Centrifugo.Client.Java/" }
+}
+
+dependencies {
+    implementation "com.github.Impulse-m:ImpulseM.Centrifugo.Client.Java:1.0.0"
+}
+```
+
+Gradle (Kotlin DSL):
+
+```kotlin
+repositories {
+    maven("https://impulse-m.github.io/ImpulseM.Centrifugo.Client.Java/")
+}
+```
+
+Released versions are listed in [GitHub Releases](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/releases). Each release is also available in the Maven repository above, with sources and Javadoc jars alongside the library.
+
+This library depends on `streamsupport-minifuture`. In case your project has a dependency to `streamsupport-cfuture` and you have a class name conflicts, you can exclude minifuture safely. Example for Gradle:
 
 ```
-implementation('io.github.centrifugal:centrifuge-java:{version}') {
+implementation('com.github.Impulse-m:ImpulseM.Centrifugo.Client.Java:{version}') {
     exclude group: 'net.sourceforge.streamsupport', module: 'streamsupport-minifuture'
 }
 ```
 
-## Javadoc online
+## Javadoc
 
-http://www.javadoc.io/doc/io.github.centrifugal/centrifuge-java
+Javadoc is published as `ImpulseM.Centrifugo.Client.Java-{version}-javadoc.jar` in the Maven repository above.
 
 ## Obfuscation with ProGuard
 
@@ -49,7 +78,7 @@ Starting in `0.6.0`, an `Error` (e.g. `NoSuchMethodError`) thrown from generated
 
 ## Basic usage
 
-See example code in [console Java example](https://github.com/centrifugal/centrifuge-java/blob/master/example/src/main/java/io/github/centrifugal/centrifuge/example/Main.java) or in [demo Android app](https://github.com/centrifugal/centrifuge-java/blob/master/demo/src/main/java/io/github/centrifugal/centrifuge/demo/MainActivity.java)
+See example code in [console Java example](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/blob/master/example/src/main/java/io/github/centrifugal/centrifuge/example/Main.java) or in [demo Android app](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/blob/master/demo/src/main/java/io/github/centrifugal/centrifuge/demo/MainActivity.java)
 
 To use with Android don't forget to set INTERNET permission to `AndroidManifest.xml`:
 
@@ -63,7 +92,7 @@ When a mobile application goes to the background there are OS-specific limitatio
 
 ## CI status
 
-[![Build Status](https://travis-ci.org/centrifugal/centrifuge-java.svg)](https://travis-ci.org/centrifugal/centrifuge-java)
+[![Test](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/actions/workflows/ci.yml/badge.svg)](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/actions/workflows/ci.yml)
 
 ## License
 
@@ -118,43 +147,27 @@ To verify API compatibility locally, run the following command:
 
 ### Automatic publishing
 
-1. Bump version in `publish-setup.gradle`. 
-2. Create new library tag.
+Run the `release` workflow from the Actions tab (`workflow_dispatch`, input `version` without the `v`, e.g. `1.1.0`), or push a `v*` tag. The workflow:
 
-The release GitHub Action should now publish the library.
+1. Validates the version and runs the tests.
+2. Builds the artifacts.
+3. Publishes the Maven repository to the `gh-pages` branch and pushes it.
+4. Waits until the POM is served at https://impulse-m.github.io/ImpulseM.Centrifugo.Client.Java/.
+5. Creates the tag (manual dispatch only) and the GitHub Release.
 
-### Manual publishing
+GitHub Pages must be enabled for this repository with source "Deploy from a branch" and branch `gh-pages`.
 
-Do all steps from the automatic publishing. Create configuration file `gradle.properties` in `GRADLE_USER_HOME`:
+Maven versions are immutable: a version that already exists in `gh-pages` is refused, so bump the version first.
 
-```properties
-signing.keyId=<LAST_8_SYMBOLS_OF_KEY_ID>
-signing.password=<PASSWORD>
-signing.secretKeyRingFile=/Path/to/.gnupg/secring.gpg
+### Publishing locally
 
-mavenCentralUsername=<USERNAME>
-mavenCentralPassword=<PASSWORD>
-```
-
-Then run:
+Publish into a local checkout of the `gh-pages` branch, or any directory, with:
 
 ```shell
-./gradlew publish --no-daemon --no-parallel
-./gradlew closeAndReleaseRepository
+VERSION=v1.1.0 ./gradlew :centrifuge:publishAllPublicationsToGhPagesRepository -PghPagesRepo=/path/to/gh-pages
 ```
 
-The second command will promote staged release to production on MavenCentral.
-
-You can do it manually by following the instructions:
-
-https://central.sonatype.org/pages/releasing-the-deployment.html
-
-I.e.
-
-1) Login here: https://oss.sonatype.org/
-2) Go to `Staging repositories`
-3) Find release, push `Close` button, wait
-4) Push `Release` button
+`-PghPagesRepo` (or the `GH_PAGES_REPO` environment variable) defaults to `centrifuge/build/gh-pages-maven`.
 
 ## Special thanks
 

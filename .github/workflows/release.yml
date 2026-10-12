@@ -12,7 +12,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
@@ -89,6 +89,8 @@ jobs:
     name: Test
     needs:
       - validate
+    permissions:
+      contents: read
     uses: ./.github/workflows/ci.yml
 
   build:
@@ -97,6 +99,8 @@ jobs:
       - validate
       - test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       VERSION: ${{ needs.validate.outputs.version }}
     steps:
@@ -120,13 +124,135 @@ jobs:
           path: centrifuge/build/libs/*.jar
           if-no-files-found: error
 
+  publish:
+    name: Publish to GitHub Pages Maven repository
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      PAGES_DIR: gh-pages
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Create gh-pages branch if missing
+        run: |
+          set +e
+          git ls-remote --exit-code --heads origin gh-pages >/dev/null
+          rc=$?
+          set -e
+
+          if [ "$rc" -eq 0 ]; then
+            echo "gh-pages branch already exists."
+            exit 0
+          fi
+          if [ "$rc" -ne 2 ]; then
+            echo "::error::Could not query origin for the gh-pages branch (exit ${rc})."
+            exit 1
+          fi
+
+          # Orphan commit containing only .nojekyll, so Pages serves the
+          # Maven layout as-is (no Jekyll processing).
+          blob="$(printf '' | git hash-object -w --stdin)"
+          tree="$(printf '100644 blob %s\t.nojekyll\n' "$blob" | git mktree)"
+          commit="$(git -c user.name=github-actions[bot] -c user.email=41898282+github-actions[bot]@users.noreply.github.com commit-tree "$tree" -m "Initialize gh-pages")"
+          git push origin "${commit}:refs/heads/gh-pages"
+
+      - name: Check out gh-pages
+        uses: actions/checkout@v6
+        with:
+          ref: gh-pages
+          path: ${{ env.PAGES_DIR }}
+
+      - name: Refuse to overwrite an existing version
+        run: |
+          target="${PAGES_DIR}/com/github/Impulse-m/ImpulseM.Centrifugo.Client.Java/${VERSION}"
+          if [ -e "$target" ]; then
+            echo "::error::Version ${VERSION} is already published in gh-pages. Maven versions are immutable; bump the version."
+            exit 1
+          fi
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Publish to gh-pages directory
+        run: >-
+          ./gradlew :centrifuge:publishAllPublicationsToGhPagesRepository
+          --no-daemon
+          -PghPagesRepo="${GITHUB_WORKSPACE}/${PAGES_DIR}"
+
+      - name: Commit and push gh-pages
+        working-directory: ${{ env.PAGES_DIR }}
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::error::Publishing ${VERSION} produced no changes."
+            exit 1
+          fi
+          git -c user.name=github-actions[bot] -c user.email=41898282+github-actions[bot]@users.noreply.github.com commit -m "Publish ${VERSION}"
+          git push origin HEAD:gh-pages
+
+  verify:
+    name: Verify GitHub Pages artifact
+    needs:
+      - validate
+      - publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check that GitHub Pages is enabled
+        run: |
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pages" || true)"
+          if [ "$code" = "404" ]; then
+            echo "::error::GitHub Pages is not enabled for ${GITHUB_REPOSITORY}. Enable it under Settings > Pages with source 'Deploy from a branch' and branch 'gh-pages', then re-run this workflow."
+            exit 1
+          fi
+          echo "GitHub Pages API responded with HTTP ${code}."
+
+      - name: Wait for the POM to be served
+        run: |
+          pom="https://impulse-m.github.io/ImpulseM.Centrifugo.Client.Java/com/github/Impulse-m/ImpulseM.Centrifugo.Client.Java/${VERSION}/ImpulseM.Centrifugo.Client.Java-${VERSION}.pom"
+          deadline=$((SECONDS + 600))
+
+          # Pages deploys asynchronously after the push, so poll until served.
+          while true; do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "$pom" || true)"
+            echo "POM HTTP ${code}: ${pom}"
+            if [ "$code" = "200" ]; then
+              exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Timed out after 10 minutes waiting for ${pom} (last HTTP ${code})."
+              exit 1
+            fi
+            sleep 15
+          done
+
   tag:
     name: Create tag
     needs:
       - validate
       - build
+      - verify
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       VERSION: ${{ needs.validate.outputs.version }}
     steps:
@@ -138,65 +264,18 @@ jobs:
           git tag "v${VERSION}" "$GITHUB_SHA"
           git push origin "refs/tags/v${VERSION}"
 
-  jitpack:
-    name: Verify JitPack build
-    needs:
-      - validate
-      - build
-      - tag
-    # tag is skipped for tag pushes, which is still a valid path.
-    if: ${{ always() && needs.build.result == 'success' && (needs.tag.result == 'success' || needs.tag.result == 'skipped') }}
-    runs-on: ubuntu-latest
-    env:
-      VERSION: ${{ needs.validate.outputs.version }}
-    steps:
-      - name: Wait for JitPack build
-        run: |
-          base="https://jitpack.io/com/github/Impulse-m/ImpulseM.Centrifugo.Client.Java/v${VERSION}"
-          api="https://jitpack.io/api/builds/com.github.Impulse-m/ImpulseM.Centrifugo.Client.Java/v${VERSION}"
-          pom="${base}/ImpulseM.Centrifugo.Client.Java-v${VERSION}.pom"
-          deadline=$((SECONDS + 1200))
-
-          # The API request also triggers the JitPack build on first call.
-          while true; do
-            body="$(curl -sS --max-time 60 "$api" || true)"
-            status="$(printf '%s' "$body" | jq -r '.status // "unknown"' 2>/dev/null || echo unknown)"
-            echo "JitPack status: ${status}"
-            if [ "$status" = "ok" ]; then
-              break
-            fi
-            if [ "$status" = "error" ]; then
-              echo "::error::JitPack build for v${VERSION} failed. Log: ${base}/build.log"
-              printf '%s\n' "$body"
-              exit 1
-            fi
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::Timed out waiting for JitPack build of v${VERSION} (last status: ${status})."
-              exit 1
-            fi
-            sleep 30
-          done
-
-          # Status ok does not guarantee the POM is served yet, so poll it too.
-          for attempt in $(seq 1 20); do
-            code="$(curl -s -o /dev/null -w '%{http_code}' "$pom" || true)"
-            if [ "$code" = "200" ]; then
-              echo "JitPack artifact available: ${pom}"
-              exit 0
-            fi
-            echo "POM not yet available (HTTP ${code}), attempt ${attempt}/20"
-            sleep 15
-          done
-          echo "::error::JitPack reported ok but POM ${pom} is not served."
-          exit 1
-
   release:
     name: Tag and publish release
     needs:
       - validate
       - build
-      - jitpack
+      - verify
+      - tag
+    # tag is skipped for tag pushes, which is still a valid path.
+    if: ${{ always() && needs.build.result == 'success' && needs.verify.result == 'success' && (needs.tag.result == 'success' || needs.tag.result == 'skipped') }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       VERSION: ${{ needs.validate.outputs.version }}
       PRERELEASE: ${{ needs.validate.outputs.prerelease }}

@@ -18,8 +18,19 @@ mavenPublishing {
 
 publishing {
     publications.all {
-        // JitPack resolves single-module builds as <group>:<repo name>.
+        // Coordinates stay stable across releases: <group>:ImpulseM.Centrifugo.Client.Java.
         artifactId = 'ImpulseM.Centrifugo.Client.Java'
+    }
+
+    repositories {
+        // Plain Maven layout written to a local directory. The release workflow
+        // points this at a checkout of the gh-pages branch, which GitHub Pages
+        // serves as the consumer-facing Maven repository.
+        maven {
+            name = 'GhPages'
+            String repoPath = project.findProperty('ghPagesRepo') ?: System.getenv('GH_PAGES_REPO') ?: "${layout.buildDirectory.get().asFile}/gh-pages-maven"
+            url = new File(repoPath).toURI()
+        }
     }
 }
 
