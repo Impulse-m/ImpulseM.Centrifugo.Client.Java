@@ -18,7 +18,8 @@ mavenPublishing {
 
 publishing {
     publications.all {
-        artifactId = 'centrifuge-java'
+        // JitPack resolves single-module builds as <group>:<repo name>.
+        artifactId = 'ImpulseM.Centrifugo.Client.Java'
     }
 }
 

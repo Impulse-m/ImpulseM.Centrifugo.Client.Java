@@ -1,7 +1,13 @@
 allprojects {
     plugins.withId("com.vanniktech.maven.publish.base") {
-        project.group = "io.github.centrifugal"
-        project.version = "0.7.0"
+        // JitPack sets VERSION to the git tag (e.g. v1.0.0). The leading v is
+        // stripped so the POM carries 1.0.0. Without VERSION the default is kept.
+        String envVersion = System.getenv("VERSION")
+        String defaultVersion = "0.7.0"
+        String resolvedVersion = envVersion ? envVersion.trim().replaceFirst(/^v/, '') : defaultVersion
+
+        project.group = "com.github.Impulse-m"
+        project.version = resolvedVersion
 
         mavenPublishing {
             // Sonatype Central Portal (replaces legacy OSSRH). The boolean
@@ -11,14 +17,19 @@ allprojects {
             // isn't visible to this `apply from:` script).
             publishToMavenCentral("CENTRAL_PORTAL", true)
 
-            // Signing will be applied to non-snapshot builds.
-            // Uses credentials as described above, supports both regular and in memory signing.
-            signAllPublications()
+            // Signing is applied only when signing credentials are configured,
+            // so local and JitPack builds (publishToMavenLocal) need no keys.
+            String signingKey = project.findProperty("signingInMemoryKey") as String
+            String signingKeyId = project.findProperty("signing.keyId") as String
+            boolean hasSigningCredentials = signingKey || signingKeyId
+            if (hasSigningCredentials) {
+                signAllPublications()
+            }
 
             pom {
                 name = 'Centrifuge Java'
                 description = 'Android and General Java client for Centrifugo server and Centrifuge library'
-                url = 'https://github.com/centrifugal/centrifuge-java'
+                url = 'https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java'
 
                 licenses {
                     license {
@@ -36,9 +47,9 @@ allprojects {
                 }
 
                 scm {
-                    connection = 'scm:git:git://github.com/centrifugal/centrifuge-java.git'
-                    developerConnection = 'scm:git:ssh://github.com:centrifugal/centrifuge-java.git'
-                    url = 'http://github.com/centrifugal/centrifuge-java'
+                    connection = 'scm:git:https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java.git'
+                    developerConnection = 'scm:git:ssh://git@github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java.git'
+                    url = 'https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java'
                 }
             }
         }

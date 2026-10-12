@@ -1,42 +1,221 @@
-name: Release workflow
+name: release
+
 on:
   push:
     tags:
-      - '*'
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version without the leading v, e.g. 1.0.0 or 1.1.0-rc.1'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  validate:
+    name: Validate version
     runs-on: ubuntu-latest
-
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: set up JDK 11
+      - name: Resolve and validate version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+          else
+            version="${REF_NAME#v}"
+          fi
+
+          semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          if ! [[ "$version" =~ $semver ]]; then
+            echo "::error::Invalid version '${version}'. Expected semver without the leading v, e.g. 1.0.0 or 1.1.0-rc.1."
+            exit 1
+          fi
+
+          tag="v${version}"
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            remote_tag="$(git ls-remote --tags origin "refs/tags/${tag}")"
+            if [ -n "$remote_tag" ]; then
+              echo "::error::Tag ${tag} already exists on origin."
+              exit 1
+            fi
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::GitHub Release ${tag} already exists."
+            exit 1
+          fi
+
+          if [ "$prerelease" = "false" ]; then
+            highest="$(gh release list --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName' | sed 's/^v//' | sort -V | tail -n 1)"
+            if [ -n "$highest" ]; then
+              newest="$(printf '%s\n%s\n' "$highest" "$version" | sort -V | tail -n 1)"
+              if [ "$highest" = "$version" ] || [ "$newest" != "$version" ]; then
+                echo "::error::Version ${version} is not greater than the latest release v${highest}."
+                exit 1
+              fi
+            fi
+          fi
+
+          {
+            echo "version=${version}"
+            echo "prerelease=${prerelease}"
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test
+    needs:
+      - validate
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build artifacts
+    needs:
+      - validate
+      - test
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 11
         uses: actions/setup-java@v5
         with:
           java-version: '11'
           distribution: 'temurin'
+          cache: gradle
 
-      - name: Publish to Maven Central
-        # publishAndReleaseToMavenCentral: uploads + auto-releases via Sonatype
-        # Central Portal (the OSSRH replacement). Replaces the old
-        # `publish` + `closeAndReleaseRepository` two-step.
-        #
-        # Credentials below come from a Central Portal "User Token"
-        # (https://central.sonatype.com/account → User Token), NOT the JIRA
-        # login. We read them from CENTRAL_PORTAL_* secrets so the legacy
-        # OSSRH MAVEN_CENTRAL_* secrets stay intact as a rollback path —
-        # if Central Portal misbehaves, swap the env vars below back to the
-        # MAVEN_CENTRAL_* secrets and revert publish-setup.gradle to the
-        # OSSRH host. GPG secrets are unchanged across both flows.
+      - name: Assemble library
+        run: ./gradlew :centrifuge:assemble --no-daemon
+
+      - name: Upload library archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-jar
+          path: centrifuge/build/libs/*.jar
+          if-no-files-found: error
+
+  tag:
+    name: Create tag
+    needs:
+      - validate
+      - build
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Create and push tag
         run: |
-          ./gradlew clean --no-daemon
-          ./gradlew publishAndReleaseToMavenCentral --no-daemon --no-parallel
-        env:
-          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.CENTRAL_PORTAL_USERNAME }}
-          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.CENTRAL_PORTAL_PASSWORD }}
-          ORG_GRADLE_PROJECT_signingInMemoryKeyId: ${{ secrets.MAVEN_GPG_ID }}
-          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_GPG_PASSWORD }}
-          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          git tag "v${VERSION}" "$GITHUB_SHA"
+          git push origin "refs/tags/v${VERSION}"
+
+  jitpack:
+    name: Verify JitPack build
+    needs:
+      - validate
+      - build
+      - tag
+    # tag is skipped for tag pushes, which is still a valid path.
+    if: ${{ always() && needs.build.result == 'success' && (needs.tag.result == 'success' || needs.tag.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Wait for JitPack build
+        run: |
+          base="https://jitpack.io/com/github/Impulse-m/ImpulseM.Centrifugo.Client.Java/v${VERSION}"
+          api="https://jitpack.io/api/builds/com.github.Impulse-m/ImpulseM.Centrifugo.Client.Java/v${VERSION}"
+          pom="${base}/ImpulseM.Centrifugo.Client.Java-v${VERSION}.pom"
+          deadline=$((SECONDS + 1200))
+
+          # The API request also triggers the JitPack build on first call.
+          while true; do
+            body="$(curl -sS --max-time 60 "$api" || true)"
+            status="$(printf '%s' "$body" | jq -r '.status // "unknown"' 2>/dev/null || echo unknown)"
+            echo "JitPack status: ${status}"
+            if [ "$status" = "ok" ]; then
+              break
+            fi
+            if [ "$status" = "error" ]; then
+              echo "::error::JitPack build for v${VERSION} failed. Log: ${base}/build.log"
+              printf '%s\n' "$body"
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Timed out waiting for JitPack build of v${VERSION} (last status: ${status})."
+              exit 1
+            fi
+            sleep 30
+          done
+
+          # Status ok does not guarantee the POM is served yet, so poll it too.
+          for attempt in $(seq 1 20); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "$pom" || true)"
+            if [ "$code" = "200" ]; then
+              echo "JitPack artifact available: ${pom}"
+              exit 0
+            fi
+            echo "POM not yet available (HTTP ${code}), attempt ${attempt}/20"
+            sleep 15
+          done
+          echo "::error::JitPack reported ok but POM ${pom} is not served."
+          exit 1
+
+  release:
+    name: Tag and publish release
+    needs:
+      - validate
+      - build
+      - jitpack
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download library archive
+        uses: actions/download-artifact@v4
+        with:
+          name: release-jar
+          path: dist
+
+      - name: Create GitHub Release
+        run: |
+          args=(--verify-tag --generate-notes)
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          else
+            args+=(--latest)
+          fi
+
+          gh release create "v${VERSION}" "${args[@]}" dist/*.jar
