@@ -37,7 +37,6 @@ final class AuthRefresh {
     }
 
 
-
     // A refused transition keeps the connection and its identity, and is reported without a
     // retry. A token which expired is retried by the timer with a fresh token.
     private static final int PERMISSION_DENIED = 103;
