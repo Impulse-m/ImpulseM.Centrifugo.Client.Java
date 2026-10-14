@@ -69,6 +69,8 @@ public class Client {
     private ScheduledFuture<?> reconnectTask;
     private int reconnectAttempts = 0;
     private boolean refreshRequired = false;
+    // Confirmed by the connect reply of the current transport, cleared when it closes.
+    private volatile boolean rpcOptionsSupported = false;
 
     Options getOpts() {
         return opts;
@@ -152,6 +154,14 @@ public class Client {
 
     public ClientState getState() {
         return this.state;
+    }
+
+    /**
+     * Capabilities the server confirmed for the current connection. A reconnect starts
+     * with none until its connect reply confirms them.
+     */
+    public ClientCapabilities getCapabilities() {
+        return new ClientCapabilities(this.rpcOptionsSupported);
     }
 
     private int _id = 0;
@@ -286,6 +296,8 @@ public class Client {
             needEvent = previousState != ClientState.DISCONNECTED;
             this.setState(ClientState.DISCONNECTED);
         }
+        // The transport is gone: its capabilities go with it until the next connect reply.
+        this.rpcOptionsSupported = false;
 
         // Channel compaction IDs are scoped to a server session — drop the routing
         // registry; each resubscribe re-registers a fresh ID. The per-subscription
@@ -857,6 +869,7 @@ public class Client {
             return;
         }
         Protocol.ConnectResult result = reply.getConnect();
+        this.rpcOptionsSupported = Extensions.hasFlag(result.getFlag(), Extensions.RPC_OPTIONS_FLAG);
         ConnectedEvent event = new ConnectedEvent();
         event.setClient(result.getClient());
         event.setData(result.getData().toByteArray());
@@ -1048,6 +1061,8 @@ public class Client {
                 build.putSubs(entry.getKey(), subReqBuild.build());
             }
         }
+        // Advertise the capabilities this client supports; the server echoes the ones it accepts.
+        build.setFlag(Extensions.RPC_OPTIONS_FLAG);
         Protocol.ConnectRequest req = build.build();
 
         Protocol.Command cmd = Protocol.Command.newBuilder()
