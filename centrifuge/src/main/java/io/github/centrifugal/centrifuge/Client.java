@@ -1000,7 +1000,7 @@ public class Client {
 
         for (Map.Entry<Integer, Protocol.Command> entry : this.connectCommands.entrySet()) {
             Protocol.Command cmd = entry.getValue();
-            boolean sent = this.ws.send(ByteString.of(this.serializeCommand(cmd)));
+            boolean sent = this.sendCommand(cmd);
             if (!sent) {
                 CompletableFuture<Protocol.Reply> f = this.futures.get(cmd.getId());
                 if (f != null) {
