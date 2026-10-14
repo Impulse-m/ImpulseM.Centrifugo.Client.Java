@@ -13,12 +13,26 @@ import static org.junit.Assert.assertTrue;
 
 public class RpcQueueTest {
     @Test
-    public void offerRefusesCallsBeyondTheCapacity() {
+    public void isFullWhenTheCapacityIsReached() {
         RpcQueue queue = new RpcQueue(2);
 
-        assertTrue(queue.offer(call(1L)));
-        assertTrue(queue.offer(call(2L)));
-        assertFalse(queue.offer(call(3L)));
+        assertFalse(queue.isFull());
+        queue.add(call(1L));
+        assertFalse(queue.isFull());
+        queue.add(call(2L));
+        assertTrue(queue.isFull());
+    }
+
+
+    @Test
+    public void addKeepsCallsBeyondTheCapacity() {
+        RpcQueue queue = new RpcQueue(1);
+
+        queue.add(call(1L));
+        queue.add(call(2L));
+
+        assertTrue(queue.isFull());
+        assertEquals(2, queue.drain().size());
     }
 
 
@@ -26,11 +40,11 @@ public class RpcQueueTest {
     public void removingACallFreesARoomInTheQueue() {
         RpcQueue queue = new RpcQueue(1);
         RpcCall first = call(1L);
-        queue.offer(first);
+        queue.add(first);
 
         queue.remove(first);
 
-        assertTrue(queue.offer(call(2L)));
+        assertFalse(queue.isFull());
     }
 
 
@@ -40,9 +54,9 @@ public class RpcQueueTest {
         RpcCall third = call(30L);
         RpcCall first = call(10L);
         RpcCall second = call(20L);
-        queue.offer(third);
-        queue.offer(first);
-        queue.offer(second);
+        queue.add(third);
+        queue.add(first);
+        queue.add(second);
 
         List<RpcCall> drained = queue.drain();
 
@@ -58,7 +72,7 @@ public class RpcQueueTest {
     public void removeOnlyRemovesTheSameCall() {
         RpcQueue queue = new RpcQueue(10);
         RpcCall kept = call(5L);
-        queue.offer(kept);
+        queue.add(kept);
 
         queue.remove(call(5L));
 

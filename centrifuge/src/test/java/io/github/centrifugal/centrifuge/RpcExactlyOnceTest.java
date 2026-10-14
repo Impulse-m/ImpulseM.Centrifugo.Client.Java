@@ -416,7 +416,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void lostCallsBeyondTheBoundFailAndTheOldestAreKept() throws Exception {
+    public void lostCallsBeyondTheBoundAreKeptAndResent() throws Exception {
         enableRpcOptions();
         serveDedup();
         Options options = new Options();
@@ -424,27 +424,50 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         Client c = newClient(options);
         connect(c);
         holdCalls.set(true);
-        List<CompletableFuture<RPCResult>> futures = new ArrayList<>();
-        for (int i = 0; i < 3; i++) {
-            CompletableFuture<RPCResult> future = new CompletableFuture<>();
-            futures.add(future);
-            c.rpcCall("step" + i, EMPTY_PAYLOAD, into(future));
-        }
-        for (int i = 0; i < 3; i++) {
-            assertTrue("call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
-        }
+        List<CompletableFuture<RPCResult>> futures = sendHeldCalls(c, 3);
 
         holdCalls.set(false);
         server.closeConnection();
 
-        assertEquals(ReplyError.LIMIT_EXCEEDED, replyErrorOf(futures.get(2)).getCode());
-        futures.get(0).get(5, TimeUnit.SECONDS);
-        futures.get(1).get(5, TimeUnit.SECONDS);
+        for (CompletableFuture<RPCResult> future : futures) {
+            future.get(5, TimeUnit.SECONDS);
+        }
         List<Protocol.RPCRequest> requests = sentRpcRequests();
-        assertEquals(5, requests.size());
-        assertEquals(requests.get(0).getMsgId(), requests.get(3).getMsgId());
-        assertEquals(requests.get(1).getMsgId(), requests.get(4).getMsgId());
-        assertTrue(requests.get(3).getRetransmit());
+        assertEquals(6, requests.size());
+        for (int i = 0; i < 3; i++) {
+            assertEquals(requests.get(i).getMsgId(), requests.get(i + 3).getMsgId());
+            assertTrue(requests.get(i + 3).getRetransmit());
+        }
+        assertEquals("each call ran once", 3, executions.get());
+    }
+
+
+    @Test
+    public void newCallsAreRefusedWhileLostCallsAreOverTheBound() throws Exception {
+        enableRpcOptions();
+        serveDedup();
+        Options options = new Options();
+        options.setMaxPendingRpc(2);
+        Client c = newClient(options);
+        connect(c);
+        connectArrivals.drainPermits();
+        holdCalls.set(true);
+        holdConnect.set(true);
+        List<CompletableFuture<RPCResult>> futures = sendHeldCalls(c, 3);
+        server.closeConnection();
+        assertTrue("reconnect started", connectArrivals.tryAcquire(5, TimeUnit.SECONDS));
+
+        CompletableFuture<RPCResult> refused = new CompletableFuture<>();
+        c.rpcCall("late", EMPTY_PAYLOAD, into(refused));
+
+        assertEquals(ReplyError.LIMIT_EXCEEDED, replyErrorOf(refused).getCode());
+        holdCalls.set(false);
+        holdConnect.set(false);
+        server.releaseDeferredCommands();
+        for (CompletableFuture<RPCResult> future : futures) {
+            future.get(5, TimeUnit.SECONDS);
+        }
+        assertEquals("each call ran once", 3, executions.get());
     }
 
 
@@ -553,6 +576,21 @@ public class RpcExactlyOnceTest extends RpcTestBase {
                     .setRpc(Protocol.RPCResult.newBuilder().setData(com.google.protobuf.ByteString.copyFromUtf8("ok")))
                     .build();
         };
+    }
+
+
+    // Issues the calls while the fake server holds their answers, and waits until it received them all.
+    private List<CompletableFuture<RPCResult>> sendHeldCalls(Client c, int count) throws Exception {
+        List<CompletableFuture<RPCResult>> futures = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            CompletableFuture<RPCResult> future = new CompletableFuture<>();
+            futures.add(future);
+            c.rpcCall("step" + i, EMPTY_PAYLOAD, into(future));
+        }
+        for (int i = 0; i < count; i++) {
+            assertTrue("call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
+        }
+        return futures;
     }
 
 

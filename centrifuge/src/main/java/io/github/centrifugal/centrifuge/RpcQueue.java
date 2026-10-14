@@ -9,7 +9,8 @@ import java.util.Set;
 
 /**
  * The rpc calls that wait for the connection: calls issued while it is down or a refresh is in
- * flight, and calls lost with their transport. Bounded by the capacity. Used on the client's
+ * flight, and calls lost with their transport. The capacity bounds the calls issued, see
+ * {@link #isFull}; a call which was sent already is kept whatever the size. Used on the client's
  * executor thread only.
  */
 final class RpcQueue {
@@ -23,13 +24,15 @@ final class RpcQueue {
     }
 
 
-    /** Adds the call unless the queue is full. Returns false when the call was not added. */
-    boolean offer(RpcCall call) {
-        if (calls.size() >= capacity) {
-            return false;
-        }
+    /** Whether the queue holds as many calls as its capacity, so a call issued now is refused. */
+    boolean isFull() {
+        return calls.size() >= capacity;
+    }
+
+
+    /** Adds the call. The capacity does not apply, so a call lost with its transport is kept. */
+    void add(RpcCall call) {
         calls.add(call);
-        return true;
     }
 
 

@@ -105,8 +105,9 @@ final class RpcSession {
 
     /**
      * The transport is gone. Calls with a msg_id are kept for a resend when the client reconnects,
-     * the others fail. Without a reconnect every call fails. Kept calls beyond the queue bound fail
-     * with {@link ReplyError#LIMIT_EXCEEDED}, the oldest calls are kept.
+     * the others fail. Without a reconnect every call fails. A kept call is never failed for the
+     * queue bound, since the server may have run it: the queue may exceed the bound, and new calls
+     * wait until it drains below the bound.
      */
     void onTransportLost(boolean keep) {
         List<RpcCall> lost = new ArrayList<>();
@@ -122,9 +123,7 @@ final class RpcSession {
         onWire.clear();
         lost.sort((RpcCall first, RpcCall second) -> Long.compare(first.msgId, second.msgId));
         for (RpcCall call : lost) {
-            if (!queue.offer(call)) {
-                call.future.completeExceptionally(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls wait for the connection", false));
-            }
+            queue.add(call);
         }
         if (!keep) {
             for (RpcCall call : queue.drain()) {
@@ -134,15 +133,18 @@ final class RpcSession {
     }
 
 
-    // Writes the call now when the connection is up and no refresh is in flight, queues it otherwise.
+    // Writes the call now when the connection is up and no refresh is in flight. Otherwise the call
+    // waits in the queue, unless the queue is full: the bound applies to the calls issued here.
     private void start(RpcCall call) {
         if (call.future.isDone()) {
             return;
         }
         if (client.getState() == ClientState.CONNECTED && !client.isRefreshing()) {
             write(call);
-        } else if (!queue.offer(call)) {
+        } else if (queue.isFull()) {
             call.future.completeExceptionally(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls wait for the connection", false));
+        } else {
+            queue.add(call);
         }
     }
 
@@ -183,8 +185,12 @@ final class RpcSession {
         client.removeFuture(id);
         onWire.remove(id);
         pendingAcks.addAll(0, acks);
-        if (!supported || !queue.offer(call)) {
+        if (!supported) {
             call.future.completeExceptionally(new IOException());
+        } else if (!call.everSent && queue.isFull()) {
+            call.future.completeExceptionally(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls wait for the connection", false));
+        } else {
+            queue.add(call);
         }
     }
 
