@@ -8,9 +8,9 @@ import java.util.function.IntUnaryOperator;
  * Issues the msg_ids of the rpc calls. A msg_id is the server-corrected unix second shifted left
  * by {@link #SEQUENCE_BITS}, with a sequence in the low bits, so it fits 53 bits. The sequence of a
  * second starts at a random lane, so two generators which share an instance rarely issue the same
- * msg_id. A backward correction of the clock holds the time part, so the msg_ids stay unique and
- * keep increasing. {@link #resync} lowers the time part when the server refused a msg_id as outside
- * its window. Used on the client's executor thread only.
+ * msg_id. A backward correction of the clock holds the time part, so the msg_ids stay unique within
+ * the scope. {@link #resync} may lower the time part when the server refused a msg_id as outside its
+ * window. Used on the client's executor thread only.
  */
 final class MsgIdGenerator {
     /** Bits of the sequence part of a msg_id. */
@@ -46,8 +46,9 @@ final class MsgIdGenerator {
 
     /**
      * The msg_id of a call written now, for the server time in milliseconds. Greater than the msg_id
-     * issued before it. The time part never moves back on its own: a server time behind the last
-     * time part keeps that time part, and the sequence goes on.
+     * issued before it, unless the generator was re-synced (see {@link #resync}). The time part never
+     * moves back on its own: a server time behind the last time part keeps that time part, and the
+     * sequence goes on.
      *
      * @throws IllegalStateException when the time part would not fit 33 bits.
      */
@@ -76,6 +77,9 @@ final class MsgIdGenerator {
      * Re-syncs the generator after the server refused a msg_id as outside its window: the time part
      * becomes the server second of {@code serverTimeMillis}, even when it is lower than the last one,
      * and the sequence starts at a new lane. The next msg_id is the first of that lane.
+     * <p>
+     * The msg_ids the server accepted before the re-sync may still be recorded in the seconds the time
+     * part covers again. The fresh lane makes a collision with them improbable, not impossible.
      */
     void resync(long serverTimeMillis) {
         lastSeconds = serverTimeMillis / 1000L;

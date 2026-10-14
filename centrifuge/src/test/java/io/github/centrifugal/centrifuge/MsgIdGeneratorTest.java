@@ -91,11 +91,19 @@ public class MsgIdGeneratorTest {
 
     @Test
     public void twoGeneratorsInTheSameSecondGiveDifferentFirstIds() {
-        for (int i = 0; i < 20; i++) {
-            MsgIdGenerator first = new MsgIdGenerator();
-            MsgIdGenerator second = new MsgIdGenerator();
+        MsgIdGenerator first = new MsgIdGenerator(lanes(7));
+        MsgIdGenerator second = new MsgIdGenerator(lanes(9));
 
-            assertNotEquals(first.next(SERVER_MILLIS), second.next(SERVER_MILLIS));
+        assertNotEquals(first.next(SERVER_MILLIS), second.next(SERVER_MILLIS));
+    }
+
+
+    @Test
+    public void defaultLaneIsBelowTheBound() {
+        for (int i = 0; i < 20; i++) {
+            long sequence = new MsgIdGenerator().next(SERVER_MILLIS) & (MsgIdGenerator.SEQUENCE_LIMIT - 1);
+
+            assertTrue("the random lane is below 2^19: " + sequence, sequence < (1L << 19));
         }
     }
 
