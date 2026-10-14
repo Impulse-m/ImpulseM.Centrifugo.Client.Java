@@ -338,6 +338,64 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void cancelsLostWithTheTransportAreCappedAtTheBound() throws Exception {
+        enableRpcOptions();
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();
+        Client c = newClient();
+        connect(c);
+        for (int i = 0; i < 40; i++) {
+            final int index = i;
+            RpcCall call = c.rpcCall("m" + i, EMPTY_PAYLOAD, into(new CompletableFuture<RPCResult>()));
+            awaitCondition("call " + index + " sent", () -> sentRpcRequests().size() > 2 * index);
+            call.cancel();
+        }
+        awaitCondition("all cancels sent", () -> sentRpcRequests().size() == 80);
+        List<Long> msgIds = new ArrayList<>();
+        for (int i = 0; i < 40; i++) {
+            msgIds.add(sentRpcRequests().get(2 * i).getMsgId());
+        }
+
+        server.deferCommand = null;
+        server.closeConnection();
+
+        assertTrue("reconnected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+        syncWithServer();
+        List<Protocol.RPCRequest> cancels = sentCancels();
+        assertEquals("the forty cancels, then the kept ones", 72, cancels.size());
+        for (int i = 0; i < 32; i++) {
+            assertEquals("the newest cancels are kept", msgIds.get(8 + i).longValue(), cancels.get(40 + i).getCancel());
+        }
+    }
+
+
+    @Test
+    public void unansweredCancelIsDroppedAfterTheTimeoutAndNotSentAgain() throws Exception {
+        enableRpcOptions();
+        Options options = instanceOptions();
+        options.setTimeout(200);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();
+        Client c = newClient(options);
+        connect(c);
+        RpcCall call = c.rpcCall("m", EMPTY_PAYLOAD, into(new CompletableFuture<RPCResult>()));
+        awaitRequestCount(1);
+        long msgId = sentRpcRequests().get(0).getMsgId();
+        long cancelledAt = System.nanoTime();
+
+        call.cancel();
+        awaitCancel(msgId);
+        // The cancel timeout has passed once the wait is twice the timeout: the cancel is forgotten then.
+        awaitCondition("cancel timeout", () -> System.nanoTime() - cancelledAt > TimeUnit.MILLISECONDS.toNanos(400L));
+        drainExecutor();
+
+        server.closeConnection();
+
+        assertTrue("reconnected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+        syncWithServer();
+        assertEquals("the unanswered cancel is not sent again", 1, sentCancels().size());
+    }
+
+
+    @Test
     public void legacyServerGetsPlainCallsAndRejectsHeaders() throws Exception {
         answerRpcs("ok");
         Client c = newClient();
@@ -997,6 +1055,18 @@ public class RpcExactlyOnceTest extends RpcTestBase {
                 .setTime(serverTime)
                 .setError(error)
                 .build();
+    }
+
+
+    // The cancel requests the client sent, in order.
+    private List<Protocol.RPCRequest> sentCancels() {
+        List<Protocol.RPCRequest> cancels = new ArrayList<>();
+        for (Protocol.RPCRequest request : sentRpcRequests()) {
+            if (request.getCancel() != 0) {
+                cancels.add(request);
+            }
+        }
+        return cancels;
     }
 
 

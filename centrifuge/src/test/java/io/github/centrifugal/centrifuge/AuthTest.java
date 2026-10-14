@@ -133,6 +133,26 @@ public class AuthTest extends RpcTestBase {
 
 
     @Test
+    public void refreshBeyondThe32InProgressIsRefusedWithLimitExceeded() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        newAuthClient(new Options());
+        connect(client);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+        CompletableFuture<AuthResult> first = refresh(client, "token-0");
+        awaitCondition("refresh sent", () -> lastRefreshToken() != null);
+        for (int i = 1; i < 32; i++) {
+            refresh(client, "token-" + i);
+        }
+        CompletableFuture<AuthResult> refused = refresh(client, "token-32");
+
+        assertEquals(ReplyError.LIMIT_EXCEEDED, ((ReplyError) errorOf(refused)).getCode());
+        server.deferCommand = null;
+        server.releaseDeferredCommands();
+        first.get(5, TimeUnit.SECONDS);
+    }
+
+
+    @Test
     public void deadlineOfAnRpcIssuedDuringARefreshStartsWhenIssued() throws Exception {
         server.connectResult = connectResultFor("u1", "authenticated");
         answerRpcs("ok");

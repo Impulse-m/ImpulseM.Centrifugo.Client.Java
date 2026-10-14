@@ -8,6 +8,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -43,11 +44,11 @@ final class RpcSession {
     // msg_ids of the replies received, sent as the ack of the next rpc request.
     private final List<Long> pendingAcks = new ArrayList<>();
     // msg_ids of calls cancelled, or past their deadline, while no connection which confirms RPC
-    // options could carry the cancel. Not counted against the queue bound: a cancel needs no resend of
-    // its call. A connection which confirms RPC options takes the whole list, so the list is bounded by
-    // the sent calls made since the last such connection, not by the queue bound. It is not capped,
-    // since a dropped cancel would leave the call running on the server.
+    // options could carry the cancel, and of cancels which got no reply before their transport was lost.
+    // Capped at maxPending, see keepCancel. A connection which confirms RPC options takes the whole list.
     private final List<Long> pendingCancels = new ArrayList<>();
+    // The cancel commands which wait for their reply, by the id of the command: the msg_id each one cancels.
+    private final Map<Integer, Long> cancelCommands = new TreeMap<>();
     private final MsgIdGenerator msgIds = new MsgIdGenerator();
     // The bound of the calls which are not settled, see submit.
     private final int maxPending;
@@ -137,7 +138,7 @@ final class RpcSession {
         pendingCancels.clear();
         for (long msgId : cancels) {
             if (client.hasRpcOptions() && !writeCancel(msgId)) {
-                pendingCancels.add(msgId);
+                keepCancel(msgId);
             }
         }
         for (RpcCall call : queue.drain()) {
@@ -171,6 +172,12 @@ final class RpcSession {
             }
         }
         onWire.clear();
+        // A cancel which got no reply is kept for the next connection which confirms RPC options.
+        for (Map.Entry<Integer, Long> entry : cancelCommands.entrySet()) {
+            client.removeFuture(entry.getKey());
+            keepCancel(entry.getValue());
+        }
+        cancelCommands.clear();
         // A resend which waits for its delay is a call lost with its transport: it goes out with the reconnect.
         for (RpcCall call : new ArrayList<>(resendWaiting)) {
             stopResend(call);
@@ -292,28 +299,65 @@ final class RpcSession {
     // connection which confirms RPC options otherwise.
     private void sendCancel(long msgId) {
         if (client.getState() != ClientState.CONNECTED || !client.hasRpcOptions() || !writeCancel(msgId)) {
-            pendingCancels.add(msgId);
+            keepCancel(msgId);
         }
     }
 
 
-    // Sends a cancel for a msg_id: an rpc request without method and data, whose reply is not
-    // awaited. Returns false when the command was not sent, and its acks wait for the next command.
+    // Keeps a cancel for the next connection which confirms RPC options. The list is capped at the
+    // bound: when it is full, the oldest cancel is dropped, since the server's window expires its record anyway.
+    private void keepCancel(long msgId) {
+        if (pendingCancels.size() >= maxPending) {
+            pendingCancels.remove(0);
+        }
+        pendingCancels.add(msgId);
+    }
+
+
+    // Sends a cancel for a msg_id: an rpc request without method and data. Its reply is not awaited for
+    // the call, only for the cancel command, which the client timeout bounds: a cancel without a reply in
+    // time is forgotten, and not sent again. Returns false when the command was not sent, and its acks
+    // wait for the next command.
     private boolean writeCancel(long msgId) {
         List<Long> acks = takeAcks();
         Protocol.RPCRequest req = Protocol.RPCRequest.newBuilder()
                 .setCancel(msgId)
                 .addAllAck(acks)
                 .build();
+        int id = client.nextCommandId();
         Protocol.Command cmd = Protocol.Command.newBuilder()
-                .setId(client.nextCommandId())
+                .setId(id)
                 .setRpc(req)
                 .build();
+        CompletableFuture<Protocol.Reply> reply = new CompletableFuture<>();
+        reply.orTimeout(client.getOpts().getTimeout(), TimeUnit.MILLISECONDS)
+                .whenComplete((Protocol.Reply answer, Throwable error) -> forgetCancelOnExecutor(id));
+        client.addFuture(id, reply);
+        cancelCommands.put(id, msgId);
         if (client.sendCommand(cmd)) {
             return true;
         }
+        client.removeFuture(id);
+        cancelCommands.remove(id);
         pendingAcks.addAll(0, acks);
         return false;
+    }
+
+
+    // Ends the wait for the reply of a cancel command, from its reply or its timeout. Runs on the
+    // executor. A closed executor has forgotten the cancel with the connection.
+    private void forgetCancelOnExecutor(int id) {
+        try {
+            client.getExecutor().submit(() -> forgetCancel(id));
+        } catch (RejectedExecutionException ignored) {
+            // The client is closed.
+        }
+    }
+
+
+    private void forgetCancel(int id) {
+        client.removeFuture(id);
+        cancelCommands.remove(id);
     }
 
 

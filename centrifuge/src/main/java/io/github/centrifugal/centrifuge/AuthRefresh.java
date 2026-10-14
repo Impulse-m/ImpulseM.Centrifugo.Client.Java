@@ -41,6 +41,9 @@ final class AuthRefresh {
     // retry. A token which expired is retried by the timer with a fresh token.
     private static final int PERMISSION_DENIED = 103;
 
+    // The refreshes in progress, the one in flight and the ones which wait for it, are bounded by this.
+    private static final int MAX_IN_PROGRESS = 32;
+
     private final Client client;
     // The bounds of the retry delay after a failed token fetch or refresh, in milliseconds.
     private final int retryMinMillis;
@@ -75,9 +78,16 @@ final class AuthRefresh {
     }
 
 
-    /** Refreshes the connection with a token the caller gave. Runs on the executor. */
+    /**
+     * Refreshes the connection with a token the caller gave. Runs on the executor. A refresh beyond
+     * the bound of the refreshes in progress is refused at once with LIMIT_EXCEEDED.
+     */
     void refreshWith(String token, ResultCallback<AuthResult> cb) {
         if (inFlight) {
+            if (waiting.size() + 1 >= MAX_IN_PROGRESS) {
+                cb.onDone(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many refreshes are in progress", false), null);
+                return;
+            }
             waiting.add(new Waiting(token, cb));
             return;
         }
