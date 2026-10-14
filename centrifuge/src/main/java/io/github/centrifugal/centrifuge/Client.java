@@ -284,6 +284,9 @@ public class Client {
                 // (e.g. orTimeout/exceptionally re-submits) get queued before
                 // we mark the executor shutdown.
                 Client.this.processDisconnect(DISCONNECTED_DISCONNECT_CALLED, "client closed", false);
+                // processDisconnect returns early when the client is already disconnected, so the
+                // rpc calls which wait for a connection are failed here, before the executor shuts down.
+                Client.this.rpcSession.onTransportLost(false);
                 Client.this.setState(ClientState.CLOSED);
                 if (Client.this.ws != null) {
                     Client.this.ws.cancel();

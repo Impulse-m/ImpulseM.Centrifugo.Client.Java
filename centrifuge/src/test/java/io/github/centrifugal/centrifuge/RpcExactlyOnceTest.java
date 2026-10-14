@@ -178,6 +178,21 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void callQueuedWhileDisconnectedIsCompletedByClose() throws Exception {
+        enableRpcOptions();
+        Client c = newClient();
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("queued", EMPTY_PAYLOAD, into(future));
+        drainExecutor();
+
+        c.close(1000);
+
+        assertTrue("close fails the queued call", errorOf(future) instanceof IOException);
+        assertTrue(sentRpcRequests().isEmpty());
+    }
+
+
+    @Test
     public void cancelBeforeSendNeverSendsTheCall() throws Exception {
         enableRpcOptions();
         answerRpcs("ok");

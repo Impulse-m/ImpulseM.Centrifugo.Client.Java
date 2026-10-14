@@ -6,6 +6,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
@@ -47,7 +48,7 @@ final class RpcSession {
      */
     void submit(RpcCall call) {
         call.future.orTimeout(call.timeout, TimeUnit.MILLISECONDS)
-                .whenComplete((Protocol.Reply reply, Throwable error) -> client.getExecutor().submit(() -> finish(call, reply, error)));
+                .whenComplete((Protocol.Reply reply, Throwable error) -> runOnExecutor(() -> finish(call, reply, error)));
         client.getExecutor().submit(() -> start(call));
     }
 
@@ -135,6 +136,17 @@ final class RpcSession {
             for (RpcCall call : queue.drain()) {
                 call.future.completeExceptionally(new IOException());
             }
+        }
+    }
+
+
+    // Runs the task on the executor. Once the client is closed the executor rejects tasks, and the
+    // task then runs on the calling thread, so the callback of the call still runs exactly once.
+    private void runOnExecutor(Runnable task) {
+        try {
+            client.getExecutor().submit(task);
+        } catch (RejectedExecutionException e) {
+            task.run();
         }
     }
 
