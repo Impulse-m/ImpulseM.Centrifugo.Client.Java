@@ -307,6 +307,28 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void legacyServerRejectsCancelOfAQueuedCallToo() throws Exception {
+        answerRpcs("ok");
+        Client c = newClient();
+        connect(c);
+        server.deferCommand = (Protocol.Command cmd) ->cmd.hasRefresh();
+        CompletableFuture<AuthResult> refreshFuture = new CompletableFuture<>();
+        c.refresh("token-2", completing(refreshFuture));
+        syncWithServer();
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        RpcCall call = c.rpcCall("m", EMPTY_PAYLOAD, into(future));
+
+        call.cancel();
+
+        assertEquals(ReplyError.UNSUPPORTED, replyErrorOf(future).getCode());
+        server.releaseDeferredCommands();
+        refreshFuture.get(5, TimeUnit.SECONDS);
+        syncWithServer();
+        assertEquals("the queued call is never sent", 0, sentRpcRequests().size());
+    }
+
+
+    @Test
     public void legacyCallLostWithItsTransportFails() throws Exception {
         server.deferCommand = (Protocol.Command cmd) ->cmd.hasRpc();
         Client c = newClient();

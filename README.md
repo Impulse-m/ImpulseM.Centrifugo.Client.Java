@@ -140,7 +140,7 @@ With a server that confirms RPC options on the connect reply, every `rpc` call c
 
 A call keeps its original deadline across resends: `Options.setTimeout` by default, or `RpcOptions.Builder.timeout`. A call whose deadline passes while the client is disconnected is rejected with a `TimeoutException`.
 
-`rpcCall` returns an `RpcCall` handle. `cancel()` asks the server to stop the call and rejects it locally with `ReplyError.CANCELLED` (17). A call which was not sent yet is never sent, and is rejected with `ReplyError.CANCELLED` whatever the server supports. A cancel issued while the client is disconnected goes out with the next connection. Without the capability, `cancel()` of a call which was already sent rejects with `ReplyError.UNSUPPORTED` and sends nothing.
+`rpcCall` returns an `RpcCall` handle. `cancel()` asks the server to stop the call and rejects it locally with `ReplyError.CANCELLED` (17). A call which was not sent yet is never sent. On a connected server without the capability, `cancel()` rejects the call with `ReplyError.UNSUPPORTED` (15) whether it was sent or not, and sends nothing. While the client is connecting or disconnected the capability is not known, so a call which was not sent yet is rejected with `ReplyError.CANCELLED`. A cancel issued while the client is disconnected goes out with the next connection which confirms the capability.
 
 ```java
 RpcCall call = client.rpcCall("my.method.name", data, new ResultCallback<RPCResult>() {

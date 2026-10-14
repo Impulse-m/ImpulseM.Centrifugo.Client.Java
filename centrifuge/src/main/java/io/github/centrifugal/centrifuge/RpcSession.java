@@ -52,18 +52,24 @@ final class RpcSession {
     }
 
 
-    /** Cancels the call. A call which was never sent is never sent. */
+    /**
+     * Cancels the call. A call which was never sent is never sent. On a connection whose server
+     * does not support RPC options, a cancel is rejected with UNSUPPORTED whether the call was sent
+     * or not, since the server cannot cancel anything. While the capability is not known, the call
+     * which was not sent is rejected with CANCELLED.
+     */
     void cancel(RpcCall call) {
         if (call.future.isDone()) {
+            return;
+        }
+        if (client.getState() == ClientState.CONNECTED && !client.hasRpcOptions()) {
+            queue.remove(call);
+            call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel is not supported by the server", false));
             return;
         }
         if (!call.everSent) {
             queue.remove(call);
             call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
-            return;
-        }
-        if (client.getState() == ClientState.CONNECTED && !client.hasRpcOptions()) {
-            call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel is not supported by the server", false));
             return;
         }
         queue.remove(call);
