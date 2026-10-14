@@ -1,5 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -40,6 +42,10 @@ public final class RpcCall {
     int laterResends;
     // The resend which waits for its delay, cancelled with the call.
     ScheduledFuture<?> resendTask;
+    // The acks the last write carried. They go back to the pending acks if the write is lost with its transport.
+    List<Long> carriedAcks = Collections.emptyList();
+    // The forgetting of the attempt of a call which settled locally, while a late reply is still acked.
+    ScheduledFuture<?> lateTask;
 
 
     RpcCall(
@@ -62,13 +68,13 @@ public final class RpcCall {
 
     /**
      * Cancels the call and rejects it with {@link ReplyError#CANCELLED}. A call which was not
-     * sent yet is never sent. A call which was sent is cancelled on the server over the current
-     * connection, or over the next one when the connection is down. On a connected server which
-     * does not support RPC options, or for a client without an instance, cancelling a call rejects it
-     * with {@link ReplyError#UNSUPPORTED} and nothing is sent. While the client is connecting or disconnected the capability is not known
-     * yet, so a call which was not sent is rejected with {@link ReplyError#CANCELLED} and is never sent,
-     * and a call which was sent gets its cancel with the next connection which confirms RPC options.
-     * Has no effect once the call is done.
+     * sent yet is never sent, and is rejected with {@link ReplyError#CANCELLED} whatever the connection
+     * state. A call which was sent is cancelled on the server over the current connection, or over the
+     * next one when the connection is down. On a connected server which does not support RPC options,
+     * or for a client without an instance, cancelling a call which was sent rejects it with
+     * {@link ReplyError#UNSUPPORTED} and nothing is sent. While the client is connecting or disconnected
+     * the capability is not known yet, and a call which was sent gets its cancel with the next
+     * connection which confirms RPC options. Has no effect once the call is done.
      */
     public void cancel() {
         if (future.isDone()) {

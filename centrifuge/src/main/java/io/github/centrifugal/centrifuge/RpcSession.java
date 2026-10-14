@@ -28,6 +28,20 @@ import java8.util.concurrent.CompletableFuture;
  * own. Used on the client's executor thread only, except {@link #submit}.
  */
 final class RpcSession {
+    // A cancel command on the wire: the msg_id it cancels, and the acks it carries, which go back to
+    // the pending acks when the command is lost with its transport.
+    private static final class CancelCommand {
+        final long msgId;
+        final List<Long> acks;
+
+
+        CancelCommand(long msgId, List<Long> acks) {
+            this.msgId = msgId;
+            this.acks = acks;
+        }
+    }
+
+
     // A call whose msg_id the server refused is sent again this many times, each time with a new msg_id.
     private static final int NEW_ID_RESENDS = 2;
     // A call the server refused for now is sent again this many times: after 250 ms, 500 ms and 1 s.
@@ -48,7 +62,7 @@ final class RpcSession {
     // Capped at maxPending, see keepCancel. A connection which confirms RPC options takes the whole list.
     private final List<Long> pendingCancels = new ArrayList<>();
     // The cancel commands which wait for their reply, by the id of the command: the msg_id each one cancels.
-    private final Map<Integer, Long> cancelCommands = new TreeMap<>();
+    private final Map<Integer, CancelCommand> cancelCommands = new TreeMap<>();
     private final MsgIdGenerator msgIds = new MsgIdGenerator();
     // The bound of the calls which are not settled, see submit.
     private final int maxPending;
@@ -90,9 +104,10 @@ final class RpcSession {
 
 
     /**
-     * Cancels the call. A call which was never sent is never sent. On a connection whose server
-     * does not support RPC options, a cancel is rejected with UNSUPPORTED whether the call was sent
-     * or not, since the server cannot cancel anything. While the capability is not known, the call
+     * Cancels the call. A call which was never sent is never sent, and is rejected with CANCELLED
+     * whatever the connection state: nothing reached the server. A sent call on a connection whose
+     * server does not support RPC options, or of a client without an instance, is rejected with
+     * UNSUPPORTED, since the server cannot cancel anything. While the capability is not known, the call
      * which was not sent is rejected with CANCELLED.
      */
     void cancel(RpcCall call) {
@@ -100,6 +115,11 @@ final class RpcSession {
             return;
         }
         stopResend(call);
+        if (!call.everSent) {
+            queue.remove(call);
+            call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
+            return;
+        }
         if (client.getState() == ClientState.CONNECTED && !client.hasRpcOptions()) {
             queue.remove(call);
             call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel is not supported by the server", false));
@@ -109,11 +129,6 @@ final class RpcSession {
             // Without an instance the calls are plain: the server has no record of them to cancel.
             queue.remove(call);
             call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel needs the instance option", false));
-            return;
-        }
-        if (!call.everSent) {
-            queue.remove(call);
-            call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
             return;
         }
         queue.remove(call);
@@ -158,13 +173,22 @@ final class RpcSession {
      * The transport is gone. Calls with a msg_id are kept for a resend when the client reconnects,
      * the others fail. Without a reconnect every call fails. A kept call is never failed for the
      * queue bound, since the server may have run it: the queue may exceed the bound, and new calls
-     * wait until it drains below the bound.
+     * wait until it drains below the bound. The acks carried by a command which was lost with the
+     * transport go back to the pending acks: the server may not have seen them, and a repeated ack
+     * is harmless. A call which settled locally and waits for a late reply has no reply to wait for
+     * any more: its wait ends here.
      */
     void onTransportLost(boolean keep) {
         List<RpcCall> lost = new ArrayList<>();
         for (Map.Entry<Integer, RpcCall> entry : onWire.entrySet()) {
             RpcCall call = entry.getValue();
             client.removeFuture(entry.getKey());
+            stopLate(call);
+            pendingAcks.addAll(0, call.carriedAcks);
+            call.carriedAcks = Collections.emptyList();
+            if (call.future.isDone()) {
+                continue;
+            }
             if (keep && call.wireTracked) {
                 lost.add(call);
             } else {
@@ -173,9 +197,10 @@ final class RpcSession {
         }
         onWire.clear();
         // A cancel which got no reply is kept for the next connection which confirms RPC options.
-        for (Map.Entry<Integer, Long> entry : cancelCommands.entrySet()) {
+        for (Map.Entry<Integer, CancelCommand> entry : cancelCommands.entrySet()) {
             client.removeFuture(entry.getKey());
-            keepCancel(entry.getValue());
+            keepCancel(entry.getValue().msgId);
+            pendingAcks.addAll(0, entry.getValue().acks);
         }
         cancelCommands.clear();
         // A resend which waits for its delay is a call lost with its transport: it goes out with the reconnect.
@@ -268,6 +293,7 @@ final class RpcSession {
             call.everSent = true;
             call.resendAsNew = false;
             call.wireTracked = tracked;
+            call.carriedAcks = acks;
             return;
         }
         client.removeFuture(id);
@@ -333,7 +359,7 @@ final class RpcSession {
         reply.orTimeout(client.getOpts().getTimeout(), TimeUnit.MILLISECONDS)
                 .whenComplete((Protocol.Reply answer, Throwable error) -> forgetCancelOnExecutor(id));
         client.addFuture(id, reply);
-        cancelCommands.put(id, msgId);
+        cancelCommands.put(id, new CancelCommand(msgId, acks));
         if (client.sendCommand(cmd)) {
             return true;
         }
@@ -347,11 +373,7 @@ final class RpcSession {
     // Ends the wait for the reply of a cancel command, from its reply or its timeout. Runs on the
     // executor. A closed executor has forgotten the cancel with the connection.
     private void forgetCancelOnExecutor(int id) {
-        try {
-            client.getExecutor().submit(() -> forgetCancel(id));
-        } catch (RejectedExecutionException ignored) {
-            // The client is closed.
-        }
+        Extensions.submitOrIgnore(client.getExecutor(), () -> forgetCancel(id));
     }
 
 
@@ -402,6 +424,8 @@ final class RpcSession {
             return;
         }
         call.resendAsNew = true;
+        // The new msg_id is not on the wire yet: until it is, a timeout sends no cancel for it.
+        call.wireTracked = false;
         writeOrQueue(call);
     }
 
@@ -434,12 +458,14 @@ final class RpcSession {
 
 
     private void finish(RpcCall call, Protocol.Reply reply, Throwable error) {
-        if (call.commandId != 0) {
-            client.removeFuture(call.commandId);
-            onWire.remove(call.commandId);
-        }
         queue.remove(call);
         stopResend(call);
+        if (reply == null && call.wireTracked && onWire.get(call.commandId) == call) {
+            // Settled locally while its attempt is on the wire: a late reply is still acked for one call timeout.
+            keepLate(call);
+        } else {
+            forgetAttempt(call);
+        }
         if (reply == null) {
             if (call.wireTracked && Extensions.unwrapCompletion(error) instanceof TimeoutException) {
                 // The server may still run a sent call, so the deadline cancels it as cancel() does.
@@ -449,6 +475,37 @@ final class RpcSession {
             pendingAcks.add(call.msgId);
         }
         deliver(call, reply, error);
+    }
+
+
+    // Forgets the attempt of the call: its future and its entry on the wire.
+    private void forgetAttempt(RpcCall call) {
+        if (call.commandId != 0) {
+            client.removeFuture(call.commandId);
+            onWire.remove(call.commandId);
+        }
+    }
+
+
+    // Keeps the attempt of a call which settled locally, so that a late reply is acked. The attempt is
+    // forgotten one call timeout later, or with the transport.
+    private void keepLate(RpcCall call) {
+        call.lateTask = client.getScheduler().schedule(() -> client.getExecutor().submit(() -> forgetLate(call)), call.timeout, TimeUnit.MILLISECONDS);
+    }
+
+
+    private void forgetLate(RpcCall call) {
+        call.lateTask = null;
+        forgetAttempt(call);
+    }
+
+
+    // Cancels the forgetting of a late attempt, if one is kept.
+    private static void stopLate(RpcCall call) {
+        if (call.lateTask != null) {
+            call.lateTask.cancel(false);
+            call.lateTask = null;
+        }
     }
 
 
@@ -465,9 +522,18 @@ final class RpcSession {
 
     // Decides on the answer of an attempt. A refusal which carries the retry signal is sent again
     // and settles nothing; any other answer settles the call. An attempt which the transport lost
-    // first is ignored: the call was kept for a resend or failed with the transport.
+    // first is ignored: the call was kept for a resend or failed with the transport. The answer to
+    // a call which settled locally is a late reply: it is acked, and its attempt is forgotten.
     private void finishAttempt(RpcCall call, Protocol.Reply reply, Throwable error) {
-        if (call.future.isDone() || onWire.get(call.commandId) != call) {
+        if (onWire.get(call.commandId) != call) {
+            return;
+        }
+        if (call.future.isDone()) {
+            if (reply != null) {
+                pendingAcks.add(call.msgId);
+            }
+            stopLate(call);
+            forgetAttempt(call);
             return;
         }
         client.removeFuture(call.commandId);
