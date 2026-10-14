@@ -10,6 +10,10 @@ public abstract class EventListener {
 
     }
 
+    public void onAuth(Client client, AuthEvent event) {
+
+    }
+
     public void onDisconnected(Client client, DisconnectedEvent event) {
 
     }
