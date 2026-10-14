@@ -52,7 +52,10 @@ public final class RpcCall {
      * sent yet is never sent. A call which was sent is cancelled on the server over the current
      * connection, or over the next one when the connection is down. On a connected server which
      * does not support RPC options, cancelling a call rejects it with {@link ReplyError#UNSUPPORTED}
-     * and nothing is sent. Has no effect once the call is done.
+     * and nothing is sent. While the client is connecting or disconnected the capability is not known
+     * yet, so a call which was not sent is rejected with {@link ReplyError#CANCELLED} and is never sent,
+     * and a call which was sent gets its cancel with the next connection which confirms RPC options.
+     * Has no effect once the call is done.
      */
     public void cancel() {
         if (future.isDone()) {

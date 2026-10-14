@@ -28,8 +28,11 @@ final class RpcSession {
     private final Map<Integer, RpcCall> onWire = new HashMap<>();
     // msg_ids of the replies received, sent as the ack of the next rpc request.
     private final List<Long> pendingAcks = new ArrayList<>();
-    // msg_ids of calls cancelled while no connection could carry the cancel. Not counted against
-    // the queue bound: a cancel needs no resend of its call.
+    // msg_ids of calls cancelled, or past their deadline, while no connection which confirms RPC
+    // options could carry the cancel. Not counted against the queue bound: a cancel needs no resend of
+    // its call. A connection which confirms RPC options takes the whole list, so the list is bounded by
+    // the sent calls made since the last such connection, not by the queue bound. It is not capped,
+    // since a dropped cancel would leave the call running on the server.
     private final List<Long> pendingCancels = new ArrayList<>();
     private long lastMsgId = 0;
 
