@@ -119,7 +119,8 @@ final class RpcSession {
      * whatever the connection state: nothing reached the server. A sent call on a connection whose
      * server does not support RPC options, or of a client without an instance, is rejected with
      * UNSUPPORTED, since the server cannot cancel anything. While the capability is not known, the call
-     * which was not sent is rejected with CANCELLED.
+     * which was not sent is rejected with CANCELLED. A call whose current msg_id was never written, a new
+     * msg_id still queued after a refusal, is rejected with CANCELLED and nothing is sent for that id.
      */
     void cancel(RpcCall call) {
         if (call.future.isDone()) {
