@@ -9,6 +9,7 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -189,6 +190,25 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
         assertTrue("close fails the queued call", errorOf(future) instanceof IOException);
         assertTrue(sentRpcRequests().isEmpty());
+    }
+
+
+    @Test
+    public void rpcAfterCloseThrowsAndItsCallbackNeverFires() throws Exception {
+        Client c = newClient();
+        c.close(1000);
+        AtomicInteger callbacks = new AtomicInteger();
+
+        try {
+            c.rpcCall("late", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(100).build(), (Throwable error, RPCResult result) -> callbacks.incrementAndGet());
+            fail("expected the closed client to reject the call");
+        } catch (RejectedExecutionException expected) {
+            // The call was never registered.
+        }
+
+        // Three times the deadline of the call: a registered deadline would have fired by now.
+        Thread.sleep(300L);
+        assertEquals(0, callbacks.get());
     }
 
 

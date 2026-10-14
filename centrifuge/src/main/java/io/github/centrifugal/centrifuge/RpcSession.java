@@ -12,8 +12,6 @@ import java.util.concurrent.TimeoutException;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
-import java8.util.concurrent.CompletionException;
-
 
 /**
  * The exactly-once rpc calls of one client. A call waits in the queue until it is written to a
@@ -48,9 +46,11 @@ final class RpcSession {
      * resends. The callback runs on the executor, also when the call was cancelled before it started.
      */
     void submit(RpcCall call) {
-        call.future.orTimeout(call.timeout, TimeUnit.MILLISECONDS)
-                .whenComplete((Protocol.Reply reply, Throwable error) -> runOnExecutor(() -> finish(call, reply, error)));
+        // The executor rejects the call once the client is closed. Nothing is registered then, so
+        // the deadline cannot fire later and call back on another thread.
         client.getExecutor().submit(() -> start(call));
+        call.future.orTimeout(call.timeout, TimeUnit.MILLISECONDS)
+                .whenComplete((Protocol.Reply reply, Throwable error) -> finishOnExecutor(call, reply, error));
     }
 
 
@@ -142,13 +142,14 @@ final class RpcSession {
     }
 
 
-    // Runs the task on the executor. Once the client is closed the executor rejects tasks, and the
-    // task then runs on the calling thread, so the callback of the call still runs exactly once.
-    private void runOnExecutor(Runnable task) {
+    // Finishes the call on the executor. Once the client is closed the executor rejects the task:
+    // the session state went with the executor, so only the callback of the call runs, on the
+    // calling thread, exactly once.
+    private void finishOnExecutor(RpcCall call, Protocol.Reply reply, Throwable error) {
         try {
-            client.getExecutor().submit(task);
+            client.getExecutor().submit(() -> finish(call, reply, error));
         } catch (RejectedExecutionException e) {
-            task.run();
+            deliver(call, reply, error);
         }
     }
 
@@ -272,16 +273,23 @@ final class RpcSession {
         }
         queue.remove(call);
         if (reply == null) {
-            Throwable cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
-            if (call.wireTracked && cause instanceof TimeoutException) {
+            if (call.wireTracked && Extensions.unwrapCompletion(error) instanceof TimeoutException) {
                 // The server may still run a sent call, so the deadline cancels it as cancel() does.
                 sendCancel(call.msgId);
             }
-            call.callback.onDone(cause, null);
-            return;
-        }
-        if (call.wireTracked) {
+        } else if (call.wireTracked) {
             pendingAcks.add(call.msgId);
+        }
+        deliver(call, reply, error);
+    }
+
+
+    // Hands the outcome of the call to its callback. Reads no session state, so it is safe once the
+    // session is gone with the executor.
+    private void deliver(RpcCall call, Protocol.Reply reply, Throwable error) {
+        if (reply == null) {
+            call.callback.onDone(Extensions.unwrapCompletion(error), null);
+            return;
         }
         if (reply.getError().getCode() != 0) {
             call.callback.onDone(client.getReplyError(reply), null);

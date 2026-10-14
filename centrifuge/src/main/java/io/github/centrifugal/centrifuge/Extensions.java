@@ -4,6 +4,8 @@ import java.util.regex.Pattern;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
+import java8.util.concurrent.CompletionException;
+
 
 /**
  * Helpers for the protocol extensions of the server fork: connect flag bits and
@@ -55,6 +57,18 @@ final class Extensions {
             return NO_MSG_ID;
         }
         return lastMsgId + 1;
+    }
+
+
+    /**
+     * The failure a dependent stage wrapped in a {@link CompletionException}, or the failure itself
+     * when nothing was wrapped.
+     */
+    static Throwable unwrapCompletion(Throwable error) {
+        if (error instanceof CompletionException && error.getCause() != null) {
+            return error.getCause();
+        }
+        return error;
     }
 
 
