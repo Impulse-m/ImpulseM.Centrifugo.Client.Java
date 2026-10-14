@@ -10,7 +10,6 @@ import java.util.concurrent.TimeUnit;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
-import java8.util.concurrent.CompletableFuture;
 import java8.util.concurrent.CompletionException;
 
 
