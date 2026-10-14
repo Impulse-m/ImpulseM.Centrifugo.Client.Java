@@ -48,7 +48,7 @@ final class RpcSession {
      */
     void submit(RpcCall call) {
         call.future.orTimeout(call.timeout, TimeUnit.MILLISECONDS)
-                .whenComplete((reply, error) -> client.getExecutor().submit(() -> finish(call, reply, error)));
+                .whenComplete((Protocol.Reply reply, Throwable error) -> client.getExecutor().submit(() -> finish(call, reply, error)));
         client.getExecutor().submit(() -> start(call));
     }
 

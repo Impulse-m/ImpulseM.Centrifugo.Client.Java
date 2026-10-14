@@ -50,7 +50,7 @@ final class AuthRefresh {
 
     /** Refreshes the connection with a token the caller gave. Runs on the executor. */
     void refreshWith(String token, ResultCallback<AuthResult> cb) {
-        run(() -> client.sendRefreshCommand(token, (error, result) -> client.getExecutor().submit(() -> finishRequested(token, error, result, cb))));
+        run(() -> client.sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> client.getExecutor().submit(() -> finishRequested(token, error, result, cb))));
     }
 
 
@@ -105,7 +105,7 @@ final class AuthRefresh {
             complete();
             return;
         }
-        client.getOpts().getTokenGetter().getConnectionToken(new ConnectionTokenEvent(), (err, token) -> client.getExecutor().submit(() -> onTokenFetched(transport, err, token)));
+        client.getOpts().getTokenGetter().getConnectionToken(new ConnectionTokenEvent(), (Throwable err, String token) -> client.getExecutor().submit(() -> onTokenFetched(transport, err, token)));
     }
 
 
@@ -129,7 +129,7 @@ final class AuthRefresh {
             complete();
             return;
         }
-        client.sendRefreshCommand(token, (error, result) -> client.getExecutor().submit(() -> finishTimer(transport, token, error, result)));
+        client.sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> client.getExecutor().submit(() -> finishTimer(transport, token, error, result)));
     }
 
 
