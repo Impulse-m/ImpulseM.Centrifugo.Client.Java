@@ -71,6 +71,8 @@ public class Client {
     private boolean refreshRequired = false;
     // Confirmed by the connect reply of the current transport, cleared when it closes.
     private volatile boolean rpcOptionsSupported = false;
+    // Server clock minus local clock, from the last reply that carried a server time.
+    private volatile long serverTimeOffset = 0;
 
     Options getOpts() {
         return opts;
@@ -165,6 +167,14 @@ public class Client {
      */
     public ClientCapabilities getCapabilities() {
         return new ClientCapabilities(this.rpcOptionsSupported);
+    }
+
+    /**
+     * Current server time in milliseconds, estimated from the server time of the last reply
+     * that carried one. Local time when no such reply has been seen.
+     */
+    public long serverTimeMillis() {
+        return Extensions.estimateServerTime(System.currentTimeMillis(), this.serverTimeOffset);
     }
 
     private int _id = 0;
@@ -1112,7 +1122,16 @@ public class Client {
         this.processDisconnect(DISCONNECTED_UNAUTHORIZED, "unauthorized", false);
     }
 
+    // A reply without a server time keeps the last offset.
+    private void observeServerTime(Protocol.Reply reply) {
+        Long offset = Extensions.serverTimeOffsetFrom(reply.getTime(), System.currentTimeMillis());
+        if (offset != null) {
+            this.serverTimeOffset = offset;
+        }
+    }
+
     private void processReply(Protocol.Reply reply) throws Exception {
+        this.observeServerTime(reply);
         if (reply.getId() > 0) {
             CompletableFuture<Protocol.Reply> cf = this.futures.get(reply.getId());
             if (cf != null) cf.complete(reply);
