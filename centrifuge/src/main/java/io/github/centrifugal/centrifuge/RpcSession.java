@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
@@ -74,10 +75,7 @@ final class RpcSession {
             return;
         }
         queue.remove(call);
-        boolean sent = client.getState() == ClientState.CONNECTED && writeCancel(call.msgId);
-        if (!sent) {
-            pendingCancels.add(call.msgId);
-        }
+        sendCancel(call.msgId);
         call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
     }
 
@@ -89,6 +87,10 @@ final class RpcSession {
     void flush() {
         if (client.getState() != ClientState.CONNECTED || client.isRefreshing()) {
             return;
+        }
+        if (!client.hasRpcOptions()) {
+            // A server without RPC options keeps no record of the calls, so there is nothing to cancel.
+            pendingCancels.clear();
         }
         List<Long> cancels = new ArrayList<>(pendingCancels);
         pendingCancels.clear();
@@ -227,6 +229,15 @@ final class RpcSession {
     }
 
 
+    // Sends the cancel of a msg_id now when the connection can carry it, and keeps it for the next
+    // connection which confirms RPC options otherwise.
+    private void sendCancel(long msgId) {
+        if (client.getState() != ClientState.CONNECTED || !client.hasRpcOptions() || !writeCancel(msgId)) {
+            pendingCancels.add(msgId);
+        }
+    }
+
+
     // Sends a cancel for a msg_id: an rpc request without method and data, whose reply is not
     // awaited. Returns false when the command was not sent, and its acks wait for the next command.
     private boolean writeCancel(long msgId) {
@@ -262,6 +273,10 @@ final class RpcSession {
         queue.remove(call);
         if (reply == null) {
             Throwable cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+            if (call.wireTracked && cause instanceof TimeoutException) {
+                // The server may still run a sent call, so the deadline cancels it as cancel() does.
+                sendCancel(call.msgId);
+            }
             call.callback.onDone(cause, null);
             return;
         }

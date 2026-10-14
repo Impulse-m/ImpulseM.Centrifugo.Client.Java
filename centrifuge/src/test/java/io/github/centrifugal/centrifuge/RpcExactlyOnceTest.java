@@ -235,6 +235,22 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void deadlineOfASentCallCancelsItOnTheServer() throws Exception {
+        enableRpcOptions();
+        server.deferCommand = (Protocol.Command cmd) ->cmd.hasRpc();
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("slow", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(200).build(), into(future));
+        awaitRequestCount(1);
+        long msgId = sentRpcRequests().get(0).getMsgId();
+
+        assertTrue(errorOf(future) instanceof TimeoutException);
+        assertEquals(msgId, awaitCancel(msgId).getCancel());
+    }
+
+
+    @Test
     public void cancelAfterCompletionHasNoEffect() throws Exception {
         enableRpcOptions();
         answerRpcs("ok");
