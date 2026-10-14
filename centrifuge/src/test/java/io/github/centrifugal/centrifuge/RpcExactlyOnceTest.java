@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
@@ -46,8 +47,6 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     // msg_id -> payload of the calls the fake server ran.
     private final Map<Long, byte[]> records = new ConcurrentHashMap<>();
     private final AtomicInteger executions = new AtomicInteger();
-    // When the fake server received each refused or answered call, by System.nanoTime.
-    private final List<Long> rpcArrivalsNanos = Collections.synchronizedList(new ArrayList<Long>());
     // While set, the fake server holds the answers to calls, so they are lost with the transport.
     private final AtomicBoolean holdCalls = new AtomicBoolean(false);
     // While set, the fake server holds the connect reply.
@@ -218,6 +217,28 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void rpcStartedAfterCloseFailsAtOnce() throws Exception {
+        Client c = newClient();
+        CountDownLatch release = new CountDownLatch(1);
+        // Holds the executor, so that the close task and the start of the call are queued before either runs.
+        c.getExecutor().submit(() -> {
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        c.close(0);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("late", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(60_000).build(), into(future));
+
+        release.countDown();
+
+        assertTrue("the call fails with the close, not with its deadline", errorOf(future) instanceof IOException);
+    }
+
+
+    @Test
     public void cancelAfterCloseDoesNotThrow() throws Exception {
         Client c = newClient();
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
@@ -372,23 +393,26 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         enableRpcOptions();
         Options options = instanceOptions();
         options.setTimeout(200);
+        options.setMinReconnectDelay(1);
+        options.setMaxReconnectDelay(1);
         server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();
-        Client c = newClient(options);
+        ManualScheduler clock = new ManualScheduler();
+        Client c = newClientOnClock(options, clock);
         connect(c);
         RpcCall call = c.rpcCall("m", EMPTY_PAYLOAD, into(new CompletableFuture<RPCResult>()));
         awaitRequestCount(1);
         long msgId = sentRpcRequests().get(0).getMsgId();
-        long cancelledAt = System.nanoTime();
 
         call.cancel();
         awaitCancel(msgId);
-        // The cancel timeout has passed once the wait is twice the timeout: the cancel is forgotten then.
-        awaitCondition("cancel timeout", () -> System.nanoTime() - cancelledAt > TimeUnit.MILLISECONDS.toNanos(400L));
+        drainExecutor();
+        // The cancel waits for its reply one timeout, and then it is forgotten.
+        clock.advance(200);
         drainExecutor();
 
-        server.closeConnection();
-
-        assertTrue("reconnected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+        server.deferCommand = null;
+        dropTransportOnClock(clock);
+        reconnectOnClock(clock);
         syncWithServer();
         assertEquals("the unanswered cancel is not sent again", 1, sentCancels().size());
     }
@@ -869,10 +893,17 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     public void laterRefusalIsResentWithTheSameMsgIdAfterTheDelay() throws Exception {
         enableRpcOptions();
         refuseCalls(1, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
-        Client c = newClient();
+        ManualScheduler clock = new ManualScheduler();
+        Client c = newClientOnClock(instanceOptions(), clock);
         connect(c);
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         c.rpcCall("later", EMPTY_PAYLOAD, into(future));
+        awaitCondition("the resend is scheduled", () -> clock.requestedDelays().contains(250L));
+
+        clock.advance(249);
+        syncWithServer();
+        assertEquals("the resend waits 250 ms", 1, sentRpcRequests().size());
+        clock.advance(1);
 
         assertEquals("ok", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
         List<Protocol.RPCRequest> requests = sentRpcRequests();
@@ -880,8 +911,32 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         assertEquals("the resend keeps the msg_id", requests.get(0).getMsgId(), requests.get(1).getMsgId());
         assertFalse(requests.get(0).getRetransmit());
         assertTrue("the resend is a retransmit", requests.get(1).getRetransmit());
-        long delayNanos = rpcArrivalsNanos.get(1) - rpcArrivalsNanos.get(0);
-        assertTrue("the resend waits 250 ms", delayNanos >= TimeUnit.MILLISECONDS.toNanos(250L));
+    }
+
+
+    @Test
+    public void cancelReplyTimerEndsWithTheTransport() throws Exception {
+        enableRpcOptions();
+        Options options = instanceOptions();
+        options.setTimeout(777);
+        options.setMinReconnectDelay(1);
+        options.setMaxReconnectDelay(1);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();
+        ManualScheduler clock = new ManualScheduler();
+        Client c = newClientOnClock(options, clock);
+        connect(c);
+        RpcCall call = c.rpcCall("m", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(60_000).build(), into(new CompletableFuture<RPCResult>()));
+        awaitRequestCount(1);
+        long msgId = sentRpcRequests().get(0).getMsgId();
+
+        call.cancel();
+        awaitCancel(msgId);
+        drainExecutor();
+        assertEquals("the reply of the cancel is timed", 1, clock.pendingWithDelay(777));
+
+        dropTransportOnClock(clock);
+
+        assertEquals("the transport ended the reply timer of the cancel", 0, clock.pendingWithDelay(777));
     }
 
 
@@ -1086,6 +1141,41 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void cancelOfAResendQueuedBehindARefreshSendsNoCancel() throws Exception {
+        enableRpcOptions();
+        // Holds the first call and the refresh, so the refused call is queued behind the refresh when it is refused.
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh() || (cmd.hasRpc() && !cmd.getRpc().getMethod().isEmpty());
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        RpcCall call = c.rpcCall("slow", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(1000).build(), into(future));
+        awaitRequestCount(1);
+        Protocol.Command original = null;
+        for (Protocol.Command command : server.received()) {
+            if (command.hasRpc() && "slow".equals(command.getRpc().getMethod())) {
+                original = command;
+            }
+        }
+        c.refresh("token-2", (Throwable error, AuthResult result) -> {
+        });
+        awaitCondition("refresh sent", () -> hasRefreshCommand());
+        server.sendReply(refusal(original, MSG_ID_INVALID, Extensions.RPC_RETRY_NEW_MSG_ID, System.currentTimeMillis()));
+        // The marker is answered after the refusal, so the refusal is handled once the executor has drained.
+        syncWithServer();
+        drainExecutor();
+
+        call.cancel();
+
+        assertEquals(ReplyError.CANCELLED, ((ReplyError) errorOf(future)).getCode());
+        answerRefreshWith(Protocol.Reply.newBuilder().setRefresh(Protocol.RefreshResult.newBuilder()));
+        server.releaseDeferredCommands();
+        syncWithServer();
+        assertTrue("the id of the resend never reached the server, so it has no cancel", sentCancels().isEmpty());
+        assertEquals("the resend was never sent", 1, sentRpcRequests().size());
+    }
+
+
+    @Test
     public void acksOfACommandLostWithItsTransportAreSentAgain() throws Exception {
         enableRpcOptions();
         Client c = newClient();
@@ -1107,6 +1197,22 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         Protocol.RPCRequest retransmit = requests.get(requests.size() - 1);
         assertTrue(retransmit.getRetransmit());
         assertTrue("the ack of the first reply is sent again with the retransmit", retransmit.getAckList().contains(firstMsgId));
+    }
+
+
+    // Drops the transport of a client whose reconnect delay runs on the clock, and waits until the reconnect is scheduled.
+    private void dropTransportOnClock(ManualScheduler clock) throws Exception {
+        int scheduled = clock.requestedDelays().size();
+        server.closeConnection();
+        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() > scheduled);
+        drainExecutor();
+    }
+
+
+    // Moves the clock past the reconnect delay, which the caller set to one millisecond, and waits for the connect.
+    private void reconnectOnClock(ManualScheduler clock) throws Exception {
+        clock.advance(2);
+        assertTrue("reconnected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
     }
 
 
@@ -1160,7 +1266,6 @@ public class RpcExactlyOnceTest extends RpcTestBase {
             if (!cmd.hasRpc() || cmd.getRpc().getCancel() != 0) {
                 return null;
             }
-            rpcArrivalsNanos.add(System.nanoTime());
             if (seen.getAndIncrement() < refusals) {
                 return refusal(cmd, code, retry, serverTime.get());
             }

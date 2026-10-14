@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -33,11 +34,21 @@ final class RpcSession {
     private static final class CancelCommand {
         final long msgId;
         final List<Long> acks;
+        // Forgets the cancel when its reply is late. Stopped when the reply comes or the transport is lost.
+        ScheduledFuture<?> timer;
 
 
         CancelCommand(long msgId, List<Long> acks) {
             this.msgId = msgId;
             this.acks = acks;
+        }
+
+
+        void stopTimer() {
+            if (timer != null) {
+                timer.cancel(false);
+                timer = null;
+            }
         }
     }
 
@@ -132,7 +143,10 @@ final class RpcSession {
             return;
         }
         queue.remove(call);
-        sendCancel(call.msgId);
+        // A call whose current msg_id was never written (a new msg_id still queued) has nothing to cancel on the server.
+        if (call.wireTracked) {
+            sendCancel(call.msgId);
+        }
         call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
     }
 
@@ -199,6 +213,7 @@ final class RpcSession {
         // A cancel which got no reply is kept for the next connection which confirms RPC options.
         for (Map.Entry<Integer, CancelCommand> entry : cancelCommands.entrySet()) {
             client.removeFuture(entry.getKey());
+            entry.getValue().stopTimer();
             keepCancel(entry.getValue().msgId);
             pendingAcks.addAll(0, entry.getValue().acks);
         }
@@ -240,6 +255,11 @@ final class RpcSession {
     // waits in the queue.
     private void start(RpcCall call) {
         if (call.future.isDone()) {
+            return;
+        }
+        // A call submitted before close but started after it: nothing will ever write it, so it fails now.
+        if (client.getState() == ClientState.CLOSED) {
+            call.future.completeExceptionally(new IOException());
             return;
         }
         writeOrQueue(call);
@@ -356,11 +376,13 @@ final class RpcSession {
                 .setRpc(req)
                 .build();
         CompletableFuture<Protocol.Reply> reply = new CompletableFuture<>();
-        reply.orTimeout(client.getOpts().getTimeout(), TimeUnit.MILLISECONDS)
-                .whenComplete((Protocol.Reply answer, Throwable error) -> forgetCancelOnExecutor(id));
+        reply.whenComplete((Protocol.Reply answer, Throwable error) -> forgetCancelOnExecutor(id));
         client.addFuture(id, reply);
-        cancelCommands.put(id, new CancelCommand(msgId, acks));
+        CancelCommand command = new CancelCommand(msgId, acks);
+        cancelCommands.put(id, command);
         if (client.sendCommand(cmd)) {
+            // The reply is handled on the executor, after this task, so the timer is set before it can come.
+            command.timer = client.getScheduler().schedule(() -> forgetCancelOnExecutor(id), client.getOpts().getTimeout(), TimeUnit.MILLISECONDS);
             return true;
         }
         client.removeFuture(id);
@@ -379,7 +401,10 @@ final class RpcSession {
 
     private void forgetCancel(int id) {
         client.removeFuture(id);
-        cancelCommands.remove(id);
+        CancelCommand command = cancelCommands.remove(id);
+        if (command != null) {
+            command.stopTimer();
+        }
     }
 
 
