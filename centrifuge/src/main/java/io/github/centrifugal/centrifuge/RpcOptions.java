@@ -24,13 +24,37 @@ public final class RpcOptions {
         }
 
 
+        /**
+         * Deadline of the call in milliseconds, instead of {@link Options#getTimeout()}. The
+         * deadline holds across resends after a reconnect.
+         */
+        public Builder timeout(long timeout) {
+            if (timeout <= 0) {
+                throw new IllegalArgumentException("timeout must be positive");
+            }
+            this.timeout = timeout;
+            return this;
+        }
+
+
         public RpcOptions build() {
             return new RpcOptions(this);
         }
+
+
+        private long timeout;
     }
 
 
     private final Map<String, String> headers;
+
+    private final long timeout;
+
+
+    /** Deadline in milliseconds, 0 when the call uses the client timeout. */
+    public long getTimeout() {
+        return timeout;
+    }
 
 
     /** Headers sent with the call, in the order they were added. Empty when none were added. */
@@ -41,5 +65,6 @@ public final class RpcOptions {
 
     private RpcOptions(Builder builder) {
         this.headers = Collections.unmodifiableMap(new LinkedHashMap<>(builder.headers));
+        this.timeout = builder.timeout;
     }
 }

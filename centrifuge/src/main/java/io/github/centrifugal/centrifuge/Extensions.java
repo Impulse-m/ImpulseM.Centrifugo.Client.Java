@@ -1,5 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
+import java.util.regex.Pattern;
+
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
 
@@ -15,13 +17,38 @@ final class Extensions {
      */
     static final long RPC_OPTIONS_FLAG = 1L << 32;
 
+    /** Bits of the sequence part of a msg_id, which is unix seconds shifted left by these bits. */
+    static final int MSG_ID_SEQUENCE_BITS = 20;
+
+    /** Largest msg_id a JSON number carries exactly: 53 bits. */
+    static final long MSG_ID_MAX = (1L << 53) - 1;
+
 
     private static final String UNSUPPORTED_RPC_MESSAGE = "rpc headers are not supported by the server";
+
+    private static final Pattern INSTANCE_PATTERN = Pattern.compile("[A-Za-z0-9_-]{22,64}");
 
 
     /** Whether the bit {@code flag} is set in the bitmask {@code flags}. */
     static boolean hasFlag(long flags, long flag) {
         return (flags & flag) != 0;
+    }
+
+
+    /**
+     * The next msg_id: the server-corrected unix second shifted left by
+     * {@link #MSG_ID_SEQUENCE_BITS}, or one above the last msg_id when that is not larger, so
+     * msg_ids of one client strictly increase.
+     */
+    static long nextMsgId(long serverTimeMillis, long lastMsgId) {
+        long candidate = (serverTimeMillis / 1000L) << MSG_ID_SEQUENCE_BITS;
+        return candidate > lastMsgId ? candidate : lastMsgId + 1;
+    }
+
+
+    /** Whether the connection instance matches the pattern the server accepts. */
+    static boolean isValidInstance(String instance) {
+        return INSTANCE_PATTERN.matcher(instance).matches();
     }
 
 

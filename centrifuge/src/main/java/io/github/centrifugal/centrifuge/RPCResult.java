@@ -20,4 +20,15 @@ public class RPCResult {
     }
 
     private byte[] data;
+
+    /** Whether the server answered the call from the record of an earlier attempt, not by running it again. */
+    public boolean isCached() {
+        return cached;
+    }
+
+    public void setCached(boolean cached) {
+        this.cached = cached;
+    }
+
+    private boolean cached;
 }

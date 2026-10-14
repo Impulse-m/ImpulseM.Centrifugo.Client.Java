@@ -111,6 +111,51 @@ public class Options {
 
     private int timeout = 5000;
 
+    public String getInstance() {
+        return instance;
+    }
+
+    /**
+     * Set the connection instance: a random secret the application generates once per
+     * installation or per tab and stores itself. It must match {@code [A-Za-z0-9_-]{22,64}}
+     * (at least 128 bits). The server scopes exactly-once RPC records by it, so whoever knows
+     * it can retransmit and cancel calls in its scope: never log or share it. Null clears it.
+     *
+     * @throws IllegalArgumentException when the value does not match the pattern.
+     */
+    public void setInstance(String instance) {
+        if (instance == null) {
+            this.instance = "";
+            return;
+        }
+        if (!Extensions.isValidInstance(instance)) {
+            throw new IllegalArgumentException("instance must match [A-Za-z0-9_-]{22,64}");
+        }
+        this.instance = instance;
+    }
+
+    private String instance = "";
+
+    public int getMaxPendingRpc() {
+        return maxPendingRpc;
+    }
+
+    /**
+     * Set how many rpc calls may wait for the connection at once: calls issued while it is
+     * down and calls kept for a resend. Calls beyond the bound fail with
+     * {@link ReplyError#LIMIT_EXCEEDED}. Read when the client is created. Default 32.
+     *
+     * @throws IllegalArgumentException when the bound is less than 1.
+     */
+    public void setMaxPendingRpc(int maxPendingRpc) {
+        if (maxPendingRpc < 1) {
+            throw new IllegalArgumentException("maxPendingRpc must be at least 1");
+        }
+        this.maxPendingRpc = maxPendingRpc;
+    }
+
+    private int maxPendingRpc = 32;
+
     public int getMinReconnectDelay() {
         return minReconnectDelay;
     }
