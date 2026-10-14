@@ -1,6 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Semaphore;
@@ -19,7 +20,7 @@ import static org.junit.Assert.assertTrue;
  * RPC options over the fork protocol: the connection capability and per-call headers.
  * Checked over the wire against the in-process {@link FakeCentrifugoServer}.
  */
-public class RpcOptionsTest extends RpcTestBase {
+public class RpcOptionsTest extends FakeServerTestBase {
     @Test
     public void connectRequestAdvertisesRpcOptionsBit() throws Exception {
         Client c = newClient();
@@ -37,7 +38,7 @@ public class RpcOptionsTest extends RpcTestBase {
 
     @Test
     public void capabilityIsOnWhenConnectReplyHasRpcOptionsBit() throws Exception {
-        enableRpcOptions();
+        confirmRpcOptions();
         Client c = newClient();
         connect(c);
 
@@ -80,7 +81,7 @@ public class RpcOptionsTest extends RpcTestBase {
 
     @Test
     public void capabilityIsClearedOnReconnectUntilConnectReplyConfirmsIt() throws Exception {
-        enableRpcOptions();
+        confirmRpcOptions();
         Client c = newClient();
         connect(c);
         assertTrue(c.getCapabilities().isRpcOptionsSupported());
@@ -108,7 +109,7 @@ public class RpcOptionsTest extends RpcTestBase {
 
     @Test
     public void capabilityIsClearedOnDisconnect() throws Exception {
-        enableRpcOptions();
+        confirmRpcOptions();
         Client c = newClient();
         connect(c);
         assertTrue(c.getCapabilities().isRpcOptionsSupported());
@@ -122,7 +123,7 @@ public class RpcOptionsTest extends RpcTestBase {
 
     @Test
     public void capabilitySnapshotDoesNotChangeAfterwards() throws Exception {
-        enableRpcOptions();
+        confirmRpcOptions();
         Client c = newClient();
         connect(c);
         ClientCapabilities before = c.getCapabilities();
@@ -137,7 +138,7 @@ public class RpcOptionsTest extends RpcTestBase {
 
     @Test
     public void rpcWithHeadersIsSentAndResultDelivered() throws Exception {
-        enableRpcOptions();
+        confirmRpcOptions();
         answerRpcs("pong");
         Client c = newClient();
         connect(c);
@@ -147,7 +148,7 @@ public class RpcOptionsTest extends RpcTestBase {
 
         RPCResult result = future.get(5, TimeUnit.SECONDS);
         assertEquals("pong", new String(result.getData(), StandardCharsets.UTF_8));
-        List<Protocol.RPCRequest> sent = sentRpcRequests();
+        List<Protocol.RPCRequest> sent = rpcRequests();
         assertEquals(1, sent.size());
         assertEquals("test", sent.get(0).getHeadersMap().get("x-request-source"));
         assertEquals(1, sent.get(0).getHeadersCount());
@@ -166,7 +167,7 @@ public class RpcOptionsTest extends RpcTestBase {
         ReplyError error = replyErrorOf(future);
         assertEquals(ReplyError.UNSUPPORTED, error.getCode());
         assertEquals("rpc headers are not supported by the server", error.getMessage());
-        assertTrue("nothing sent", sentRpcRequests().isEmpty());
+        assertTrue("nothing sent", rpcRequests().isEmpty());
     }
 
 
@@ -181,14 +182,14 @@ public class RpcOptionsTest extends RpcTestBase {
 
         RPCResult result = future.get(5, TimeUnit.SECONDS);
         assertEquals("pong", new String(result.getData(), StandardCharsets.UTF_8));
-        assertEquals(1, sentRpcRequests().size());
-        assertEquals(0, sentRpcRequests().get(0).getHeadersCount());
+        assertEquals(1, rpcRequests().size());
+        assertEquals(0, rpcRequests().get(0).getHeadersCount());
     }
 
 
     @Test
     public void plainRpcWorksWithCapability() throws Exception {
-        enableRpcOptions();
+        confirmRpcOptions();
         answerRpcs("pong");
         Client c = newClient();
         connect(c);
@@ -198,7 +199,7 @@ public class RpcOptionsTest extends RpcTestBase {
 
         RPCResult result = future.get(5, TimeUnit.SECONDS);
         assertEquals("pong", new String(result.getData(), StandardCharsets.UTF_8));
-        assertEquals(0, sentRpcRequests().get(0).getHeadersCount());
+        assertEquals(0, rpcRequests().get(0).getHeadersCount());
     }
 
 
@@ -213,13 +214,13 @@ public class RpcOptionsTest extends RpcTestBase {
 
         RPCResult result = future.get(5, TimeUnit.SECONDS);
         assertEquals("pong", new String(result.getData(), StandardCharsets.UTF_8));
-        assertEquals(0, sentRpcRequests().get(0).getHeadersCount());
+        assertEquals(0, rpcRequests().get(0).getHeadersCount());
     }
 
 
     @Test
     public void rpcWithHeadersQueuedWhileConnectingIsSentWhenConnectReplyConfirmsIt() throws Exception {
-        enableRpcOptions();
+        confirmRpcOptions();
         answerRpcs("pong");
         Client c = newClient();
 
@@ -227,7 +228,7 @@ public class RpcOptionsTest extends RpcTestBase {
 
         RPCResult result = future.get(5, TimeUnit.SECONDS);
         assertEquals("pong", new String(result.getData(), StandardCharsets.UTF_8));
-        assertEquals("test", sentRpcRequests().get(0).getHeadersMap().get("x-request-source"));
+        assertEquals("test", rpcRequests().get(0).getHeadersMap().get("x-request-source"));
     }
 
 
@@ -240,12 +241,30 @@ public class RpcOptionsTest extends RpcTestBase {
 
         ReplyError error = replyErrorOf(future);
         assertEquals(ReplyError.UNSUPPORTED, error.getCode());
-        assertTrue("nothing sent", sentRpcRequests().isEmpty());
+        assertTrue("nothing sent", rpcRequests().isEmpty());
+    }
+
+
+    private void confirmRpcOptions() {
+        server.connectResult = Protocol.ConnectResult.newBuilder()
+                .setClient("fake-client").setVersion("0.0.0").setPing(25)
+                .setFlag(Extensions.RPC_OPTIONS_FLAG).build();
     }
 
 
     private static RpcOptions headerOptions() {
         return new RpcOptions.Builder().header("x-request-source", "test").build();
+    }
+
+
+    private List<Protocol.RPCRequest> rpcRequests() {
+        List<Protocol.RPCRequest> requests = new ArrayList<>();
+        for (Protocol.Command cmd : server.received()) {
+            if (cmd.hasRpc()) {
+                requests.add(cmd.getRpc());
+            }
+        }
+        return requests;
     }
 
 

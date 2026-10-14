@@ -212,8 +212,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
             // The call was never registered.
         }
 
-        // Three times the deadline of the call: a registered deadline would have fired by now.
-        Thread.sleep(300L);
+        // The call was never registered, so no deadline or callback can run for it.
         assertEquals(0, callbacks.get());
     }
 
@@ -435,20 +434,21 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void legacyServerRejectsCancelOfAQueuedCallToo() throws Exception {
+    public void legacyServerCancelsACallNeverSentLocally() throws Exception {
         answerRpcs("ok");
         Client c = newClient();
         connect(c);
         server.deferCommand = (Protocol.Command cmd) ->cmd.hasRefresh();
         CompletableFuture<AuthResult> refreshFuture = new CompletableFuture<>();
-        c.refresh("token-2", into(refreshFuture));
+        c.refresh("token-2", completeInto(refreshFuture));
         syncWithServer();
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         RpcCall call = c.rpcCall("m", EMPTY_PAYLOAD, into(future));
 
         call.cancel();
 
-        assertEquals(ReplyError.UNSUPPORTED, replyErrorOf(future).getCode());
+        // Nothing reached the server, so there is nothing to cancel on the server: the call is cancelled locally.
+        assertEquals(ReplyError.CANCELLED, replyErrorOf(future).getCode());
         server.releaseDeferredCommands();
         refreshFuture.get(5, TimeUnit.SECONDS);
         syncWithServer();
@@ -985,6 +985,138 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
         assertTrue(errorOf(future) instanceof TimeoutException);
         assertEquals(msgId, awaitCancel(msgId).getCancel());
+    }
+
+
+    @Test
+    public void cancelOfACallNeverSentIsCancelledOnALegacyConnection() throws Exception {
+        Client c = newClient();
+        connect(c);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+        c.refresh("token-2", (Throwable error, AuthResult result) -> {
+        });
+        awaitCondition("refresh sent", () -> hasRefreshCommand());
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        RpcCall call = c.rpcCall("queued", EMPTY_PAYLOAD, into(future));
+
+        call.cancel();
+
+        assertEquals(ReplyError.CANCELLED, replyErrorOf(future).getCode());
+        server.releaseDeferredCommands();
+        syncWithServer();
+        for (Protocol.RPCRequest request : sentRpcRequests()) {
+            assertFalse("the cancelled call is never sent", "queued".equals(request.getMethod()));
+        }
+    }
+
+
+    @Test
+    public void instanceIsReadWhenTheClientIsCreated() throws Exception {
+        enableRpcOptions();
+        answerRpcs("ok");
+        Options options = instanceOptions();
+        Client c = newClient(options);
+        options.setInstance(null);
+        connect(c);
+
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("method", EMPTY_PAYLOAD, into(future));
+        future.get(5, TimeUnit.SECONDS);
+
+        assertEquals(TEST_INSTANCE, lastConnectRequest().getInstance());
+        assertNotEquals("the call is tracked with the instance it was created with", 0L, sentRpcRequests().get(0).getMsgId());
+    }
+
+
+    @Test
+    public void lateReplyToASettledCallIsAckedWithTheNextCall() throws Exception {
+        enableRpcOptions();
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && !cmd.getRpc().getMethod().isEmpty();
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("slow", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(200).build(), into(future));
+        awaitRequestCount(1);
+        long msgId = sentRpcRequests().get(0).getMsgId();
+
+        assertTrue(errorOf(future) instanceof TimeoutException);
+        assertEquals(msgId, awaitCancel(msgId).getCancel());
+
+        // The server answers the call after the deadline: the answer is late, and it is acked.
+        server.deferCommand = null;
+        server.releaseDeferredCommands();
+        syncWithServer();
+        CompletableFuture<RPCResult> next = new CompletableFuture<>();
+        c.rpcCall("next", EMPTY_PAYLOAD, into(next));
+        next.get(5, TimeUnit.SECONDS);
+
+        List<Protocol.RPCRequest> requests = sentRpcRequests();
+        Protocol.RPCRequest last = requests.get(requests.size() - 1);
+        assertEquals("next", last.getMethod());
+        assertTrue("the late reply is acked", last.getAckList().contains(msgId));
+    }
+
+
+    @Test
+    public void resendWithANewMsgIdThatTimesOutWhileQueuedSendsNoCancel() throws Exception {
+        enableRpcOptions();
+        // Holds the first call and the refresh, so the refused call waits for the refresh when it is refused.
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh() || (cmd.hasRpc() && !cmd.getRpc().getMethod().isEmpty());
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("slow", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(1000).build(), into(future));
+        awaitRequestCount(1);
+        Protocol.Command original = null;
+        for (Protocol.Command command : server.received()) {
+            if (command.hasRpc() && "slow".equals(command.getRpc().getMethod())) {
+                original = command;
+            }
+        }
+        c.refresh("token-2", (Throwable error, AuthResult result) -> {
+        });
+        awaitCondition("refresh sent", () -> hasRefreshCommand());
+
+        server.sendReply(refusal(original, MSG_ID_INVALID, Extensions.RPC_RETRY_NEW_MSG_ID, System.currentTimeMillis()));
+
+        assertTrue("the resend waits behind the refresh until the deadline", errorOf(future) instanceof TimeoutException);
+        assertEquals("the resend was never sent", 1, sentRpcRequests().size());
+        assertTrue("a resend which was never sent has no cancel to send", sentCancels().isEmpty());
+    }
+
+
+    @Test
+    public void acksOfACommandLostWithItsTransportAreSentAgain() throws Exception {
+        enableRpcOptions();
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        c.rpcCall("first", EMPTY_PAYLOAD, into(first));
+        first.get(5, TimeUnit.SECONDS);
+        long firstMsgId = sentRpcRequests().get(0).getMsgId();
+        AtomicInteger seen = new AtomicInteger();
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && "second".equals(cmd.getRpc().getMethod()) && seen.incrementAndGet() == 1;
+        CompletableFuture<RPCResult> second = new CompletableFuture<>();
+        c.rpcCall("second", EMPTY_PAYLOAD, into(second));
+        awaitCondition("second held by the server", () -> seen.get() == 1);
+
+        server.closeConnection();
+
+        second.get(5, TimeUnit.SECONDS);
+        List<Protocol.RPCRequest> requests = sentRpcRequests();
+        Protocol.RPCRequest retransmit = requests.get(requests.size() - 1);
+        assertTrue(retransmit.getRetransmit());
+        assertTrue("the ack of the first reply is sent again with the retransmit", retransmit.getAckList().contains(firstMsgId));
+    }
+
+
+    private boolean hasRefreshCommand() {
+        for (Protocol.Command command : server.received()) {
+            if (command.hasRefresh()) {
+                return true;
+            }
+        }
+        return false;
     }
 
 

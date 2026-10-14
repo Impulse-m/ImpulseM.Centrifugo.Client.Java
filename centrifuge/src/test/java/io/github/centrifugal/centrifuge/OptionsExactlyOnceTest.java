@@ -8,7 +8,7 @@ import static org.junit.Assert.fail;
 
 
 /** Tests of the options of the exactly-once rpc calls: the connection instance, the queue bound and the call timeout. */
-public class OptionsRpcTest {
+public class OptionsExactlyOnceTest {
     @Test
     public void instanceIsEmptyByDefaultAndNullClearsIt() {
         Options opts = new Options();

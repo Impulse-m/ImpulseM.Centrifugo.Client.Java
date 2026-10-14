@@ -3,8 +3,10 @@ package io.github.centrifugal.centrifuge;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import java.util.function.LongSupplier;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
@@ -28,6 +30,25 @@ abstract class RpcTestBase extends FakeServerTestBase {
         server.connectResult = Protocol.ConnectResult.newBuilder()
                 .setClient("fake-client").setVersion("0.0.0").setPing(25)
                 .setFlag(Extensions.RPC_OPTIONS_FLAG).build();
+    }
+
+
+    /**
+     * Answers every rpc with a result carrying the payload and the server time, read when each
+     * answer is sent, other commands by default.
+     */
+    protected void answerRpcs(String payload, LongSupplier serverTime) {
+        server.onCommand = cmd -> {
+            if (!cmd.hasRpc()) {
+                return null;
+            }
+            return Protocol.Reply.newBuilder()
+                    .setId(cmd.getId())
+                    .setTime(serverTime.getAsLong())
+                    .setRpc(Protocol.RPCResult.newBuilder()
+                            .setData(com.google.protobuf.ByteString.copyFromUtf8(payload)))
+                    .build();
+        };
     }
 
 
@@ -123,6 +144,29 @@ abstract class RpcTestBase extends FakeServerTestBase {
     }
 
 
+    /** Adapts a callback to a future: an error completes it exceptionally. */
+    protected static <T> ResultCallback<T> completeInto(CompletableFuture<T> future) {
+        return (Throwable error, T result) -> {
+            if (error != null) {
+                future.completeExceptionally(error);
+            } else {
+                future.complete(result);
+            }
+        };
+    }
+
+
+    /** The error of a call which failed. Fails when the call succeeded. */
+    protected static <T> Throwable errorOf(CompletableFuture<T> future) throws Exception {
+        try {
+            future.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (ExecutionException e) {
+            return e.getCause();
+        }
+        throw new AssertionError("the call succeeded, expected an error");
+    }
+
+
     /**
      * Returns once every command submitted to the client executor before this call has run, so
      * a test can assert on the client state after its calls were handled.
@@ -140,7 +184,7 @@ abstract class RpcTestBase extends FakeServerTestBase {
      */
     protected void syncWithServer() throws Exception {
         CompletableFuture<PresenceResult> marker = new CompletableFuture<>();
-        client.presence("sync", into(marker));
+        client.presence("sync", completeInto(marker));
         marker.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
     }
 

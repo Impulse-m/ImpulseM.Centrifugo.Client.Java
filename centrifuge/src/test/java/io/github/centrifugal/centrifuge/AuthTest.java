@@ -30,6 +30,9 @@ public class AuthTest extends RpcTestBase {
     private static final int PERMISSION_DENIED = 103;
     private static final int TOKEN_EXPIRED = 109;
     private static final int UNAUTHORIZED = 101;
+    // A client error, below 100: not temporary, and the timer retries it with a fresh token.
+    private static final int CLIENT_ERROR = 3;
+    private static final int LIMIT_EXCEEDED = ReplyError.LIMIT_EXCEEDED;
 
     private static final long ONE_SECOND_NANOS = 1_000_000_000L;
 
@@ -252,10 +255,11 @@ public class AuthTest extends RpcTestBase {
         refuseRefreshes();
         awaitCondition("refused refresh sent", () -> refreshTokens().size() == 1);
         awaitCondition("refresh error reported", () -> !errorEvents.isEmpty());
+        // The error is reported on the executor before the retry would be scheduled, so once the executor
+        // has run everything queued before this call, a retry is either scheduled or it is not.
+        drainExecutor();
 
-        // A retry would be scheduled within the fast retry bound, so this window shows one if it exists.
-        Thread.sleep(300L);
-
+        assertFalse("no retry is scheduled", client.authRefresh().hasScheduledTimer());
         assertEquals("the refused refresh is not sent again", 1, refreshTokens().size());
         assertEquals("the token is not fetched again", 1, fetchTimes.size());
         assertEquals(ClientState.CONNECTED, client.getState());
@@ -312,6 +316,194 @@ public class AuthTest extends RpcTestBase {
         assertEquals(Arrays.asList("token-1", "token-2"), refreshTokens().subList(0, 2));
         assertEquals(ClientState.CONNECTED, client.getState());
         assertFalse(disconnectedSignals.tryAcquire());
+    }
+
+
+    @Test
+    public void timerRefreshWithAClientErrorCodeIsRetriedWithAFreshToken() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        AtomicInteger fetches = new AtomicInteger();
+        Options options = new Options();
+        options.setToken("token-initial");
+        options.setTokenGetter(new ConnectionTokenGetter() {
+            @Override
+            public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
+                cb.Done(null, "token-" + fetches.incrementAndGet());
+            }
+        });
+        newAuthClient(options, FAST_RETRY_MIN_MILLIS, FAST_RETRY_MAX_MILLIS);
+        connect(client);
+        server.onCommand = (Protocol.Command cmd) -> {
+            if (!cmd.hasRefresh()) {
+                return null;
+            }
+            if ("token-1".equals(cmd.getRefresh().getToken())) {
+                return Protocol.Reply.newBuilder()
+                        .setId(cmd.getId())
+                        .setError(Protocol.Error.newBuilder().setCode(CLIENT_ERROR).setMessage("bad request"))
+                        .build();
+            }
+            return Protocol.Reply.newBuilder()
+                    .setId(cmd.getId())
+                    .setRefresh(Protocol.RefreshResult.newBuilder().setUser("u1").setAuthClass("authenticated").setExpires(true).setTtl(1))
+                    .build();
+        };
+
+        awaitCondition("retry sent with a fresh token", () -> refreshTokens().size() >= 2);
+
+        assertEquals(Arrays.asList("token-1", "token-2"), refreshTokens().subList(0, 2));
+        assertEquals(ClientState.CONNECTED, client.getState());
+        assertFalse(disconnectedSignals.tryAcquire());
+    }
+
+
+    @Test
+    public void rpcWaitsForARefreshQueuedBehindATimerFetch() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        List<TokenCallback> fetches = new CopyOnWriteArrayList<>();
+        Options options = new Options();
+        options.setToken("token-initial");
+        options.setTokenGetter(new ConnectionTokenGetter() {
+            @Override
+            public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
+                fetches.add(cb);
+            }
+        });
+        newAuthClient(options);
+        connect(client);
+        answerRefreshes("u2", "authenticated");
+        awaitCondition("timer fetch started", () -> fetches.size() == 1);
+
+        CompletableFuture<AuthResult> refreshFuture = refresh(client, "token-2");
+        CompletableFuture<RPCResult> rpcFuture = new CompletableFuture<>();
+        client.rpc("method", EMPTY_PAYLOAD, into(rpcFuture));
+        syncWithServer();
+        assertTrue("the refresh waits behind the fetch", refreshTokens().isEmpty());
+        assertEquals("the rpc waits for the refresh", 0, sentRpcRequests().size());
+
+        fetches.get(0).Done(null, "token-timer");
+
+        refreshFuture.get(5, TimeUnit.SECONDS);
+        rpcFuture.get(5, TimeUnit.SECONDS);
+        assertEquals(Arrays.asList("token-timer", "token-2"), refreshTokens());
+        int refreshAt = -1;
+        int rpcAt = -1;
+        List<Protocol.Command> received = server.received();
+        for (int i = 0; i < received.size(); i++) {
+            if (received.get(i).hasRefresh() && "token-2".equals(received.get(i).getRefresh().getToken())) {
+                refreshAt = i;
+            }
+            if (received.get(i).hasRpc()) {
+                rpcAt = i;
+            }
+        }
+        assertTrue("the rpc is sent after the refresh", refreshAt >= 0 && rpcAt > refreshAt);
+    }
+
+
+    @Test
+    public void refreshWithTheSameTokenSharesOneCommand() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        newAuthClient(new Options());
+        connect(client);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+
+        CompletableFuture<AuthResult> first = refresh(client, "token-a");
+        CompletableFuture<AuthResult> second = refresh(client, "token-a");
+        awaitCondition("refresh sent", () -> refreshTokens().size() == 1);
+        syncWithServer();
+        assertEquals(Arrays.asList("token-a"), refreshTokens());
+
+        server.releaseDeferredCommands();
+
+        first.get(5, TimeUnit.SECONDS);
+        second.get(5, TimeUnit.SECONDS);
+        assertEquals("one command for both calls", Arrays.asList("token-a"), refreshTokens());
+    }
+
+
+    @Test
+    public void timerEntriesDoNotCountAgainstTheRefreshBound() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        newAuthClient(optionsWithTokenGetter(new CopyOnWriteArrayList<Long>()));
+        connect(client);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+        CompletableFuture<AuthResult> first = refresh(client, "token-0");
+        awaitCondition("refresh sent", () -> refreshTokens().size() == 1);
+        // The timer fires one ttl after the connect and queues behind the refresh in flight.
+        awaitCondition("timer queued behind the refresh", () -> client.authRefresh().waitingCount() == 1);
+
+        List<CompletableFuture<AuthResult>> accepted = new ArrayList<>();
+        for (int i = 1; i < 32; i++) {
+            accepted.add(refresh(client, "token-" + i));
+        }
+        CompletableFuture<AuthResult> refused = refresh(client, "token-32");
+
+        assertEquals(LIMIT_EXCEEDED, ((ReplyError) errorOf(refused)).getCode());
+        for (CompletableFuture<AuthResult> future : accepted) {
+            assertFalse("accepted: it waits for the refresh in flight", future.isDone());
+        }
+        server.deferCommand = null;
+        server.releaseDeferredCommands();
+
+        first.get(5, TimeUnit.SECONDS);
+        for (CompletableFuture<AuthResult> future : accepted) {
+            future.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+
+    @Test
+    public void refreshWhileDisconnectedSetsTheTokenOfTheNextConnect() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        Options options = new Options();
+        options.setToken("token-1");
+        newAuthClient(options);
+        connect(client);
+        client.disconnect();
+        // The token the connection had is expired: a connect with it is refused.
+        server.onCommand = (Protocol.Command cmd) -> {
+            if (cmd.hasConnect() && "token-1".equals(cmd.getConnect().getToken())) {
+                return Protocol.Reply.newBuilder()
+                        .setId(cmd.getId())
+                        .setError(Protocol.Error.newBuilder().setCode(TOKEN_EXPIRED).setMessage("token expired"))
+                        .build();
+            }
+            if (cmd.hasRefresh()) {
+                return Protocol.Reply.newBuilder()
+                        .setId(cmd.getId())
+                        .setRefresh(Protocol.RefreshResult.newBuilder().setUser("u2").setAuthClass("authenticated"))
+                        .build();
+            }
+            return null;
+        };
+
+        CompletableFuture<AuthResult> refreshFuture = refresh(client, "token-2");
+        connect(client);
+
+        assertEquals("u2", refreshFuture.get(5, TimeUnit.SECONDS).getUser());
+        assertEquals("token-2", lastConnectRequest().getToken());
+    }
+
+
+    @Test
+    public void refusedRefreshWhileDisconnectedRestoresThePreviousToken() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        Options options = new Options();
+        options.setToken("token-1");
+        newAuthClient(options);
+        connect(client);
+        client.disconnect();
+        refuseRefreshes();
+        CompletableFuture<AuthResult> refused = refresh(client, "token-2");
+
+        connect(client);
+
+        assertEquals(PERMISSION_DENIED, ((ReplyError) errorOf(refused)).getCode());
+        client.disconnect();
+        server.onCommand = null;
+        connect(client);
+        assertEquals("the next connect carries the previous token", "token-1", lastConnectRequest().getToken());
     }
 
 
@@ -626,7 +818,7 @@ public class AuthTest extends RpcTestBase {
 
     private static CompletableFuture<AuthResult> refresh(Client c, String token) {
         CompletableFuture<AuthResult> future = new CompletableFuture<>();
-        c.refresh(token, into(future));
+        c.refresh(token, completeInto(future));
         return future;
     }
 
