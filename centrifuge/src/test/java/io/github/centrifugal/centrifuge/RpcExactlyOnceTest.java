@@ -24,6 +24,7 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -37,12 +38,16 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     // Server error for a msg_id outside its window. The code is server-configurable, the test
     // only pins that the client surfaces it as a reply error.
     private static final int MSG_ID_INVALID = 107;
+    // Server error of a call the server refused for now, such as a store which is unavailable.
+    private static final int TEMPORARY = 100;
     // Largest msg_id a JSON number carries exactly: 53 bits.
     private static final long MSG_ID_MAX = (1L << 53) - 1;
 
     // msg_id -> payload of the calls the fake server ran.
     private final Map<Long, byte[]> records = new ConcurrentHashMap<>();
     private final AtomicInteger executions = new AtomicInteger();
+    // When the fake server received each refused or answered call, by System.nanoTime.
+    private final List<Long> rpcArrivalsNanos = Collections.synchronizedList(new ArrayList<Long>());
     // While set, the fake server holds the answers to calls, so they are lost with the transport.
     private final AtomicBoolean holdCalls = new AtomicBoolean(false);
     // While set, the fake server holds the connect reply.
@@ -597,17 +602,47 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void msgIdInvalidIsSurfacedAndNotResent() throws Exception {
+    public void msgIdRefusalIsResentWithANewMsgId() throws Exception {
         enableRpcOptions();
-        server.onCommand = (Protocol.Command cmd) ->{
-            if (!cmd.hasRpc()) {
-                return null;
-            }
-            return Protocol.Reply.newBuilder()
-                    .setId(cmd.getId())
-                    .setError(Protocol.Error.newBuilder().setCode(MSG_ID_INVALID).setMessage("msg_id outside the window"))
-                    .build();
-        };
+        AtomicLong serverTime = new AtomicLong(System.currentTimeMillis() - 120_000L);
+        refuseCalls(1, MSG_ID_INVALID, Extensions.RPC_RETRY_NEW_MSG_ID, serverTime);
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("late", EMPTY_PAYLOAD, into(future));
+
+        assertEquals("ok", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+        List<Protocol.RPCRequest> requests = sentRpcRequests();
+        assertEquals(2, requests.size());
+        assertNotEquals("the resend has a new msg_id", requests.get(0).getMsgId(), requests.get(1).getMsgId());
+        assertFalse("the new msg_id is not a retransmit", requests.get(1).getRetransmit());
+        assertTrue("the resend has the corrected time part", timePart(requests.get(1)) < timePart(requests.get(0)));
+    }
+
+
+    @Test
+    public void callAfterAMsgIdRefusalUsesTheCorrectedTimePart() throws Exception {
+        enableRpcOptions();
+        AtomicLong serverTime = new AtomicLong(System.currentTimeMillis() - 120_000L);
+        refuseCalls(1, MSG_ID_INVALID, Extensions.RPC_RETRY_NEW_MSG_ID, serverTime);
+        Client c = newClient();
+        connect(c);
+        callAndWait(c);
+
+        callAndWait(c);
+
+        List<Protocol.RPCRequest> requests = sentRpcRequests();
+        assertEquals(3, requests.size());
+        long correctedSecond = (System.currentTimeMillis() - 120_000L) / 1000L;
+        assertTrue("the next call follows the corrected clock", Math.abs(timePart(requests.get(2)) - correctedSecond) <= 5);
+        assertTrue("the next call has its own msg_id", requests.get(2).getMsgId() > requests.get(1).getMsgId());
+    }
+
+
+    @Test
+    public void msgIdRefusedThreeTimesSurfacesTheErrorWithItsMetadata() throws Exception {
+        enableRpcOptions();
+        refuseCalls(3, MSG_ID_INVALID, Extensions.RPC_RETRY_NEW_MSG_ID, new AtomicLong(System.currentTimeMillis()));
         Client c = newClient();
         connect(c);
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
@@ -616,7 +651,135 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         ReplyError error = replyErrorOf(future);
 
         assertEquals(MSG_ID_INVALID, error.getCode());
+        assertEquals(Extensions.RPC_RETRY_NEW_MSG_ID, error.getMetadata().get(Extensions.RPC_RETRY_METADATA_KEY));
+        List<Protocol.RPCRequest> requests = sentRpcRequests();
+        assertEquals("the call and two resends", 3, requests.size());
+        for (Protocol.RPCRequest request : requests) {
+            assertFalse(request.getRetransmit());
+        }
+    }
+
+
+    @Test
+    public void laterRefusalIsResentWithTheSameMsgIdAfterTheDelay() throws Exception {
+        enableRpcOptions();
+        refuseCalls(1, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("later", EMPTY_PAYLOAD, into(future));
+
+        assertEquals("ok", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+        List<Protocol.RPCRequest> requests = sentRpcRequests();
+        assertEquals(2, requests.size());
+        assertEquals("the resend keeps the msg_id", requests.get(0).getMsgId(), requests.get(1).getMsgId());
+        assertFalse(requests.get(0).getRetransmit());
+        assertTrue("the resend is a retransmit", requests.get(1).getRetransmit());
+        long delayNanos = rpcArrivalsNanos.get(1) - rpcArrivalsNanos.get(0);
+        assertTrue("the resend waits 250 ms", delayNanos >= TimeUnit.MILLISECONDS.toNanos(250L));
+    }
+
+
+    @Test
+    public void laterRefusedFourTimesSurfacesTheError() throws Exception {
+        enableRpcOptions();
+        refuseCalls(4, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("later", EMPTY_PAYLOAD, into(future));
+
+        ReplyError error = replyErrorOf(future);
+
+        assertEquals(TEMPORARY, error.getCode());
+        assertEquals(Extensions.RPC_RETRY_LATER, error.getMetadata().get(Extensions.RPC_RETRY_METADATA_KEY));
+        List<Protocol.RPCRequest> requests = sentRpcRequests();
+        assertEquals("the call and three resends", 4, requests.size());
+        for (Protocol.RPCRequest request : requests) {
+            assertEquals(requests.get(0).getMsgId(), request.getMsgId());
+        }
+    }
+
+
+    @Test
+    public void msgIdRefusalWithoutTheKeyIsSurfacedAtOnce() throws Exception {
+        enableRpcOptions();
+        refuseCalls(1, MSG_ID_INVALID, null, new AtomicLong(System.currentTimeMillis()));
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("late", EMPTY_PAYLOAD, into(future));
+
+        ReplyError error = replyErrorOf(future);
+
+        assertEquals(MSG_ID_INVALID, error.getCode());
+        syncWithServer();
         assertEquals("the call is rejected, not sent again", 1, sentRpcRequests().size());
+    }
+
+
+    @Test
+    public void temporaryRefusalWithoutTheKeyIsSurfacedAtOnce() throws Exception {
+        enableRpcOptions();
+        refuseCalls(1, TEMPORARY, null, new AtomicLong(System.currentTimeMillis()));
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("late", EMPTY_PAYLOAD, into(future));
+
+        ReplyError error = replyErrorOf(future);
+
+        assertEquals(TEMPORARY, error.getCode());
+        syncWithServer();
+        assertEquals("the call is not sent again", 1, sentRpcRequests().size());
+    }
+
+
+    @Test
+    public void laterDelayAcrossADroppedTransportIsResentOnReconnect() throws Exception {
+        enableRpcOptions();
+        refuseCalls(1, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("later", EMPTY_PAYLOAD, into(future));
+        awaitRequestCount(1);
+
+        server.closeConnection();
+
+        assertEquals("ok", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+        List<Protocol.RPCRequest> requests = sentRpcRequests();
+        assertEquals(2, requests.size());
+        assertEquals(requests.get(0).getMsgId(), requests.get(1).getMsgId());
+        assertTrue(requests.get(1).getRetransmit());
+    }
+
+
+    @Test
+    public void deadlineDuringAResendRejectsWithTimeoutAndCancels() throws Exception {
+        enableRpcOptions();
+        AtomicInteger seen = new AtomicInteger();
+        AtomicLong serverTime = new AtomicLong(System.currentTimeMillis());
+        // The first call is refused for now. Its resend is held, so the deadline comes while the call waits or is in flight.
+        server.onCommand = (Protocol.Command cmd) -> {
+            if (!cmd.hasRpc() || cmd.getRpc().getCancel() != 0) {
+                return null;
+            }
+            if (seen.getAndIncrement() == 0) {
+                return refusal(cmd, TEMPORARY, Extensions.RPC_RETRY_LATER, serverTime.get());
+            }
+            return null;
+        };
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && cmd.getRpc().getCancel() == 0;
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("slow", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(300).build(), into(future));
+        awaitCondition("first attempt", () -> !sentRpcRequests().isEmpty());
+        long msgId = sentRpcRequests().get(0).getMsgId();
+
+        assertTrue(errorOf(future) instanceof TimeoutException);
+        assertEquals(msgId, awaitCancel(msgId).getCancel());
     }
 
 
@@ -649,6 +812,49 @@ public class RpcExactlyOnceTest extends RpcTestBase {
             assertTrue("call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
         }
         return futures;
+    }
+
+
+    // Refuses the first calls with the code and the retry value, and answers the calls after them. The
+    // refusals carry the server time, so the client re-syncs to it.
+    private void refuseCalls(final int refusals, final int code, final String retry, final AtomicLong serverTime) {
+        final AtomicInteger seen = new AtomicInteger();
+        server.onCommand = (Protocol.Command cmd) -> {
+            if (!cmd.hasRpc() || cmd.getRpc().getCancel() != 0) {
+                return null;
+            }
+            rpcArrivalsNanos.add(System.nanoTime());
+            if (seen.getAndIncrement() < refusals) {
+                return refusal(cmd, code, retry, serverTime.get());
+            }
+            return Protocol.Reply.newBuilder()
+                    .setId(cmd.getId())
+                    .setTime(serverTime.get())
+                    .setRpc(Protocol.RPCResult.newBuilder()
+                            .setData(com.google.protobuf.ByteString.copyFromUtf8("ok")))
+                    .build();
+        };
+    }
+
+
+    // The error reply of a call the server refused. The retry value is set only when given.
+    private static Protocol.Reply refusal(Protocol.Command cmd, int code, String retry, long serverTime) {
+        Protocol.Error.Builder error = Protocol.Error.newBuilder()
+                .setCode(code)
+                .setMessage("refused");
+        if (retry != null) {
+            error.putMetadata(Extensions.RPC_RETRY_METADATA_KEY, retry);
+        }
+        return Protocol.Reply.newBuilder()
+                .setId(cmd.getId())
+                .setTime(serverTime)
+                .setError(error)
+                .build();
+    }
+
+
+    private static long timePart(Protocol.RPCRequest request) {
+        return request.getMsgId() >> MsgIdGenerator.SEQUENCE_BITS;
     }
 
 

@@ -158,6 +158,8 @@ Calls which wait for the connection (issued while it is down or while a refresh 
 
 The `msg_id` carries the server time, corrected by the server time of each reply, and is taken when the call is first written. The time part follows the corrected clock. A correction that moves the clock back holds the time part of the last `msg_id` until the clock passes it, so the `msg_id` values keep increasing. The sequence of each second starts at a random lane, so no `msg_id` is issued twice, also by two clients which share an instance after a reload.
 
+The server refuses a call it did not run with a reply error, and sets the metadata key `x-centrifugo-retry` on it (`ReplyError.getMetadata()`). The value `new_msg_id` means the `msg_id` was outside the server window: the client re-syncs its clock to the server time of that reply, and sends the call again at once with a new `msg_id`, at most twice. The value `later` means the call did not run and its `msg_id` is still good: the client sends the same `msg_id` again after 250 ms, 500 ms and then 1 s, at most three times, with the retransmit flag set. The deadline of the call bounds all attempts. An error without the key is returned at once, and so is the error of the last attempt, with its metadata. A refused call has not run, so a resend never runs it twice.
+
 ### Connection instance
 
 The server scopes the records of a client by a connection instance, which the application supplies with `Options.setInstance`. The SDK never generates it and never stores it. The application must:

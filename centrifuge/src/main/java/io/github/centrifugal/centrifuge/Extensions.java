@@ -21,6 +21,18 @@ final class Extensions {
      */
     static final long RPC_OPTIONS_FLAG = 1L << 32;
 
+    /**
+     * Error metadata key the server sets on the errors of rpc calls it did not run. Its value says
+     * whether and how the call may be sent again, see {@link #retrySignal}.
+     */
+    static final String RPC_RETRY_METADATA_KEY = "x-centrifugo-retry";
+
+    /** Retry value: the msg_id was refused as outside the window. Send the call again with a new msg_id. */
+    static final String RPC_RETRY_NEW_MSG_ID = "new_msg_id";
+
+    /** Retry value: the call did not run and its msg_id is still good. Send it again, later. */
+    static final String RPC_RETRY_LATER = "later";
+
     private static final String UNSUPPORTED_RPC_MESSAGE = "rpc headers are not supported by the server";
 
     private static final Pattern INSTANCE_PATTERN = Pattern.compile("[A-Za-z0-9_-]{22,64}");
@@ -79,6 +91,15 @@ final class Extensions {
     /** Server time estimated from a local time and the offset of the server clock. */
     static long estimateServerTime(long localTime, long offset) {
         return localTime + offset;
+    }
+
+
+    /**
+     * The retry value the server set on an error reply, or null when it set none. Read through this
+     * one function, so the carrier of the signal can change in one place.
+     */
+    static String retrySignal(Protocol.Error error) {
+        return error.getMetadataMap().get(RPC_RETRY_METADATA_KEY);
     }
 
 

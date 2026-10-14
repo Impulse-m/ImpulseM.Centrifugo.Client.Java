@@ -1,6 +1,8 @@
 package io.github.centrifugal.centrifuge;
 
 import java.util.Map;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 import java8.util.concurrent.CompletableFuture;
@@ -18,6 +20,8 @@ public final class RpcCall {
     final Map<String, String> headers;
     final long timeout;
     final ResultCallback<RPCResult> callback;
+    // The deadline of the call on the nano clock. It starts with the call, so it bounds the resends too.
+    final long deadlineNanos;
 
     // The fields below are the state of the call on the client's executor thread.
     // The future is created with the call, so a cancel can complete it before the call starts.
@@ -28,6 +32,14 @@ public final class RpcCall {
     boolean everSent;
     // The last write carried msg_id, so the server knows the call and may answer a resend.
     boolean wireTracked;
+    // The msg_id was refused, so the next write carries a new one, which the server has not seen:
+    // that write is not a retransmit. Cleared when the write goes out.
+    boolean resendAsNew;
+    // Resends so far: after a refused msg_id, and after a temporary refusal.
+    int newIdResends;
+    int laterResends;
+    // The resend which waits for its delay, cancelled with the call.
+    ScheduledFuture<?> resendTask;
 
 
     RpcCall(
@@ -44,6 +56,7 @@ public final class RpcCall {
         this.headers = headers;
         this.timeout = timeout;
         this.callback = callback;
+        this.deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout);
     }
 
 
@@ -62,5 +75,11 @@ public final class RpcCall {
             return;
         }
         this.client.cancelRpc(this);
+    }
+
+
+    // The time left until the deadline, in nanoseconds. Zero or less when the deadline has passed.
+    long remainingNanos() {
+        return deadlineNanos - System.nanoTime();
     }
 }
