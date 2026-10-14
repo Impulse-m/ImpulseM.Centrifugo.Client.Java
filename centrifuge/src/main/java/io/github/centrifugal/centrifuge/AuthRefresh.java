@@ -194,7 +194,7 @@ final class AuthRefresh {
     private void scheduleTimer(long delay, TimeUnit unit) {
         cancelTimer();
         final long generation = timerGeneration;
-        timer = client.getScheduler().schedule(() -> client.getExecutor().submit(() -> onTimer(generation)), delay, unit);
+        timer = client.getScheduler().schedule(() -> client.sendRefresh(generation), delay, unit);
     }
 
 
@@ -204,7 +204,7 @@ final class AuthRefresh {
 
 
     // The timer fired: fetch a token and refresh with it, under the single-flight gate.
-    private void onTimer(long generation) {
+    void onTimer(long generation) {
         if (generation != timerGeneration || client.getOpts().getTokenGetter() == null) {
             return;
         }

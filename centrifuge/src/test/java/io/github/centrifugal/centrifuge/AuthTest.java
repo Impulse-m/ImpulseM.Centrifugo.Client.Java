@@ -6,6 +6,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -775,7 +776,7 @@ public class AuthTest extends RpcTestBase {
 
 
     private void newAuthClient(Options options, int retryMinMillis, int retryMaxMillis) {
-        client = new Client(server.url(), options, authListener(), retryMinMillis, retryMaxMillis);
+        client = new Client(server.url(), options, authListener(), retryMinMillis, retryMaxMillis, Executors.newScheduledThreadPool(1));
     }
 
 

@@ -67,7 +67,7 @@ public class Client {
     private final Backoff backoff;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+    private final ScheduledExecutorService scheduler;
     private int pingInterval;
     private boolean sendPong;
     private ScheduledFuture<?> pingTask;
@@ -213,15 +213,17 @@ public class Client {
      * @param listener: client event handler.
      */
     public Client(final String endpoint, final Options opts, final EventListener listener) {
-        this(endpoint, opts, listener, AUTH_RETRY_MIN_MILLIS, AUTH_RETRY_MAX_MILLIS);
+        this(endpoint, opts, listener, AUTH_RETRY_MIN_MILLIS, AUTH_RETRY_MAX_MILLIS, Executors.newScheduledThreadPool(1));
     }
 
-    // The retry bounds of the token refresh are a parameter so that the tests do not wait for the defaults.
-    Client(final String endpoint, final Options opts, final EventListener listener, final int authRetryMinMillis, final int authRetryMaxMillis) {
+    // The retry bounds of the token refresh and the scheduler of the timers are parameters so that the
+    // tests can control the time, see ManualScheduler.
+    Client(final String endpoint, final Options opts, final EventListener listener, final int authRetryMinMillis, final int authRetryMaxMillis, final ScheduledExecutorService scheduler) {
         this.endpoint = endpoint;
         this.opts = opts;
         this.instance = opts.getInstance();
         this.listener = listener;
+        this.scheduler = scheduler;
         this.backoff = new Backoff();
         this.rpcSession = new RpcSession(this, opts.getMaxPendingRpc());
         this.auth = new AuthRefresh(this, authRetryMinMillis, authRetryMaxMillis);
@@ -1072,6 +1074,11 @@ public class Client {
         this.pingTask = this.scheduler.schedule(Client.this::waitServerPing, this.pingInterval + this.opts.getMaxServerPingDelay(), TimeUnit.MILLISECONDS);
 
         this.auth.scheduleExpiry(result.getExpires(), result.getTtl());
+    }
+
+    // The refresh timer fired. AuthRefresh fetches a token and refreshes with it, on the executor.
+    void sendRefresh(long generation) {
+        this.executor.submit(() -> this.auth.onTimer(generation));
     }
 
     private void sendConnect() {

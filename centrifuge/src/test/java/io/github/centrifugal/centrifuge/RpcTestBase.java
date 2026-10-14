@@ -103,7 +103,22 @@ abstract class RpcTestBase extends FakeServerTestBase {
 
     /** Creates the client for the fake server with the options, whose connect and disconnect are signalled. */
     protected Client newClient(Options options) {
-        return newClient(options, new EventListener() {
+        return newClient(options, signallingListener());
+    }
+
+
+    /**
+     * Creates the client for the fake server with the options, whose timers run on the clock: the test
+     * moves the clock with {@link ManualScheduler#advance}. The client is not connected yet.
+     */
+    protected Client newClientOnClock(Options options, ManualScheduler clock) {
+        client = new Client(server.url(), options, signallingListener(), Client.AUTH_RETRY_MIN_MILLIS, Client.AUTH_RETRY_MAX_MILLIS, clock);
+        return client;
+    }
+
+
+    private EventListener signallingListener() {
+        return new EventListener() {
             @Override
             public void onConnected(Client c, ConnectedEvent e) {
                 connectedSignals.release();
@@ -114,7 +129,7 @@ abstract class RpcTestBase extends FakeServerTestBase {
             public void onDisconnected(Client c, DisconnectedEvent e) {
                 disconnectedSignals.release();
             }
-        });
+        };
     }
 
 
