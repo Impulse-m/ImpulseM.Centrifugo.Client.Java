@@ -140,7 +140,7 @@ With a server that confirms RPC options on the connect reply, every `rpc` call c
 
 A call keeps its original deadline across resends: `Options.setTimeout` by default, or `RpcOptions.Builder.timeout`. A call whose deadline passes while the client is disconnected is rejected with a `TimeoutException`.
 
-`rpcCall` returns an `RpcCall` handle. `cancel()` asks the server to stop the call and rejects it locally with `ReplyError.CANCELLED` (16). A call which was not sent yet is never sent. A cancel issued while the client is disconnected goes out with the next connection. Without the capability, `cancel()` rejects with `ReplyError.UNSUPPORTED` and nothing is sent.
+`rpcCall` returns an `RpcCall` handle. `cancel()` asks the server to stop the call and rejects it locally with `ReplyError.CANCELLED` (17). A call which was not sent yet is never sent, and is rejected with `ReplyError.CANCELLED` whatever the server supports. A cancel issued while the client is disconnected goes out with the next connection. Without the capability, `cancel()` of a call which was already sent rejects with `ReplyError.UNSUPPORTED` and sends nothing.
 
 ```java
 RpcCall call = client.rpcCall("my.method.name", data, new ResultCallback<RPCResult>() {
@@ -154,7 +154,7 @@ RpcCall call = client.rpcCall("my.method.name", data, new ResultCallback<RPCResu
 call.cancel();
 ```
 
-Calls which wait for the connection (issued while it is down, or lost with a transport) are bounded by `Options.setMaxPendingRpc`, 32 by default. A call beyond the bound fails with `ReplyError.LIMIT_EXCEEDED` (106). Without the capability, calls are sent without a `msg_id`, nothing is resent, and a call lost with its transport fails with an `IOException`.
+Calls which wait for the connection (issued while it is down, or lost with a transport) are bounded by `Options.setMaxPendingRpc`, 32 by default. A call beyond the bound fails with `ReplyError.LIMIT_EXCEEDED` (16). A lost call beyond the bound on a reconnect fails the same way, the oldest calls are kept. Without the capability, calls are sent without a `msg_id`, nothing is resent, and a call lost with its transport fails with an `IOException`.
 
 ### Connection instance
 

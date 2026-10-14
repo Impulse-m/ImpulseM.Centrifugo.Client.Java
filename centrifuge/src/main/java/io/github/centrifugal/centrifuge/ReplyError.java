@@ -12,16 +12,15 @@ public class ReplyError extends Throwable {
     public static final int UNSUPPORTED = 15;
 
     /**
-     * Code of a call the client cancelled with {@link RpcCall#cancel()}.
+     * Code of a call the client did not send because too many rpc calls already wait for the
+     * connection, see {@link Options#setMaxPendingRpc(int)}.
      */
-    public static final int CANCELLED = 16;
+    public static final int LIMIT_EXCEEDED = 16;
 
     /**
-     * Code of a call the client did not send because too many rpc calls already wait for the
-     * connection, see {@link Options#setMaxPendingRpc(int)}. Same number as the server's
-     * limit exceeded error.
+     * Code of a call the client cancelled with {@link RpcCall#cancel()}.
      */
-    public static final int LIMIT_EXCEEDED = 106;
+    public static final int CANCELLED = 17;
 
     private int code;
 

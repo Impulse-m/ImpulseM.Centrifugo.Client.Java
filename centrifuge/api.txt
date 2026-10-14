@@ -268,8 +268,8 @@ package io.github.centrifugal.centrifuge {
     method public void setCode(int);
     method public void setMessage(String);
     method public void setTemporary(boolean);
-    field public static final int CANCELLED = 16; // 0x10
-    field public static final int LIMIT_EXCEEDED = 106; // 0x6a
+    field public static final int CANCELLED = 17; // 0x11
+    field public static final int LIMIT_EXCEEDED = 16; // 0x10
     field public static final int UNSUPPORTED = 15; // 0xf
   }
 
