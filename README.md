@@ -90,6 +90,50 @@ To use with Android don't forget to set INTERNET permission to `AndroidManifest.
 
 When a mobile application goes to the background there are OS-specific limitations for established persistent connections - which can be silently closed shortly. Thus in most cases you need to disconnect from a server when app moves to the background and connect again when app goes to the foreground.
 
+## RPC options
+
+`rpc` has an overload that takes `RpcOptions`. Headers set in the options are sent with that one call only:
+
+```java
+RpcOptions options = new RpcOptions.Builder()
+        .header("x-request-source", "mobile")
+        .build();
+
+client.rpc("my.method.name", data, options, new ResultCallback<RPCResult>() {
+    @Override
+    public void onDone(Throwable e, RPCResult result) {
+        // result.getData() on success
+    }
+});
+```
+
+Headers need a server that supports RPC options. The client advertises this capability in the connect request, and the server confirms it in the connect reply. Check the confirmed capability on the client:
+
+```java
+if (client.getCapabilities().isRpcOptionsSupported()) {
+    // per-call headers can be sent
+}
+```
+
+The capability belongs to the current connection. It is `false` until a connect reply confirms it, and it is cleared when the transport closes. When it is `false`, an `rpc` call with headers fails locally: the callback gets a `ReplyError` with code `ReplyError.UNSUPPORTED` (15), and the call is not sent. A call with empty options, or the `rpc` overload without options, is a plain call and works either way.
+
+Errors from the server can carry application fields. They are available on `ReplyError`, and they are empty or zero when the server did not send them:
+
+* `getAppCode()` - numeric application error code, `0` when not set.
+* `getAppType()` - application error type, empty when not set.
+* `getMetadata()` - unmodifiable string map of allow-listed server metadata, empty when not set.
+
+```java
+public void onDone(Throwable e, RPCResult result) {
+    if (e instanceof ReplyError) {
+        ReplyError error = (ReplyError) e;
+        System.out.println(error.getCode() + " " + error.getAppCode() + " " + error.getAppType() + " " + error.getMetadata());
+    }
+}
+```
+
+`client.serverTimeMillis()` returns the current time in milliseconds on the server clock. It is estimated from the server time in the last reply that carried one, and falls back to local time until a reply has carried a server time.
+
 ## CI status
 
 [![Test](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/actions/workflows/ci.yml/badge.svg)](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/actions/workflows/ci.yml)
