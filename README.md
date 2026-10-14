@@ -134,6 +134,46 @@ public void onDone(Throwable e, RPCResult result) {
 
 `client.serverTimeMillis()` returns the current time in milliseconds on the server clock. It is estimated from the server time in the last reply that carried one, and falls back to local time until a reply has carried a server time.
 
+## Exactly-once calls
+
+With a server that confirms RPC options on the connect reply, every `rpc` call carries a `msg_id`, and the server runs each `msg_id` once. When the transport drops before the reply arrives, the client keeps the call and sends it again after the next connect reply, with the same `msg_id` and the retransmit flag set. The server answers from its record, so the call is not run twice. The result then has `isCached()` set to `true`. The replies received are acknowledged with the next call, so the server can drop its records early.
+
+A call keeps its original deadline across resends: `Options.setTimeout` by default, or `RpcOptions.Builder.timeout`. A call whose deadline passes while the client is disconnected is rejected with a `TimeoutException`.
+
+`rpcCall` returns an `RpcCall` handle. `cancel()` asks the server to stop the call and rejects it locally with `ReplyError.CANCELLED` (16). A call which was not sent yet is never sent. A cancel issued while the client is disconnected goes out with the next connection. Without the capability, `cancel()` rejects with `ReplyError.UNSUPPORTED` and nothing is sent.
+
+```java
+RpcCall call = client.rpcCall("my.method.name", data, new ResultCallback<RPCResult>() {
+    @Override
+    public void onDone(Throwable e, RPCResult result) {
+        if (e instanceof ReplyError && ((ReplyError) e).getCode() == ReplyError.CANCELLED) {
+            // the call was cancelled
+        }
+    }
+});
+call.cancel();
+```
+
+Calls which wait for the connection (issued while it is down, or lost with a transport) are bounded by `Options.setMaxPendingRpc`, 32 by default. A call beyond the bound fails with `ReplyError.LIMIT_EXCEEDED` (106). Without the capability, calls are sent without a `msg_id`, nothing is resent, and a call lost with its transport fails with an `IOException`.
+
+### Connection instance
+
+The server scopes the records of a client by a connection instance, which the application supplies with `Options.setInstance`. The SDK never generates it and never stores it. The application must:
+
+* generate a random secret of at least 128 bits: 22 to 64 characters from `A-Za-z0-9_-`;
+* keep it per installation or per tab, in storage of its own;
+* never log or share it. Whoever knows it can retransmit and cancel calls in its scope.
+
+`setInstance` throws `IllegalArgumentException` for a value outside that pattern. `null` clears the instance. Without an instance a call has no scope on the server, so it is not deduplicated.
+
+```java
+byte[] bytes = new byte[16];
+new java.security.SecureRandom().nextBytes(bytes);
+String instance = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+// persist the value in the application's own storage, then:
+options.setInstance(instance);
+```
+
 ## CI status
 
 [![Test](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/actions/workflows/ci.yml/badge.svg)](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/actions/workflows/ci.yml)

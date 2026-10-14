@@ -31,6 +31,8 @@ package io.github.centrifugal.centrifuge {
     method public void removeSubscription(io.github.centrifugal.centrifuge.Subscription!);
     method public void rpc(String, byte[]!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.RPCResult!>!);
     method public void rpc(String, byte[]!, io.github.centrifugal.centrifuge.RpcOptions!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.RPCResult!>!);
+    method public io.github.centrifugal.centrifuge.RpcCall! rpcCall(String, byte[]!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.RPCResult!>!);
+    method public io.github.centrifugal.centrifuge.RpcCall! rpcCall(String, byte[]!, io.github.centrifugal.centrifuge.RpcOptions!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.RPCResult!>!);
     method public void send(byte[]!, io.github.centrifugal.centrifuge.CompletionCallback!);
     method public long serverTimeMillis();
     method public void setToken(String);
@@ -178,7 +180,9 @@ package io.github.centrifugal.centrifuge {
     ctor public Options();
     method public byte[]! getData();
     method public io.github.centrifugal.centrifuge.Dns! getDns();
+    method public String getInstance();
     method public Map<String,String> getHeaders();
+    method public int getMaxPendingRpc();
     method public int getMaxReconnectDelay();
     method public int getMaxServerPingDelay();
     method public int getMinReconnectDelay();
@@ -193,6 +197,8 @@ package io.github.centrifugal.centrifuge {
     method public void setData(byte[]!);
     method public void setDns(io.github.centrifugal.centrifuge.Dns!);
     method public void setHeaders(Map<String,String>);
+    method public void setInstance(String);
+    method public void setMaxPendingRpc(int);
     method public void setMaxReconnectDelay(int);
     method public void setMaxServerPingDelay(int);
     method public void setMinReconnectDelay(int);
@@ -240,6 +246,8 @@ package io.github.centrifugal.centrifuge {
     ctor public RPCResult();
     method public byte[]! getData();
     method public io.github.centrifugal.centrifuge.ReplyError! getError();
+    method public boolean isCached();
+    method public void setCached(boolean);
     method public void setData(byte[]!);
     method public void setError(io.github.centrifugal.centrifuge.ReplyError!);
   }
@@ -260,6 +268,8 @@ package io.github.centrifugal.centrifuge {
     method public void setCode(int);
     method public void setMessage(String);
     method public void setTemporary(boolean);
+    field public static final int CANCELLED = 16; // 0x10
+    field public static final int LIMIT_EXCEEDED = 106; // 0x6a
     field public static final int UNSUPPORTED = 15; // 0xf
   }
 
@@ -267,14 +277,20 @@ package io.github.centrifugal.centrifuge {
     method public void onDone(Throwable, T!);
   }
 
+  public final class RpcCall {
+    method public void cancel();
+  }
+
   public final class RpcOptions {
     method public Map<String,String> getHeaders();
+    method public long getTimeout();
   }
 
   public static class RpcOptions.Builder {
     ctor public RpcOptions.Builder();
     method public io.github.centrifugal.centrifuge.RpcOptions! build();
     method public io.github.centrifugal.centrifuge.RpcOptions.Builder! header(String, String);
+    method public io.github.centrifugal.centrifuge.RpcOptions.Builder! timeout(long);
   }
 
   public class ServerJoinEvent {
