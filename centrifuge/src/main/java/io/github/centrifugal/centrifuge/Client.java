@@ -118,6 +118,9 @@ public class Client {
     // impossible (only sent when SUBSCRIPTION_FLAG_REJECT_UNRECOVERED was requested).
     static final int ERROR_CODE_UNRECOVERABLE_POSITION = 112;
 
+    // Reply error of an rpc with headers on a connection without RPC options support.
+    private static final String UNSUPPORTED_RPC_HEADERS_MESSAGE = "rpc headers are not supported by the server";
+
     // Server-sent "state invalidated" codes. The server determines that the
     // client's cached state and/or token are no longer valid and asks the client
     // to drop them and re-sync.
@@ -936,6 +939,10 @@ public class Client {
 
         for (Map.Entry<Integer, Protocol.Command> entry : this.connectCommands.entrySet()) {
             Protocol.Command cmd = entry.getValue();
+            CompletableFuture<Protocol.Reply> pending = this.futures.get(cmd.getId());
+            if (pending != null && this.rejectUnsupportedRpc(cmd, pending)) {
+                continue;
+            }
             boolean sent = this.ws.send(ByteString.of(this.serializeCommand(cmd)));
             if (!sent) {
                 CompletableFuture<Protocol.Reply> f = this.futures.get(cmd.getId());
@@ -1319,12 +1326,29 @@ public class Client {
         this.futures.put(cmd.getId(), f);
         if (this.getState() != ClientState.CONNECTED) {
             this.connectCommands.put(cmd.getId(), cmd);
-        } else {
+        } else if (!this.rejectUnsupportedRpc(cmd, f)) {
             boolean sent = this.ws.send(ByteString.of(this.serializeCommand(cmd)));
             if (!sent) {
                 f.completeExceptionally(new IOException());
             }
         }
+    }
+
+    // An rpc with headers is sent only on a connection which confirmed RPC options. On
+    // any other connection it fails here, with the same reply error a server would give,
+    // and nothing is sent. Returns true when the command was failed. Called when the
+    // command goes out, so a call queued while connecting sees the confirmed capability.
+    private boolean rejectUnsupportedRpc(Protocol.Command cmd, CompletableFuture<Protocol.Reply> f) {
+        if (!cmd.hasRpc() || cmd.getRpc().getHeadersCount() == 0 || this.rpcOptionsSupported) {
+            return false;
+        }
+        f.complete(Protocol.Reply.newBuilder()
+                .setId(cmd.getId())
+                .setError(Protocol.Error.newBuilder()
+                        .setCode(ReplyError.UNSUPPORTED)
+                        .setMessage(UNSUPPORTED_RPC_HEADERS_MESSAGE))
+                .build());
+        return true;
     }
 
     ReplyError getReplyError(Protocol.Reply reply) {
@@ -1349,18 +1373,35 @@ public class Client {
      * @param cb:     will be called as soon as rpc response received or error happened.
      */
     public void rpc(String method, byte[] data, ResultCallback<RPCResult> cb) {
-        this.executor.submit(() -> Client.this.rpcSynchronized(method, data, cb));
+        this.rpc(method, data, null, cb);
     }
 
-    private void rpcSynchronized(String method, byte[] data, ResultCallback<RPCResult> cb) {
-        Protocol.RPCRequest req = Protocol.RPCRequest.newBuilder()
+    /**
+     * Send RPC with method and per-call options to server, process result in callback.
+     * Headers in the options need a server which confirms RPC options, see
+     * {@link #getCapabilities()}. Without it the callback gets error code
+     * {@link ReplyError#UNSUPPORTED} and the call is not sent.
+     *
+     * @param method:  of RPC call.
+     * @param data:    a custom payload for RPC call.
+     * @param options: per-call options, null or without headers for a plain call.
+     * @param cb:      will be called as soon as rpc response received or error happened.
+     */
+    public void rpc(String method, byte[] data, RpcOptions options, ResultCallback<RPCResult> cb) {
+        this.executor.submit(() -> Client.this.rpcSynchronized(method, data, options, cb));
+    }
+
+    private void rpcSynchronized(String method, byte[] data, RpcOptions options, ResultCallback<RPCResult> cb) {
+        Protocol.RPCRequest.Builder req = Protocol.RPCRequest.newBuilder()
                 .setData(com.google.protobuf.ByteString.copyFrom(data))
-                .setMethod(method)
-                .build();
+                .setMethod(method);
+        if (options != null) {
+            req.putAllHeaders(options.getHeaders());
+        }
 
         Protocol.Command cmd = Protocol.Command.newBuilder()
                 .setId(this.getNextId())
-                .setRpc(req)
+                .setRpc(req.build())
                 .build();
 
         CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();

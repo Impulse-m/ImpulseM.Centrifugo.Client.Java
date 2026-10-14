@@ -1,6 +1,12 @@
 package io.github.centrifugal.centrifuge;
 
 public class ReplyError extends Throwable {
+    /**
+     * Code of a call the client did not send because the server does not support RPC
+     * options (headers) on this connection.
+     */
+    public static final int UNSUPPORTED = 15;
+
     private int code;
 
     public ReplyError(int code, String message, boolean temporary) {
