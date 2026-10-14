@@ -81,6 +81,30 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     }
 
 
+    // A refused call takes no slot, so once the call which holds the slot settles, the next call is accepted.
+    @Test
+    public void aRefusedCallHoldsNoSlotOfTheBound() throws Exception {
+        enableRpcOptions();
+        answerRpcs("ok");
+        Options options = instanceOptions();
+        options.setMaxPendingRpc(1);
+        Client c = newClient(options);
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        c.rpcCall("first", EMPTY_PAYLOAD, into(first));
+        CompletableFuture<RPCResult> refused = new CompletableFuture<>();
+        c.rpcCall("refused", EMPTY_PAYLOAD, into(refused));
+        assertEquals(ReplyError.LIMIT_EXCEEDED, replyErrorOf(refused).getCode());
+
+        connect(c);
+        first.get(5, TimeUnit.SECONDS);
+        CompletableFuture<RPCResult> later = new CompletableFuture<>();
+        c.rpcCall("later", EMPTY_PAYLOAD, into(later));
+
+        later.get(5, TimeUnit.SECONDS);
+        assertEquals("the refused call is never sent", 2, sentRpcRequests().size());
+    }
+
+
     @Test
     public void lostCallsAreSentAgainInMsgIdOrder() throws Exception {
         enableRpcOptions();

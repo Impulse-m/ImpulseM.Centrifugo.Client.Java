@@ -78,7 +78,7 @@ final class RpcSession {
     private final MsgIdGenerator msgIds = new MsgIdGenerator();
     // The bound of the calls which are not settled, see submit.
     private final int maxPending;
-    // The calls which are not settled: counted when they are submitted, released when they are delivered.
+    // The slots of the bound taken by the calls which are not settled: taken at submit, given back at delivery.
     private final AtomicInteger pending = new AtomicInteger();
 
 
@@ -97,7 +97,7 @@ final class RpcSession {
      * is not registered and the bound counts every call which is not settled.
      */
     void submit(RpcCall call) {
-        if (pending.incrementAndGet() > maxPending && client.hasInstance()) {
+        if (!reserve(call)) {
             // Refused at once. The call settles on the caller's thread, and the callback runs through the
             // same path as the other calls, so the future of the call is never an orphan.
             call.future.completeExceptionally(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls are pending", false));
@@ -107,7 +107,7 @@ final class RpcSession {
                 // the deadline cannot fire later and call back on another thread.
                 client.getExecutor().submit(() -> start(call));
             } catch (RejectedExecutionException e) {
-                pending.decrementAndGet();
+                release(call);
                 throw e;
             }
         }
@@ -256,6 +256,34 @@ final class RpcSession {
             for (RpcCall call : queue.drain()) {
                 call.future.completeExceptionally(new IOException());
             }
+        }
+    }
+
+
+    // Takes a slot of the bound for the call. A client with an instance refuses the call when every slot is
+    // taken, and a refused call takes none: only the accepted calls hold slots. A client without an instance
+    // has no bound.
+    private boolean reserve(RpcCall call) {
+        if (!client.hasInstance()) {
+            return true;
+        }
+        int current = pending.get();
+        while (current < maxPending) {
+            if (pending.compareAndSet(current, current + 1)) {
+                call.holdsSlot = true;
+                return true;
+            }
+            current = pending.get();
+        }
+        return false;
+    }
+
+
+    // Gives back the slot the call holds, if it holds one.
+    private void release(RpcCall call) {
+        if (call.holdsSlot) {
+            call.holdsSlot = false;
+            pending.decrementAndGet();
         }
     }
 
@@ -620,7 +648,7 @@ final class RpcSession {
     // Hands the outcome of the call to its callback. Reads no session state, so it is safe once the
     // session is gone with the executor.
     private void deliver(RpcCall call, Protocol.Reply reply, Throwable error) {
-        pending.decrementAndGet();
+        release(call);
         if (reply == null) {
             call.callback.onDone(Extensions.unwrapCompletion(error), null);
             return;

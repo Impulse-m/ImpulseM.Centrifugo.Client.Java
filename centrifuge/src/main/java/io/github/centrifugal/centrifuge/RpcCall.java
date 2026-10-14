@@ -30,6 +30,9 @@ public final class RpcCall {
     final CompletableFuture<Protocol.Reply> future = new CompletableFuture<>();
     long msgId;
     int commandId;
+    // Holds a slot of the bound on the calls of the client, taken at submit and given back at delivery.
+    // A call refused by the bound holds none.
+    boolean holdsSlot;
     // Written to a transport at least once.
     boolean everSent;
     // The last write carried msg_id, so the server knows the call and may answer a resend.
