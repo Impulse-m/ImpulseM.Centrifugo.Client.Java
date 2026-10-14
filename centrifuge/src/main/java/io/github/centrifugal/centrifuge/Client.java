@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -25,6 +26,7 @@ import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
 import java8.util.concurrent.CompletableFuture;
+import java8.util.concurrent.CompletionException;
 import okhttp3.Credentials;
 import okhttp3.Headers;
 import okhttp3.OkHttpClient;
@@ -50,6 +52,13 @@ public class Client {
     private final Map<Integer, CompletableFuture<Protocol.Reply>> futures = new ConcurrentHashMap<>();
     private final Map<Integer, Protocol.Command> connectCommands = new ConcurrentHashMap<>();
     private final Map<Integer, Protocol.Command> connectAsyncCommands = new ConcurrentHashMap<>();
+    // rpc calls waiting for the connection: not sent yet, or lost with their transport.
+    private final RpcQueue rpcQueue;
+    // rpc calls written to the current transport, by the id of their command.
+    private final Map<Integer, RpcCall> rpcsOnWire = new ConcurrentHashMap<>();
+    // msg_ids of the replies received, sent as the ack of the next rpc call.
+    private final List<Long> pendingAcks = new ArrayList<>();
+    private long lastMsgId = 0;
 
     private volatile ClientState state = ClientState.DISCONNECTED;
     private final Map<String, Subscription> subs = new ConcurrentHashMap<>();
@@ -153,6 +162,7 @@ public class Client {
         this.opts = opts;
         this.listener = listener;
         this.backoff = new Backoff();
+        this.rpcQueue = new RpcQueue(opts.getMaxPendingRpc());
         this.token = opts.getToken();
         if (opts.getData() != null) {
             this.data = com.google.protobuf.ByteString.copyFrom(opts.getData());
@@ -334,9 +344,28 @@ public class Client {
             }
         }
 
+        // rpc calls with a msg_id are kept for a resend when the client reconnects; the rest fail.
+        boolean keepRpcs = Boolean.TRUE.equals(shouldReconnect);
+        List<RpcCall> lostRpcs = new ArrayList<>();
         for (Map.Entry<Integer, CompletableFuture<Protocol.Reply>> entry : this.futures.entrySet()) {
+            RpcCall call = this.rpcsOnWire.get(entry.getKey());
+            if (keepRpcs && call != null && call.wireTracked) {
+                lostRpcs.add(call);
+                continue;
+            }
             CompletableFuture<Protocol.Reply> f = entry.getValue();
             f.completeExceptionally(new IOException());
+        }
+        this.rpcsOnWire.clear();
+        for (RpcCall call : lostRpcs) {
+            if (!this.rpcQueue.offer(call)) {
+                call.future.completeExceptionally(new IOException());
+            }
+        }
+        if (!keepRpcs) {
+            for (RpcCall call : this.rpcQueue.drain()) {
+                call.future.completeExceptionally(new IOException());
+            }
         }
         // Drop the pending command registry along with the futures: no reply can
         // arrive for a connection that is gone, and command IDs are never reused.
@@ -960,10 +989,6 @@ public class Client {
 
         for (Map.Entry<Integer, Protocol.Command> entry : this.connectCommands.entrySet()) {
             Protocol.Command cmd = entry.getValue();
-            CompletableFuture<Protocol.Reply> pending = this.futures.get(cmd.getId());
-            if (pending != null && this.rejectUnsupportedRpc(cmd, pending)) {
-                continue;
-            }
             boolean sent = this.ws.send(ByteString.of(this.serializeCommand(cmd)));
             if (!sent) {
                 CompletableFuture<Protocol.Reply> f = this.futures.get(cmd.getId());
@@ -974,6 +999,7 @@ public class Client {
         }
 
         this.connectCommands.clear();
+        this.flushRpcQueue();
 
         for (Map.Entry<Integer, Protocol.Command> entry : this.connectAsyncCommands.entrySet()) {
             Protocol.Command cmd = entry.getValue();
@@ -1078,6 +1104,7 @@ public class Client {
         if (this.opts.getName().length() > 0) build.setName(this.opts.getName());
         if (this.opts.getVersion().length() > 0) build.setVersion(this.opts.getVersion());
         if (this.data != null) build.setData(this.data);
+        if (this.opts.getInstance().length() > 0) build.setInstance(this.opts.getInstance());
         if (this.serverSubs.size() > 0) {
             for (Map.Entry<String, ServerSubscription> entry : this.serverSubs.entrySet()) {
                 Protocol.SubscribeRequest.Builder subReqBuild = Protocol.SubscribeRequest.newBuilder();
@@ -1367,24 +1394,12 @@ public class Client {
         this.futures.put(cmd.getId(), f);
         if (this.getState() != ClientState.CONNECTED) {
             this.connectCommands.put(cmd.getId(), cmd);
-        } else if (!this.rejectUnsupportedRpc(cmd, f)) {
+        } else {
             boolean sent = this.ws.send(ByteString.of(this.serializeCommand(cmd)));
             if (!sent) {
                 f.completeExceptionally(new IOException());
             }
         }
-    }
-
-    // An rpc with headers is sent only on a connection which confirmed RPC options. On
-    // any other connection it fails here, with the same reply error a server would give,
-    // and nothing is sent. Returns true when the command was failed. Called when the
-    // command goes out, so a call queued while connecting sees the confirmed capability.
-    private boolean rejectUnsupportedRpc(Protocol.Command cmd, CompletableFuture<Protocol.Reply> f) {
-        if (!cmd.hasRpc() || cmd.getRpc().getHeadersCount() == 0 || this.rpcOptionsSupported) {
-            return false;
-        }
-        f.complete(Extensions.unsupportedRpcReply(cmd.getId()));
-        return true;
     }
 
     ReplyError getReplyError(Protocol.Reply reply) {
@@ -1417,7 +1432,7 @@ public class Client {
      * @param cb:     will be called as soon as rpc response received or error happened.
      */
     public void rpc(String method, byte[] data, ResultCallback<RPCResult> cb) {
-        this.rpc(method, data, null, cb);
+        this.rpcCall(method, data, null, cb);
     }
 
     /**
@@ -1432,46 +1447,205 @@ public class Client {
      * @param cb:      will be called as soon as rpc response received or error happened.
      */
     public void rpc(String method, byte[] data, RpcOptions options, ResultCallback<RPCResult> cb) {
-        this.executor.submit(() -> Client.this.rpcSynchronized(method, data, options, cb));
+        this.rpcCall(method, data, options, cb);
     }
 
-    private void rpcSynchronized(String method, byte[] data, RpcOptions options, ResultCallback<RPCResult> cb) {
+    /**
+     * Send RPC with method to server and get the call back, to cancel it with
+     * {@link RpcCall#cancel()}. Same as {@link #rpc(String, byte[], ResultCallback)}.
+     *
+     * @param method: of RPC call.
+     * @param data:   a custom payload for RPC call.
+     * @param cb:     will be called as soon as rpc response received or error happened.
+     * @return the call.
+     */
+    public RpcCall rpcCall(String method, byte[] data, ResultCallback<RPCResult> cb) {
+        return this.rpcCall(method, data, null, cb);
+    }
+
+    /**
+     * Send RPC with method and per-call options to server and get the call back, to cancel it
+     * with {@link RpcCall#cancel()}. Same as {@link #rpc(String, byte[], RpcOptions, ResultCallback)}.
+     * With a server which confirmed RPC options, a call which is not answered is kept across a
+     * reconnect and sent again with the same msg_id, so the server runs it once.
+     *
+     * @param method:  of RPC call.
+     * @param data:    a custom payload for RPC call.
+     * @param options: per-call options, null for a plain call.
+     * @param cb:      will be called as soon as rpc response received or error happened.
+     * @return the call.
+     */
+    public RpcCall rpcCall(String method, byte[] data, RpcOptions options, ResultCallback<RPCResult> cb) {
+        Map<String, String> headers = options != null ? options.getHeaders() : Collections.<String, String>emptyMap();
+        long timeout = options != null && options.getTimeout() > 0 ? options.getTimeout() : this.opts.getTimeout();
+        RpcCall call = new RpcCall(this, method, data, headers, timeout, cb);
+        this.executor.submit(() -> Client.this.rpcSynchronized(call));
+        return call;
+    }
+
+    private void rpcSynchronized(RpcCall call) {
         if (this.refreshInFlight) {
-            this.pendingAfterRefresh.add(() -> Client.this.rpcSynchronized(method, data, options, cb));
+            this.pendingAfterRefresh.add(() -> Client.this.rpcSynchronized(call));
             return;
         }
-        Protocol.RPCRequest.Builder req = Protocol.RPCRequest.newBuilder()
-                .setData(com.google.protobuf.ByteString.copyFrom(data))
-                .setMethod(method);
-        if (options != null) {
-            req.putAllHeaders(options.getHeaders());
+        // The deadline starts here and holds across resends. The callback runs on the
+        // executor, also when the call was cancelled before it started.
+        call.future.orTimeout(call.timeout, TimeUnit.MILLISECONDS)
+                .whenComplete((reply, error) -> this.executor.submit(() -> this.finishRpc(call, reply, error)));
+        if (call.future.isDone()) {
+            return;
         }
+        call.msgId = this.nextMsgId();
+        this.enqueueRpc(call);
+    }
 
+    private void enqueueRpc(RpcCall call) {
+        if (this.getState() == ClientState.CONNECTED) {
+            this.writeRpc(call, false);
+        } else if (!this.rpcQueue.offer(call)) {
+            call.future.completeExceptionally(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls wait for the connection", false));
+        }
+    }
+
+    // Writes the call on the current transport. A call with headers on a connection without
+    // RPC options fails here with the reply error a server would give, and nothing is written.
+    // A call with a msg_id which did not reach the server waits for the next connection.
+    private void writeRpc(RpcCall call, boolean retransmit) {
+        if (!this.rpcOptionsSupported && !call.headers.isEmpty()) {
+            call.future.complete(Extensions.unsupportedRpcReply(call.commandId));
+            return;
+        }
+        int id = this.getNextId();
+        call.commandId = id;
+        boolean tracked = this.rpcOptionsSupported;
+        Protocol.Command cmd = Protocol.Command.newBuilder()
+                .setId(id)
+                .setRpc(this.buildRpcRequest(call, retransmit))
+                .build();
+        this.futures.put(id, call.future);
+        this.rpcsOnWire.put(id, call);
+        boolean sent = this.ws.send(ByteString.of(this.serializeCommand(cmd)));
+        if (sent) {
+            call.everSent = true;
+            call.wireTracked = tracked;
+            return;
+        }
+        this.futures.remove(id);
+        this.rpcsOnWire.remove(id);
+        if (!tracked || !this.rpcQueue.offer(call)) {
+            call.future.completeExceptionally(new IOException());
+        }
+    }
+
+    private Protocol.RPCRequest buildRpcRequest(RpcCall call, boolean retransmit) {
+        Protocol.RPCRequest.Builder req = Protocol.RPCRequest.newBuilder()
+                .setData(com.google.protobuf.ByteString.copyFrom(call.data))
+                .setMethod(call.method)
+                .putAllHeaders(call.headers);
+        if (this.rpcOptionsSupported) {
+            req.setMsgId(call.msgId)
+                    .setRetransmit(retransmit)
+                    .addAllAck(this.pendingAcks);
+            this.pendingAcks.clear();
+        }
+        return req.build();
+    }
+
+    // Sends the rpc calls that waited for the connection, once its connect reply is in. Calls
+    // lost with an earlier transport are sent again in msg_id order, with retransmit set, and
+    // keep their deadline. Without RPC options on this connection they fail instead.
+    private void flushRpcQueue() {
+        for (RpcCall call : this.rpcQueue.drain()) {
+            if (call.cancelPending) {
+                if (this.rpcOptionsSupported) {
+                    this.writeCancel(call.msgId);
+                }
+                continue;
+            }
+            if (call.future.isDone()) {
+                continue;
+            }
+            if (call.everSent && !this.rpcOptionsSupported) {
+                call.future.completeExceptionally(new IOException());
+                continue;
+            }
+            this.writeRpc(call, call.everSent);
+        }
+    }
+
+    // Sends a cancel for a msg_id: an RPCRequest without method and data. Its reply is not awaited.
+    private void writeCancel(long msgId) {
+        Protocol.RPCRequest req = Protocol.RPCRequest.newBuilder()
+                .setCancel(msgId)
+                .addAllAck(this.pendingAcks)
+                .build();
+        this.pendingAcks.clear();
         Protocol.Command cmd = Protocol.Command.newBuilder()
                 .setId(this.getNextId())
-                .setRpc(req.build())
+                .setRpc(req)
                 .build();
+        this.ws.send(ByteString.of(this.serializeCommand(cmd)));
+    }
 
-        CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
-        f.thenAccept(reply -> {
-            this.cleanCommandFuture(cmd);
-            if (reply.getError().getCode() != 0) {
-                cb.onDone(getReplyError(reply), null);
-            } else {
-                Protocol.RPCResult rpcResult = reply.getRpc();
-                RPCResult result = new RPCResult();
-                result.setData(rpcResult.getData().toByteArray());
-                cb.onDone(null, result);
-            }
-        }).orTimeout(this.opts.getTimeout(), TimeUnit.MILLISECONDS).exceptionally(e -> {
-            this.executor.submit(() -> {
-                Client.this.cleanCommandFuture(cmd);
-                cb.onDone(e, null);
-            });
-            return null;
-        });
+    void cancelRpc(RpcCall call) {
+        this.executor.submit(() -> Client.this.cancelRpcSynchronized(call));
+    }
 
-        this.enqueueCommandFuture(cmd, f);
+    private void cancelRpcSynchronized(RpcCall call) {
+        if (call.future.isDone()) {
+            return;
+        }
+        if (this.getState() == ClientState.CONNECTED && !this.rpcOptionsSupported) {
+            call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel is not supported by the server", false));
+            return;
+        }
+        if (!call.everSent) {
+            this.rpcQueue.remove(call);
+            call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
+            return;
+        }
+        if (this.getState() == ClientState.CONNECTED) {
+            this.writeCancel(call.msgId);
+        } else {
+            // The call was lost with its transport and waits in the queue: the cancel goes out
+            // with the next connection, or is dropped when that one has no RPC options.
+            call.cancelPending = true;
+            this.rpcQueue.keep(call);
+        }
+        call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
+    }
+
+    private void finishRpc(RpcCall call, Protocol.Reply reply, Throwable error) {
+        if (call.commandId != 0) {
+            this.futures.remove(call.commandId);
+            this.rpcsOnWire.remove(call.commandId);
+        }
+        if (!call.cancelPending) {
+            this.rpcQueue.remove(call);
+        }
+        if (reply == null) {
+            Throwable cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+            call.callback.onDone(cause, null);
+            return;
+        }
+        if (call.wireTracked) {
+            this.pendingAcks.add(call.msgId);
+        }
+        if (reply.getError().getCode() != 0) {
+            call.callback.onDone(getReplyError(reply), null);
+            return;
+        }
+        Protocol.RPCResult rpcResult = reply.getRpc();
+        RPCResult result = new RPCResult();
+        result.setData(rpcResult.getData().toByteArray());
+        result.setCached(rpcResult.getCached());
+        call.callback.onDone(null, result);
+    }
+
+    // msg_id of the next rpc call, see Extensions.nextMsgId. Used on the executor thread only.
+    private long nextMsgId() {
+        this.lastMsgId = Extensions.nextMsgId(this.serverTimeMillis(), this.lastMsgId);
+        return this.lastMsgId;
     }
 
     /**
