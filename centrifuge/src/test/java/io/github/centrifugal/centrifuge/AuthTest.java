@@ -148,6 +148,7 @@ public class AuthTest extends RpcTestBase {
         server.connectResult = connectResultFor("u1", "authenticated");
         newAuthClient(new Options());
         connect(client);
+        awaitCondition("auth on connect", () -> authLog.size() == 1);
         assertEquals(Arrays.asList("u1/authenticated"), authLog);
 
         answerRefreshes("u1", "authenticated");
@@ -340,6 +341,7 @@ public class AuthTest extends RpcTestBase {
 
         assertEquals("", connectedEvents.get(0).getUser());
         assertEquals("", connectedEvents.get(0).getAuthClass());
+        awaitCondition("auth on connect", () -> authLog.size() == 1);
         assertEquals(Arrays.asList("/"), authLog);
 
         answerRefreshes("", "");
