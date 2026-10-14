@@ -1635,7 +1635,6 @@ public class Client {
                 cb.onDone(getReplyError(reply), null);
             } else {
                 Protocol.RefreshResult replyResult = reply.getRefresh();
-                this.auth.applyAuth(replyResult.getUser(), replyResult.getAuthClass(), false);
                 cb.onDone(null, replyResult);
             }
         }).orTimeout(this.opts.getTimeout(), TimeUnit.MILLISECONDS).exceptionally(e -> {

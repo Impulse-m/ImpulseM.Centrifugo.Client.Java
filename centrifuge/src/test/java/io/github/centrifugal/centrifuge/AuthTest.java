@@ -14,6 +14,7 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 
@@ -33,6 +34,9 @@ public class AuthTest extends RpcTestBase {
 
 
     private final List<String> authLog = new CopyOnWriteArrayList<>();
+
+
+    private final List<Thread> authThreads = new CopyOnWriteArrayList<>();
 
 
     private final List<ConnectedEvent> connectedEvents = new CopyOnWriteArrayList<>();
@@ -322,6 +326,22 @@ public class AuthTest extends RpcTestBase {
 
 
     @Test
+    public void authEventsFireOnTheClientExecutor() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        newAuthClient(new Options());
+        connect(client);
+        answerRefreshes("u2", "authenticated");
+
+        refresh(client, "token-2").get(5, TimeUnit.SECONDS);
+
+        awaitCondition("auth on connect and on refresh", () -> authThreads.size() == 2);
+        Thread executorThread = client.getExecutor().submit(() -> Thread.currentThread()).get(5, TimeUnit.SECONDS);
+        assertSame("the connect reply is handled on the executor", executorThread, authThreads.get(0));
+        assertSame("the refresh reply is handled on the executor", executorThread, authThreads.get(1));
+    }
+
+
+    @Test
     public void connectedEventCarriesTheIdentity() throws Exception {
         server.connectResult = connectResultFor("u1", "authenticated");
         newAuthClient(new Options());
@@ -370,6 +390,7 @@ public class AuthTest extends RpcTestBase {
 
             @Override
             public void onAuth(Client c, AuthEvent e) {
+                authThreads.add(Thread.currentThread());
                 authLog.add(e.getUser() + "/" + e.getAuthClass());
             }
 

@@ -157,6 +157,7 @@ final class AuthRefresh {
             return;
         }
         if (error == null) {
+            applyAuth(result.getUser(), result.getAuthClass(), false);
             client.storeToken(token);
             scheduleExpiry(result.getExpires(), result.getTtl());
             complete();
@@ -183,6 +184,7 @@ final class AuthRefresh {
             complete();
             return;
         }
+        applyAuth(result.getUser(), result.getAuthClass(), false);
         client.storeToken(token);
         if (client.getState() == ClientState.CONNECTED) {
             scheduleExpiry(result.getExpires(), result.getTtl());
