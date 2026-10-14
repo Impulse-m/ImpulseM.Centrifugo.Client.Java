@@ -18,6 +18,7 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
@@ -426,6 +427,58 @@ public class AuthTest extends RpcTestBase {
         first.get(5, TimeUnit.SECONDS);
         second.get(5, TimeUnit.SECONDS);
         assertEquals("one command for both calls", Arrays.asList("token-a"), refreshTokens());
+    }
+
+
+    @Test
+    public void aThrowingCallbackDoesNotStopTheOthersSharingItsRefresh() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        newAuthClient(new Options());
+        connect(client);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+        AtomicInteger thrower = new AtomicInteger();
+        AtomicInteger sibling = new AtomicInteger();
+        client.refresh("token-a", (Throwable error, AuthResult result) -> {
+            thrower.incrementAndGet();
+            throw new IllegalStateException("callback failed");
+        });
+        CompletableFuture<AuthResult> after = new CompletableFuture<>();
+        client.refresh("token-a", (Throwable error, AuthResult result) -> {
+            sibling.incrementAndGet();
+            completeInto(after).onDone(error, result);
+        });
+        awaitCondition("refresh sent", () -> refreshTokens().size() == 1);
+
+        server.releaseDeferredCommands();
+
+        assertNotNull("the sibling gets the result", after.get(5, TimeUnit.SECONDS));
+        assertEquals(1, thrower.get());
+        assertEquals(1, sibling.get());
+        assertEquals(Arrays.asList("token-a"), refreshTokens());
+        assertEquals(ClientState.CONNECTED, client.getState());
+    }
+
+
+    @Test
+    public void closingFailsEveryWaitingRefreshEvenWhenACallbackThrows() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        newAuthClient(new Options());
+        connect(client);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+        CompletableFuture<AuthResult> inFlight = refresh(client, "token-a");
+        awaitCondition("refresh sent", () -> refreshTokens().size() == 1);
+        AtomicInteger thrower = new AtomicInteger();
+        client.refresh("token-b", (Throwable error, AuthResult result) -> {
+            thrower.incrementAndGet();
+            throw new IllegalStateException("callback failed");
+        });
+        CompletableFuture<AuthResult> shared = refresh(client, "token-b");
+
+        client.close(0L);
+
+        assertTrue("the in-flight refresh fails with the close", errorOf(inFlight) instanceof IOException);
+        assertTrue("the waiting refresh which shares the throwing callback fails too", errorOf(shared) instanceof IOException);
+        assertEquals(1, thrower.get());
     }
 
 

@@ -1671,7 +1671,15 @@ public class Client {
                 .build();
 
         CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
-        f.thenAccept(reply -> {
+        // One stage delivers the outcome, so a callback which throws is never called a second time.
+        f.orTimeout(this.opts.getTimeout(), TimeUnit.MILLISECONDS).handle((Protocol.Reply reply, Throwable e) -> {
+            if (e != null) {
+                Extensions.runOnExecutor(this.executor, () -> {
+                    Client.this.cleanCommandFuture(cmd);
+                    cb.onDone(Extensions.unwrapCompletion(e), null);
+                });
+                return null;
+            }
             this.cleanCommandFuture(cmd);
             if (reply.getError().getCode() != 0) {
                 cb.onDone(getReplyError(reply), null);
@@ -1679,11 +1687,6 @@ public class Client {
                 Protocol.RefreshResult replyResult = reply.getRefresh();
                 cb.onDone(null, replyResult);
             }
-        }).orTimeout(this.opts.getTimeout(), TimeUnit.MILLISECONDS).exceptionally(e -> {
-            Extensions.runOnExecutor(this.executor, () -> {
-                Client.this.cleanCommandFuture(cmd);
-                cb.onDone(Extensions.unwrapCompletion(e), null);
-            });
             return null;
         });
 

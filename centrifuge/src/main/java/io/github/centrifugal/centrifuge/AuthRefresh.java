@@ -127,19 +127,23 @@ final class AuthRefresh {
 
     /**
      * Fails the refreshes which wait for the refresh in flight, as the client closes. Runs on the
-     * executor, after the connection is torn down.
+     * executor, after the connection is torn down. Every waiting refresh is failed even when a callback
+     * throws; the first failure is rethrown then.
      */
     void failWaiting() {
+        Throwable failure = null;
         while (!waiting.isEmpty()) {
             Waiting next = waiting.poll();
             if (next.token == null) {
                 continue;
             }
             requestedInProgress -= next.callbacks.size();
-            for (ResultCallback<AuthResult> cb : next.callbacks) {
-                cb.onDone(new IOException(), null);
+            Throwable thrown = deliverAll(next.callbacks, new IOException(), null);
+            if (failure == null) {
+                failure = thrown;
             }
         }
+        rethrow(failure);
     }
 
 
@@ -318,9 +322,7 @@ final class AuthRefresh {
             requestedInProgress -= callbacks.size();
             if (error != null) {
                 settleConnectToken(error);
-                for (ResultCallback<AuthResult> cb : callbacks) {
-                    cb.onDone(error, null);
-                }
+                rethrow(deliverAll(callbacks, error, null));
                 return;
             }
             client.storeToken(token);
@@ -332,9 +334,7 @@ final class AuthRefresh {
             try {
                 applyAuth(result.getUser(), result.getAuthClass(), false);
             } finally {
-                for (ResultCallback<AuthResult> cb : callbacks) {
-                    cb.onDone(null, authResult);
-                }
+                rethrow(deliverAll(callbacks, null, authResult));
             }
         } finally {
             complete();
@@ -349,6 +349,34 @@ final class AuthRefresh {
         inFlightCallbacks = callbacks;
         commandInFlight = true;
         client.refreshSynchronized(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishRequested(token, error, result, callbacks)));
+    }
+
+
+    // Hands the outcome to every callback. A callback which throws does not keep the others from theirs:
+    // the first failure is returned once all of them ran, and null when none failed.
+    private static Throwable deliverAll(List<ResultCallback<AuthResult>> callbacks, Throwable error, AuthResult result) {
+        Throwable first = null;
+        for (ResultCallback<AuthResult> cb : callbacks) {
+            try {
+                cb.onDone(error, result);
+            } catch (RuntimeException | Error failure) {
+                if (first == null) {
+                    first = failure;
+                }
+            }
+        }
+        return first;
+    }
+
+
+    // Rethrows a failure a callback threw, unchanged. Nothing is thrown for null.
+    private static void rethrow(Throwable failure) {
+        if (failure instanceof RuntimeException) {
+            throw (RuntimeException) failure;
+        }
+        if (failure instanceof Error) {
+            throw (Error) failure;
+        }
     }
 
 
@@ -410,8 +438,11 @@ final class AuthRefresh {
         inFlight = false;
         commandInFlight = false;
         if (client.getState() != ClientState.CONNECTED) {
-            failWaiting();
-            client.flushRpc();
+            try {
+                failWaiting();
+            } finally {
+                client.flushRpc();
+            }
             return;
         }
         while (!waiting.isEmpty()) {

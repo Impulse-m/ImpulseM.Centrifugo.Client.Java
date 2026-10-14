@@ -71,7 +71,12 @@ final class Extensions {
         try {
             executor.submit(task);
         } catch (RejectedExecutionException e) {
-            task.run();
+            // The task runs once, here. A failure of the task is reported: the caller's stage would not show it.
+            try {
+                task.run();
+            } catch (RuntimeException failure) {
+                failure.printStackTrace();
+            }
         }
     }
 
