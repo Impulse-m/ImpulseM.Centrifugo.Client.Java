@@ -35,6 +35,10 @@ final class AuthRefresh {
     // after its cancel does nothing.
     private ScheduledFuture<?> timer;
     private long timerGeneration = 0;
+    // Identity the server last reported for the connection, see applyAuth. A refresh reply
+    // arrives on the transport thread, so the fields are volatile.
+    private volatile String currentUser = "";
+    private volatile String currentAuthClass = "";
 
 
     AuthRefresh(Client client) {
@@ -73,6 +77,20 @@ final class AuthRefresh {
         if (timer != null) {
             timer.cancel(true);
             timer = null;
+        }
+    }
+
+
+    /**
+     * Records the identity the server reports for the connection. A connect always reports it, so
+     * the listener hears every connect; a refresh reports it only when it changed.
+     */
+    void applyAuth(String user, String authClass, boolean always) {
+        boolean changed = !user.equals(this.currentUser) || !authClass.equals(this.currentAuthClass);
+        this.currentUser = user;
+        this.currentAuthClass = authClass;
+        if (always || changed) {
+            client.reportAuth(new AuthEvent(user, authClass));
         }
     }
 

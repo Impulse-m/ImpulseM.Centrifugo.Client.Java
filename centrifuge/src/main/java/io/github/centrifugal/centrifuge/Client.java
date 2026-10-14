@@ -76,9 +76,6 @@ public class Client {
     private volatile boolean rpcOptionsSupported = false;
     // Server clock minus local clock, from the last reply that carried a server time.
     private volatile long serverTimeOffset = 0;
-    // Identity the server last reported for the connection, see applyAuth.
-    private volatile String currentUser = "";
-    private volatile String currentAuthClass = "";
 
     Options getOpts() {
         return opts;
@@ -120,6 +117,10 @@ public class Client {
 
     void reportError(Throwable cause) {
         this.listener.onError(this, new ErrorEvent(cause));
+    }
+
+    void reportAuth(AuthEvent event) {
+        this.listener.onAuth(this, event);
     }
 
     void addFuture(int id, CompletableFuture<Protocol.Reply> future) {
@@ -938,7 +939,7 @@ public class Client {
         event.setAuthClass(result.getAuthClass());
         this.setState(ClientState.CONNECTED);
         this.listener.onConnected(this, event);
-        this.applyAuth(result.getUser(), result.getAuthClass(), true);
+        this.auth.applyAuth(result.getUser(), result.getAuthClass(), true);
         this.pingInterval = result.getPing() * 1000;
         this.sendPong = result.getPong();
 
@@ -1100,17 +1101,6 @@ public class Client {
         Long offset = Extensions.serverTimeOffsetFrom(reply.getTime(), System.currentTimeMillis());
         if (offset != null) {
             this.serverTimeOffset = offset;
-        }
-    }
-
-    // Records the identity the server reports for the connection. A connect always reports
-    // it, so the listener hears every connect; a refresh reports it only when it changed.
-    private void applyAuth(String user, String authClass, boolean always) {
-        boolean changed = !user.equals(this.currentUser) || !authClass.equals(this.currentAuthClass);
-        this.currentUser = user;
-        this.currentAuthClass = authClass;
-        if (always || changed) {
-            this.listener.onAuth(this, new AuthEvent(user, authClass));
         }
     }
 
@@ -1638,7 +1628,7 @@ public class Client {
                 cb.onDone(getReplyError(reply), null);
             } else {
                 Protocol.RefreshResult replyResult = reply.getRefresh();
-                this.applyAuth(replyResult.getUser(), replyResult.getAuthClass(), false);
+                this.auth.applyAuth(replyResult.getUser(), replyResult.getAuthClass(), false);
                 cb.onDone(null, replyResult);
             }
         }).orTimeout(this.opts.getTimeout(), TimeUnit.MILLISECONDS).exceptionally(e -> {
