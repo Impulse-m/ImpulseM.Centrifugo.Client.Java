@@ -249,7 +249,7 @@ public class Client {
      * that carried one. Local time when no such reply has been seen.
      */
     public long serverTimeMillis() {
-        return Extensions.estimateServerTime(System.currentTimeMillis(), this.serverTimeOffset);
+        return System.currentTimeMillis() + this.serverTimeOffset;
     }
 
     private int _id = 0;
@@ -340,10 +340,7 @@ public class Client {
     // Fails the pending commands (a refresh among them) and the rpc calls which wait for a connection.
     // processDisconnect returns early when the client is already disconnected, so close calls this too.
     private void failPendingOnClose() {
-        for (CompletableFuture<Protocol.Reply> f : this.futures.values()) {
-            f.completeExceptionally(new IOException());
-        }
-        this.rpcSession.onTransportLost(false);
+        this.rpcSession.failOnClose(this.futures.values());
         this.auth.failWaiting();
     }
 
@@ -379,7 +376,7 @@ public class Client {
             this.pingTask.cancel(true);
             this.pingTask = null;
         }
-        this.auth.cancelTimer();
+        this.auth.onDisconnect();
         if (this.reconnectTask != null) {
             this.reconnectTask.cancel(true);
             this.reconnectTask = null;
@@ -1138,11 +1135,10 @@ public class Client {
         this.processDisconnect(DISCONNECTED_UNAUTHORIZED, "unauthorized", false);
     }
 
-    // A reply without a server time keeps the last offset.
+    // A reply without a server time keeps the last offset. The proto zero value (0) means unset.
     private void observeServerTime(Protocol.Reply reply) {
-        Long offset = Extensions.serverTimeOffsetFrom(reply.getTime(), System.currentTimeMillis());
-        if (offset != null) {
-            this.serverTimeOffset = offset;
+        if (reply.getTime() != 0) {
+            this.serverTimeOffset = reply.getTime() - System.currentTimeMillis();
         }
     }
 
@@ -1646,7 +1642,8 @@ public class Client {
      * its command and its callback; a refresh with another token waits for it. At most 32 refresh calls
      * are in progress: a refresh beyond that calls back with {@link ReplyError#LIMIT_EXCEEDED}. A refresh
      * made while the client is not connected sets the token the next connect sends; when the server
-     * refuses it, the previous token is restored.
+     * refuses it, the previous token is restored. A refresh which a dropped connection interrupts, or
+     * which waits behind one, calls back with an IOException; the token it set stays for the next connect.
      *
      * @param token: new connection token, must not be null.
      * @param cb:    will be called when the refresh reply is received or an error happened.
@@ -1658,8 +1655,7 @@ public class Client {
         this.executor.submit(() -> Client.this.auth.refreshWith(token, cb));
     }
 
-    // Sends a refresh command with the token. The callback gets the reply, or the error.
-    void sendRefreshCommand(String token, ResultCallback<Protocol.RefreshResult> cb) {
+    void refreshSynchronized(String token, ResultCallback<Protocol.RefreshResult> cb) {
         Protocol.RefreshRequest req = Protocol.RefreshRequest.newBuilder()
                 .setToken(token)
                 .build();

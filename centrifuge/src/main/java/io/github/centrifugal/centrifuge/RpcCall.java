@@ -40,8 +40,13 @@ public final class RpcCall {
     // Resends so far: after a refused msg_id, and after a temporary refusal.
     int newIdResends;
     int laterResends;
-    // The resend which waits for its delay, cancelled with the call.
+    // The attempt on the wire: its future completes with the answer of the transport, and the executor
+    // clears the field once it has decided on the answer.
+    CompletableFuture<Protocol.Reply> attempt;
+    // The resend which waits for its delay, cancelled with the call. The generation tells the timer of
+    // a resend from the timer of a later one.
     ScheduledFuture<?> resendTask;
+    int resendGeneration;
     // The acks the last write carried. They go back to the pending acks if the write is lost with its transport.
     List<Long> carriedAcks = Collections.emptyList();
     // The forgetting of the attempt of a call which settled locally, while a late reply is still acked.

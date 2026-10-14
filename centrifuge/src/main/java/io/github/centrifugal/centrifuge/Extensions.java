@@ -89,25 +89,6 @@ final class Extensions {
 
 
     /**
-     * Offset of the server clock from the local clock, from the server time of a reply and
-     * the local time it arrived at. Null when the reply carries no server time: the proto
-     * zero value (0) means unset.
-     */
-    static Long serverTimeOffsetFrom(long serverTime, long localTime) {
-        if (serverTime == 0) {
-            return null;
-        }
-        return serverTime - localTime;
-    }
-
-
-    /** Server time estimated from a local time and the offset of the server clock. */
-    static long estimateServerTime(long localTime, long offset) {
-        return localTime + offset;
-    }
-
-
-    /**
      * The retry value the server set on an error reply, or null when it set none. Read through this
      * one function, so the carrier of the signal can change in one place.
      */
@@ -118,11 +99,11 @@ final class Extensions {
 
     /**
      * The reply of a call the client did not send: the server would have answered it with
-     * {@link ReplyError#UNSUPPORTED}. Completes the call's future like any other reply.
+     * {@link ReplyError#UNSUPPORTED}. Completes the call's future like any other reply. It has no
+     * command id, which is 0.
      */
-    static Protocol.Reply unsupportedRpcReply(int id) {
+    static Protocol.Reply unsupportedRpcReply() {
         return Protocol.Reply.newBuilder()
-                .setId(id)
                 .setError(Protocol.Error.newBuilder()
                         .setCode(ReplyError.UNSUPPORTED)
                         .setMessage(UNSUPPORTED_RPC_MESSAGE))

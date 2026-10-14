@@ -2,6 +2,7 @@ package io.github.centrifugal.centrifuge;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -97,17 +98,18 @@ final class RpcSession {
      */
     void submit(RpcCall call) {
         if (pending.incrementAndGet() > maxPending && client.hasInstance()) {
-            pending.decrementAndGet();
-            client.getExecutor().submit(() -> call.callback.onDone(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls are pending", false), null));
-            return;
-        }
-        try {
-            // The executor rejects the call once the client is closed. Nothing is registered then, so
-            // the deadline cannot fire later and call back on another thread.
-            client.getExecutor().submit(() -> start(call));
-        } catch (RejectedExecutionException e) {
-            pending.decrementAndGet();
-            throw e;
+            // Refused at once. The call settles on the caller's thread, and the callback runs through the
+            // same path as the other calls, so the future of the call is never an orphan.
+            call.future.completeExceptionally(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls are pending", false));
+        } else {
+            try {
+                // The executor rejects the call once the client is closed. Nothing is registered then, so
+                // the deadline cannot fire later and call back on another thread.
+                client.getExecutor().submit(() -> start(call));
+            } catch (RejectedExecutionException e) {
+                pending.decrementAndGet();
+                throw e;
+            }
         }
         call.future.orTimeout(call.timeout, TimeUnit.MILLISECONDS)
                 .whenComplete((Protocol.Reply reply, Throwable error) -> finishOnExecutor(call, reply, error));
@@ -181,6 +183,18 @@ final class RpcSession {
             }
             write(call);
         }
+    }
+
+
+    /**
+     * The client is closed: the futures still pending fail, and so do the calls which wait for a
+     * connection, as a transport loss without a reconnect does.
+     */
+    void failOnClose(Collection<CompletableFuture<Protocol.Reply>> pendingFutures) {
+        for (CompletableFuture<Protocol.Reply> f : pendingFutures) {
+            f.completeExceptionally(new IOException());
+        }
+        onTransportLost(false);
     }
 
 
@@ -285,7 +299,7 @@ final class RpcSession {
     private void write(RpcCall call) {
         boolean supported = client.hasRpcOptions();
         if (!supported && !call.headers.isEmpty()) {
-            call.future.complete(Extensions.unsupportedRpcReply(0));
+            call.future.complete(Extensions.unsupportedRpcReply());
             return;
         }
         boolean tracked = supported && client.hasInstance();
@@ -308,6 +322,7 @@ final class RpcSession {
         // again settles the attempt only, not the call.
         CompletableFuture<Protocol.Reply> attempt = new CompletableFuture<>();
         attempt.whenComplete((Protocol.Reply reply, Throwable error) -> settleAttempt(call, reply, error));
+        call.attempt = attempt;
         client.addFuture(id, attempt);
         onWire.put(id, call);
         if (client.sendCommand(cmd)) {
@@ -430,7 +445,12 @@ final class RpcSession {
             return true;
         }
         if (Extensions.RPC_RETRY_LATER.equals(signal) && call.laterResends < LATER_RESENDS) {
-            long delayNanos = Math.min(LATER_BASE_NANOS << call.laterResends, remainingNanos);
+            long delayNanos = LATER_BASE_NANOS << call.laterResends;
+            // A resend which would run at or past the deadline is not scheduled: the deadline is not a
+            // time to retransmit, and the error is delivered as it is.
+            if (delayNanos >= remainingNanos) {
+                return false;
+            }
             call.laterResends++;
             scheduleResend(call, delayNanos);
             return true;
@@ -459,13 +479,16 @@ final class RpcSession {
     // Sends the refused call again with the same msg_id once the delay is over, on the executor.
     private void scheduleResend(RpcCall call, long delayNanos) {
         resendWaiting.add(call);
-        call.resendTask = client.getScheduler().schedule(() -> client.getExecutor().submit(() -> resendLater(call)), delayNanos, TimeUnit.NANOSECONDS);
+        call.resendGeneration++;
+        final int generation = call.resendGeneration;
+        call.resendTask = client.getScheduler().schedule(() -> client.getExecutor().submit(() -> resendLater(call, generation)), delayNanos, TimeUnit.NANOSECONDS);
     }
 
 
-    // The delay of a resend is over. The call goes out as a retransmit, unless it settled meanwhile.
-    private void resendLater(RpcCall call) {
-        if (!resendWaiting.contains(call) || call.future.isDone()) {
+    // The delay of a resend is over. The call goes out as a retransmit, unless it settled meanwhile, its
+    // deadline passed, or a resend scheduled after this one replaced it: the deadline then delivers the call.
+    private void resendLater(RpcCall call, int generation) {
+        if (generation != call.resendGeneration || !resendWaiting.contains(call) || call.future.isDone() || call.remainingNanos() <= 0L) {
             return;
         }
         stopResend(call);
@@ -493,7 +516,7 @@ final class RpcSession {
             forgetAttempt(call);
         }
         if (reply == null) {
-            if (call.wireTracked && Extensions.unwrapCompletion(error) instanceof TimeoutException) {
+            if (call.wireTracked && Extensions.unwrapCompletion(error) instanceof TimeoutException && !answerQueued(call)) {
                 // The server may still run a sent call, so the deadline cancels it as cancel() does.
                 sendCancel(call.msgId);
             }
@@ -501,6 +524,13 @@ final class RpcSession {
             pendingAcks.add(call.msgId);
         }
         deliver(call, reply, error);
+    }
+
+
+    // Whether the server answered the last attempt of the call, and the answer waits for the executor. The
+    // server ran or refused the call then, so a deadline sends no cancel for it.
+    private static boolean answerQueued(RpcCall call) {
+        return call.attempt != null && call.attempt.isDone() && !call.attempt.isCompletedExceptionally();
     }
 
 
@@ -555,7 +585,7 @@ final class RpcSession {
             return;
         }
         if (call.future.isDone()) {
-            if (reply != null) {
+            if (reply != null && call.wireTracked) {
                 pendingAcks.add(call.msgId);
             }
             stopLate(call);
@@ -564,6 +594,7 @@ final class RpcSession {
         }
         client.removeFuture(call.commandId);
         onWire.remove(call.commandId);
+        call.attempt = null;
         if (reply != null && reply.getError().getCode() != 0 && call.wireTracked && resend(call, reply.getError())) {
             return;
         }

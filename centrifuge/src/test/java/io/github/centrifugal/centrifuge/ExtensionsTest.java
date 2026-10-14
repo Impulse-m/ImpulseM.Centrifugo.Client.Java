@@ -6,7 +6,6 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 
@@ -34,36 +33,10 @@ public class ExtensionsTest {
 
 
     @Test
-    public void serverTimeOffsetIsServerTimeMinusLocalTime() {
-        assertEquals(Long.valueOf(500L), Extensions.serverTimeOffsetFrom(1_000_500L, 1_000_000L));
-        assertEquals(Long.valueOf(-250L), Extensions.serverTimeOffsetFrom(999_750L, 1_000_000L));
-    }
+    public void unsupportedRpcReplyHasNoCommandIdAndCodeFifteen() {
+        Protocol.Reply reply = Extensions.unsupportedRpcReply();
 
-
-    @Test
-    public void zeroServerTimeMeansNoOffset() {
-        assertNull(Extensions.serverTimeOffsetFrom(0L, 1_000_000L));
-    }
-
-
-    @Test
-    public void estimatedServerTimeAddsOffsetToLocalTime() {
-        assertEquals(1_000_500L, Extensions.estimateServerTime(1_000_000L, 500L));
-        assertEquals(999_750L, Extensions.estimateServerTime(1_000_000L, -250L));
-    }
-
-
-    @Test
-    public void estimatedServerTimeIsLocalTimeWithoutOffset() {
-        assertEquals(1_000_000L, Extensions.estimateServerTime(1_000_000L, 0L));
-    }
-
-
-    @Test
-    public void unsupportedRpcReplyAnswersTheCommandWithCodeFifteen() {
-        Protocol.Reply reply = Extensions.unsupportedRpcReply(7);
-
-        assertEquals(7, reply.getId());
+        assertEquals(0, reply.getId());
         assertEquals(ReplyError.UNSUPPORTED, reply.getError().getCode());
         assertEquals("rpc headers are not supported by the server", reply.getError().getMessage());
     }

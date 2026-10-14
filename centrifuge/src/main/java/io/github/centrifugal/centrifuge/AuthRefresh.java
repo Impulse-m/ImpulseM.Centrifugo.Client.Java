@@ -28,15 +28,17 @@ import okhttp3.WebSocket;
 final class AuthRefresh {
     // A refresh which waits for the refresh in flight. A requested refresh carries its token and the
     // callbacks of the refresh calls which asked for it. A timer refresh carries neither: it fetches
-    // its token when it starts.
+    // its token when it starts, and the generation of the timer which queued it.
     private static final class Waiting {
         final String token;
         final List<ResultCallback<AuthResult>> callbacks;
+        final long generation;
 
 
-        Waiting(String token, List<ResultCallback<AuthResult>> callbacks) {
+        Waiting(String token, List<ResultCallback<AuthResult>> callbacks, long generation) {
             this.token = token;
             this.callbacks = callbacks;
+            this.generation = generation;
         }
     }
 
@@ -75,10 +77,9 @@ final class AuthRefresh {
     // after its cancel does nothing.
     private ScheduledFuture<?> timer;
     private long timerGeneration = 0;
-    // Identity the server last reported for the connection, see applyAuth. A refresh reply
-    // arrives on the transport thread, so the fields are volatile.
-    private volatile String currentUser = "";
-    private volatile String currentAuthClass = "";
+    // Identity the server last reported for the connection, see applyAuth. Used on the executor thread only.
+    private String currentUser = "";
+    private String currentAuthClass = "";
 
 
     AuthRefresh(Client client, int retryMinMillis, int retryMaxMillis) {
@@ -116,7 +117,7 @@ final class AuthRefresh {
         List<ResultCallback<AuthResult>> callbacks = new ArrayList<>();
         callbacks.add(cb);
         if (inFlight) {
-            waiting.add(new Waiting(token, callbacks));
+            waiting.add(new Waiting(token, callbacks, 0L));
             return;
         }
         inFlight = true;
@@ -166,6 +167,17 @@ final class AuthRefresh {
 
 
     /**
+     * The connection is gone. The timer is cancelled, and the command gate is reset: the refresh
+     * command in flight fails with the connection, so nothing awaits its reply. The refresh in flight
+     * is not reset here. Its callback completes it, and only then does a waiting refresh start.
+     */
+    void onDisconnect() {
+        cancelTimer();
+        commandInFlight = false;
+    }
+
+
+    /**
      * Records the identity the server reports for the connection. A connect always reports it, so
      * the listener hears every connect; a refresh reports it only when it changed.
      */
@@ -198,7 +210,7 @@ final class AuthRefresh {
         }
         timer = null;
         if (inFlight) {
-            waiting.add(new Waiting(null, null));
+            waiting.add(new Waiting(null, null, generation));
             return;
         }
         inFlight = true;
@@ -213,94 +225,120 @@ final class AuthRefresh {
             return;
         }
         // The getter may never answer, so the fetch is bounded by the client timeout. A late answer is ignored.
+        // A getter which throws fails the fetch as an error does, so the refresh still completes.
         CompletableFuture<String> fetched = new CompletableFuture<>();
-        client.getOpts().getTokenGetter().getConnectionToken(new ConnectionTokenEvent(), (Throwable err, String token) -> {
-            if (err != null) {
-                fetched.completeExceptionally(err);
-            } else {
-                fetched.complete(token);
-            }
-        });
+        try {
+            client.getOpts().getTokenGetter().getConnectionToken(new ConnectionTokenEvent(), (Throwable err, String token) -> {
+                if (err != null) {
+                    fetched.completeExceptionally(err);
+                } else {
+                    fetched.complete(token);
+                }
+            });
+        } catch (RuntimeException | Error e) {
+            fetched.completeExceptionally(e);
+        }
         fetched.orTimeout(client.getOpts().getTimeout(), TimeUnit.MILLISECONDS)
                 .whenComplete((String token, Throwable err) -> Extensions.runOnExecutor(client.getExecutor(), () -> onTokenFetched(transport, Extensions.unwrapCompletion(err), token)));
     }
 
 
     private void onTokenFetched(WebSocket transport, Throwable err, String token) {
-        if (transport != client.transport() || client.getState() != ClientState.CONNECTED) {
-            complete();
-            return;
-        }
-        if (err != null) {
-            if (err instanceof UnauthorizedException) {
-                client.failUnauthorized();
-            } else {
-                client.reportError(new TokenError(err));
-                scheduleRetry();
+        // The refresh in flight is completed here, unless a refresh command goes out: its callback completes it.
+        boolean awaitingCommand = false;
+        try {
+            if (transport != client.transport() || client.getState() != ClientState.CONNECTED) {
+                return;
             }
-            complete();
-            return;
+            if (err != null) {
+                if (err instanceof UnauthorizedException) {
+                    client.failUnauthorized();
+                } else {
+                    scheduleRetry();
+                    client.reportError(new TokenError(err));
+                }
+                return;
+            }
+            if (token == null || token.equals("")) {
+                client.failUnauthorized();
+                return;
+            }
+            commandInFlight = true;
+            client.refreshSynchronized(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishTimer(transport, token, error, result)));
+            awaitingCommand = true;
+        } finally {
+            if (!awaitingCommand) {
+                complete();
+            }
         }
-        if (token == null || token.equals("")) {
-            client.failUnauthorized();
-            complete();
-            return;
-        }
-        commandInFlight = true;
-        client.sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishTimer(transport, token, error, result)));
     }
 
 
     private void finishTimer(WebSocket transport, String token, Throwable error, Protocol.RefreshResult result) {
-        if (transport != client.transport() || client.getState() != ClientState.CONNECTED) {
-            complete();
-            return;
-        }
-        if (error == null) {
-            applyAuth(result.getUser(), result.getAuthClass(), false);
-            client.storeToken(token);
-            scheduleExpiry(result.getExpires(), result.getTtl());
-            complete();
-            return;
-        }
-        client.reportError(new RefreshError(error));
-        if (error instanceof ReplyError) {
-            ReplyError replyError = (ReplyError) error;
-            if (replyError.isTemporary() || replyError.getCode() < SERVER_ERROR_CODE_MIN || replyError.getCode() == Client.ERROR_CODE_TOKEN_EXPIRED) {
-                scheduleRetry();
-            } else if (replyError.getCode() != PERMISSION_DENIED) {
-                client.processDisconnect(replyError.getCode(), replyError.getMessage(), false);
+        try {
+            if (transport != client.transport() || client.getState() != ClientState.CONNECTED) {
+                return;
             }
-        } else {
-            scheduleRetry();
+            if (error == null) {
+                client.storeToken(token);
+                scheduleExpiry(result.getExpires(), result.getTtl());
+                applyAuth(result.getUser(), result.getAuthClass(), false);
+                return;
+            }
+            try {
+                client.reportError(new RefreshError(error));
+            } finally {
+                settleTimerError(error);
+            }
+        } finally {
+            complete();
         }
-        complete();
+    }
+
+
+    // Decides on a failed timer refresh: retried with backoff, reported as a disconnect, or kept as it is.
+    private void settleTimerError(Throwable error) {
+        if (!(error instanceof ReplyError)) {
+            scheduleRetry();
+            return;
+        }
+        ReplyError replyError = (ReplyError) error;
+        if (replyError.isTemporary() || replyError.getCode() < SERVER_ERROR_CODE_MIN || replyError.getCode() == Client.ERROR_CODE_TOKEN_EXPIRED) {
+            scheduleRetry();
+        } else if (replyError.getCode() != PERMISSION_DENIED) {
+            client.processDisconnect(replyError.getCode(), replyError.getMessage(), false);
+        }
     }
 
 
     private void finishRequested(String token, Throwable error, Protocol.RefreshResult result, List<ResultCallback<AuthResult>> callbacks) {
-        inFlightToken = null;
-        inFlightCallbacks = null;
-        requestedInProgress -= callbacks.size();
-        if (error != null) {
-            settleConnectToken(error);
-            for (ResultCallback<AuthResult> cb : callbacks) {
-                cb.onDone(error, null);
+        try {
+            inFlightToken = null;
+            inFlightCallbacks = null;
+            requestedInProgress -= callbacks.size();
+            if (error != null) {
+                settleConnectToken(error);
+                for (ResultCallback<AuthResult> cb : callbacks) {
+                    cb.onDone(error, null);
+                }
+                return;
             }
+            client.storeToken(token);
+            connectTokenStored = false;
+            if (client.getState() == ClientState.CONNECTED) {
+                scheduleExpiry(result.getExpires(), result.getTtl());
+            }
+            AuthResult authResult = new AuthResult(result.getUser(), result.getAuthClass(), result.getExpires(), result.getTtl());
+            try {
+                applyAuth(result.getUser(), result.getAuthClass(), false);
+            } finally {
+                for (ResultCallback<AuthResult> cb : callbacks) {
+                    cb.onDone(null, authResult);
+                }
+            }
+        } finally {
             complete();
-            return;
         }
-        applyAuth(result.getUser(), result.getAuthClass(), false);
-        client.storeToken(token);
-        connectTokenStored = false;
-        if (client.getState() == ClientState.CONNECTED) {
-            scheduleExpiry(result.getExpires(), result.getTtl());
-        }
-        AuthResult authResult = new AuthResult(result.getUser(), result.getAuthClass(), result.getExpires(), result.getTtl());
-        for (ResultCallback<AuthResult> cb : callbacks) {
-            cb.onDone(null, authResult);
-        }
-        complete();
     }
 
 
@@ -310,7 +348,7 @@ final class AuthRefresh {
         inFlightToken = token;
         inFlightCallbacks = callbacks;
         commandInFlight = true;
-        client.sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishRequested(token, error, result, callbacks)));
+        client.refreshSynchronized(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishRequested(token, error, result, callbacks)));
     }
 
 
@@ -365,14 +403,24 @@ final class AuthRefresh {
     }
 
 
-    // The refresh in flight is over. The next waiting refresh starts; without one, the rpc calls
-    // held for the refresh are written.
+    // The refresh in flight is over. While the connection is down the waiting refreshes fail with it, since
+    // nothing is sent while disconnected and the timer does not run. Otherwise the next waiting refresh
+    // starts, and without one the rpc calls held for the refresh are written.
     private void complete() {
         inFlight = false;
         commandInFlight = false;
-        if (!waiting.isEmpty()) {
-            inFlight = true;
+        if (client.getState() != ClientState.CONNECTED) {
+            failWaiting();
+            client.flushRpc();
+            return;
+        }
+        while (!waiting.isEmpty()) {
             Waiting next = waiting.poll();
+            // A queued timer refresh is stale once a later schedule or cancel replaced its timer.
+            if (next.token == null && next.generation != timerGeneration) {
+                continue;
+            }
+            inFlight = true;
             if (next.token == null) {
                 fetchAndRefresh();
             } else {
