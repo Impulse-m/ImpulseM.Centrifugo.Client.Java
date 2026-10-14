@@ -54,6 +54,13 @@ abstract class RpcTestBase extends FakeServerTestBase {
     }
 
 
+    /** Creates the client for the fake server with the default options, whose connect and disconnect are signalled. */
+    @Override
+    protected Client newClient() {
+        return newClient(new Options());
+    }
+
+
     /** Creates the client for the fake server with the options and the listener; it is not connected yet. */
     protected Client newClient(Options options, EventListener listener) {
         client = new Client(server.url(), options, listener);

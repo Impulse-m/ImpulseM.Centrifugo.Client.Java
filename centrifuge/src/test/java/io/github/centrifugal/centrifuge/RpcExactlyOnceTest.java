@@ -527,7 +527,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         c.rpcCall("late", EMPTY_PAYLOAD, into(future));
 
-        ReplyError error = (ReplyError) errorOf(future);
+        ReplyError error = replyErrorOf(future);
 
         assertEquals(MSG_ID_INVALID, error.getCode());
         assertEquals("the call is rejected, not sent again", 1, sentRpcRequests().size());

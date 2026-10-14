@@ -80,7 +80,7 @@ public class AuthTest extends RpcTestBase {
 
         CompletableFuture<AuthResult> refreshFuture = refresh(client, "token-2");
         CompletableFuture<RPCResult> rpcFuture = new CompletableFuture<>();
-        client.rpc("method", EMPTY_PAYLOAD, completing(rpcFuture));
+        client.rpc("method", EMPTY_PAYLOAD, into(rpcFuture));
 
         awaitCondition("refresh sent", () -> lastRefreshToken() != null);
         syncWithServer();
@@ -111,10 +111,10 @@ public class AuthTest extends RpcTestBase {
         for (int i = 0; i < 3; i++) {
             CompletableFuture<RPCResult> future = new CompletableFuture<>();
             rpcs.add(future);
-            client.rpc("method", EMPTY_PAYLOAD, completing(future));
+            client.rpc("method", EMPTY_PAYLOAD, into(future));
         }
 
-        assertEquals(ReplyError.LIMIT_EXCEEDED, ((ReplyError) errorOf(rpcs.get(2))).getCode());
+        assertEquals(ReplyError.LIMIT_EXCEEDED, replyErrorOf(rpcs.get(2)).getCode());
         server.releaseDeferredCommands();
         refreshFuture.get(5, TimeUnit.SECONDS);
         assertEquals("ok", new String(rpcs.get(0).get(5, TimeUnit.SECONDS).getData()));
@@ -134,7 +134,7 @@ public class AuthTest extends RpcTestBase {
         awaitCondition("refresh sent", () -> lastRefreshToken() != null);
         CompletableFuture<RPCResult> rpcFuture = new CompletableFuture<>();
 
-        client.rpc("method", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(200).build(), completing(rpcFuture));
+        client.rpc("method", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(200).build(), into(rpcFuture));
 
         assertTrue("the deadline ends the call while the refresh is in flight", errorOf(rpcFuture) instanceof TimeoutException);
         assertFalse(refreshFuture.isDone());
