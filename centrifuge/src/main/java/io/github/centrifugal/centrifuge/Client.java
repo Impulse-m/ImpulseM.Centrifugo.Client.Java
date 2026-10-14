@@ -835,7 +835,7 @@ public class Client {
             }
             Protocol.SubscribeResult result;
             if (reply.getError().getCode() != 0) {
-                ReplyError err = new ReplyError(reply.getError().getCode(), reply.getError().getMessage(), reply.getError().getTemporary());
+                ReplyError err = this.getReplyError(reply);
                 sub.subscribeError(err);
                 return;
             }
@@ -860,7 +860,7 @@ public class Client {
             return;
         }
         if (reply.getError().getCode() != 0) {
-            this.handleConnectionError(new ReplyError(reply.getError().getCode(), reply.getError().getMessage(), reply.getError().getTemporary()));
+            this.handleConnectionError(this.getReplyError(reply));
             if (reply.getError().getCode() == 109) { // Token expired.
                 this.refreshRequired = true;
                 this.ws.close(NORMAL_CLOSURE_STATUS, "");
@@ -1352,7 +1352,15 @@ public class Client {
     }
 
     ReplyError getReplyError(Protocol.Reply reply) {
-        return new ReplyError(reply.getError().getCode(), reply.getError().getMessage(), reply.getError().getTemporary());
+        Protocol.Error error = reply.getError();
+        return new ReplyError(
+                error.getCode(),
+                error.getMessage(),
+                error.getTemporary(),
+                error.getAppCode(),
+                error.getAppType(),
+                error.getMetadataMap()
+        );
     }
 
     private void cleanCommandFuture(Protocol.Command cmd) {
