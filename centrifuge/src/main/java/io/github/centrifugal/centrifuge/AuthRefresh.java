@@ -9,6 +9,7 @@ import java.util.concurrent.TimeUnit;
 import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
+import java8.util.concurrent.CompletableFuture;
 import okhttp3.WebSocket;
 
 
@@ -49,6 +50,9 @@ final class AuthRefresh {
     private final Backoff backoff = new Backoff();
     // The refresh in flight is the one which runs now. The refreshes waiting for it run in order.
     private boolean inFlight = false;
+    // A refresh command awaits its reply. Only this gates the rpc calls: a timer refresh which is
+    // still fetching its token does not hold them.
+    private boolean commandInFlight = false;
     private final Deque<Waiting> waiting = new ArrayDeque<>();
     // The scheduled refresh. The generation is bumped on each cancel, so a timer which fired
     // after its cancel does nothing.
@@ -65,9 +69,9 @@ final class AuthRefresh {
     }
 
 
-    /** Whether a refresh is in flight. The rpc calls wait for it. */
+    /** Whether a refresh command awaits its reply. The rpc calls wait for it. */
     boolean isInFlight() {
-        return inFlight;
+        return commandInFlight;
     }
 
 
@@ -166,7 +170,17 @@ final class AuthRefresh {
             complete();
             return;
         }
-        client.getOpts().getTokenGetter().getConnectionToken(new ConnectionTokenEvent(), (Throwable err, String token) -> client.getExecutor().submit(() -> onTokenFetched(transport, err, token)));
+        // The getter may never answer, so the fetch is bounded by the client timeout. A late answer is ignored.
+        CompletableFuture<String> fetched = new CompletableFuture<>();
+        client.getOpts().getTokenGetter().getConnectionToken(new ConnectionTokenEvent(), (Throwable err, String token) -> {
+            if (err != null) {
+                fetched.completeExceptionally(err);
+            } else {
+                fetched.complete(token);
+            }
+        });
+        fetched.orTimeout(client.getOpts().getTimeout(), TimeUnit.MILLISECONDS)
+                .whenComplete((String token, Throwable err) -> Extensions.runOnExecutor(client.getExecutor(), () -> onTokenFetched(transport, Extensions.unwrapCompletion(err), token)));
     }
 
 
@@ -190,6 +204,7 @@ final class AuthRefresh {
             complete();
             return;
         }
+        commandInFlight = true;
         client.sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishTimer(transport, token, error, result)));
     }
 
@@ -239,6 +254,7 @@ final class AuthRefresh {
 
     // Sends the refresh command with the token the caller gave.
     private void startRequested(String token, ResultCallback<AuthResult> cb) {
+        commandInFlight = true;
         client.sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishRequested(token, error, result, cb)));
     }
 
@@ -247,6 +263,7 @@ final class AuthRefresh {
     // held for the refresh are written.
     private void complete() {
         inFlight = false;
+        commandInFlight = false;
         if (!waiting.isEmpty()) {
             inFlight = true;
             Waiting next = waiting.poll();

@@ -420,6 +420,37 @@ public class AuthTest extends RpcTestBase {
     }
 
 
+    @Test
+    public void silentTokenGetterDoesNotHoldRpcCalls() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        answerRpcs("after-timer");
+        List<Long> fetchTimes = new CopyOnWriteArrayList<>();
+        newAuthClient(optionsWithSilentTokenGetter(fetchTimes));
+        connect(client);
+        awaitCondition("timer started a token fetch", () -> fetchTimes.size() == 1);
+
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        client.rpc("method", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(1000).build(), into(future));
+
+        assertEquals("after-timer", new String(future.get(5, TimeUnit.SECONDS).getData()));
+    }
+
+
+    @Test
+    public void silentTokenGetterIsReportedAtTheClientTimeout() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        List<Long> fetchTimes = new CopyOnWriteArrayList<>();
+        Options options = optionsWithSilentTokenGetter(fetchTimes);
+        options.setTimeout(300);
+        newAuthClient(options);
+        connect(client);
+
+        awaitCondition("token fetch reported as timed out", () -> tokenErrorOf(errorEvents) != null);
+        assertTrue(tokenErrorOf(errorEvents).getError() instanceof TimeoutException);
+        assertEquals(ClientState.CONNECTED, client.getState());
+    }
+
+
     @Test(expected = NullPointerException.class)
     public void refreshRejectsNullToken() {
         newAuthClient(new Options());
@@ -472,6 +503,31 @@ public class AuthTest extends RpcTestBase {
             }
         });
         return options;
+    }
+
+
+    // A token getter which records each call and never answers, like a getter which lost its request.
+    private static Options optionsWithSilentTokenGetter(final List<Long> fetchTimes) {
+        Options options = new Options();
+        options.setToken("token-initial");
+        options.setTokenGetter(new ConnectionTokenGetter() {
+            @Override
+            public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
+                fetchTimes.add(System.nanoTime());
+            }
+        });
+        return options;
+    }
+
+
+    // The token error the client reported, or null when none was reported.
+    private static TokenError tokenErrorOf(List<ErrorEvent> events) {
+        for (ErrorEvent event : events) {
+            if (event.getError() instanceof TokenError) {
+                return (TokenError) event.getError();
+            }
+        }
+        return null;
     }
 
 
