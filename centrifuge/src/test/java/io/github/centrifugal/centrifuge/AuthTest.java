@@ -9,6 +9,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
@@ -769,6 +770,57 @@ public class AuthTest extends RpcTestBase {
     }
 
 
+    @Test
+    public void explicitRefreshIsAnsweredAfterATokenGetterThrowsOnTheTimer() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        ManualScheduler clock = new ManualScheduler();
+        AtomicBoolean failing = new AtomicBoolean(true);
+        Options options = new Options();
+        options.setToken("token-initial");
+        options.setTokenGetter(new ConnectionTokenGetter() {
+            @Override
+            public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
+                if (failing.get()) {
+                    throw new IllegalStateException("getter failed");
+                }
+                cb.Done(null, "token-timer");
+            }
+        });
+        newAuthClientOnClock(options, clock);
+        connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+        answerRefreshes("u1", "authenticated");
+
+        clock.advance(1000);
+        awaitCondition("the getter failure is reported", () -> tokenErrorOf(errorEvents) != null);
+        AuthResult result = refresh(client, "token-2").get(5, TimeUnit.SECONDS);
+
+        assertEquals("u1", result.getUser());
+        assertEquals(ClientState.CONNECTED, client.getState());
+        assertFalse(disconnectedSignals.tryAcquire());
+    }
+
+
+    @Test
+    public void refreshIsAnsweredAfterTheAuthListenerThrowsOnATimerRefresh() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        ManualScheduler clock = new ManualScheduler();
+        Options options = optionsWithTokenGetter(new CopyOnWriteArrayList<Long>());
+        client = new Client(server.url(), options, throwingAuthListener(), FAST_RETRY_MIN_MILLIS, FAST_RETRY_MAX_MILLIS, clock);
+        connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+        answerRefreshes("u2", "authenticated");
+
+        clock.advance(1000);
+        awaitCondition("the timer refresh is sent", () -> refreshTokens().size() == 1);
+        AuthResult result = refresh(client, "token-2").get(5, TimeUnit.SECONDS);
+
+        assertEquals("u2", result.getUser());
+        assertEquals(ClientState.CONNECTED, client.getState());
+        assertFalse(disconnectedSignals.tryAcquire());
+    }
+
+
     @Test(expected = NullPointerException.class)
     public void refreshRejectsNullToken() {
         newAuthClient(new Options());
@@ -819,6 +871,31 @@ public class AuthTest extends RpcTestBase {
             @Override
             public void onDisconnected(Client c, DisconnectedEvent e) {
                 disconnectedEvents.add(e);
+                disconnectedSignals.release();
+            }
+        };
+    }
+
+
+    // A listener which fails on the identity "u2", after the connect and the disconnect signals are recorded.
+    private EventListener throwingAuthListener() {
+        return new EventListener() {
+            @Override
+            public void onConnected(Client c, ConnectedEvent e) {
+                connectedSignals.release();
+            }
+
+
+            @Override
+            public void onAuth(Client c, AuthEvent e) {
+                if ("u2".equals(e.getUser())) {
+                    throw new IllegalStateException("listener failed");
+                }
+            }
+
+
+            @Override
+            public void onDisconnected(Client c, DisconnectedEvent e) {
                 disconnectedSignals.release();
             }
         };
