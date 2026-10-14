@@ -3,10 +3,11 @@ package io.github.centrifugal.centrifuge;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 
-/** Tests of the options of the exactly-once rpc calls: the connection instance and the queue bound. */
+/** Tests of the options of the exactly-once rpc calls: the connection instance, the queue bound and the call timeout. */
 public class OptionsRpcTest {
     @Test
     public void instanceIsEmptyByDefaultAndNullClearsIt() {
@@ -36,6 +37,24 @@ public class OptionsRpcTest {
             fail("expected the instance to be rejected");
         } catch (IllegalArgumentException expected) {
             assertEquals("", opts.getInstance());
+        }
+    }
+
+
+    @Test
+    public void timeoutIsReadBackAndDefaultsToZero() {
+        assertEquals(0L, new RpcOptions.Builder().build().getTimeout());
+        assertEquals(750L, new RpcOptions.Builder().timeout(750L).build().getTimeout());
+    }
+
+
+    @Test
+    public void timeoutRejectsANonPositiveValue() {
+        try {
+            new RpcOptions.Builder().timeout(0L);
+            fail("expected the timeout to be rejected");
+        } catch (IllegalArgumentException expected) {
+            assertTrue(expected.getMessage().contains("timeout"));
         }
     }
 

@@ -6,6 +6,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
@@ -87,13 +88,22 @@ abstract class FakeServerTestBase {
 
     /** Answers every rpc with a result carrying the payload and the server time, other commands by default. */
     protected void answerRpcs(String payload, long time) {
+        answerRpcs(payload, () -> time);
+    }
+
+
+    /**
+     * Answers every rpc with a result carrying the payload and the server time, read when each
+     * answer is sent, other commands by default.
+     */
+    protected void answerRpcs(String payload, LongSupplier serverTime) {
         server.onCommand = cmd -> {
             if (!cmd.hasRpc()) {
                 return null;
             }
             return Protocol.Reply.newBuilder()
                     .setId(cmd.getId())
-                    .setTime(time)
+                    .setTime(serverTime.getAsLong())
                     .setRpc(Protocol.RPCResult.newBuilder()
                             .setData(com.google.protobuf.ByteString.copyFromUtf8(payload)))
                     .build();
@@ -107,9 +117,9 @@ abstract class FakeServerTestBase {
     }
 
 
-    /** Adapts an rpc callback to a future: a reply error completes it exceptionally. */
-    protected static ResultCallback<RPCResult> into(CompletableFuture<RPCResult> future) {
-        return (error, result) -> {
+    /** Adapts a callback to a future: an error completes it exceptionally. */
+    protected static <T> ResultCallback<T> into(CompletableFuture<T> future) {
+        return (Throwable error, T result) -> {
             if (error != null) {
                 future.completeExceptionally(error);
             } else {
@@ -119,13 +129,19 @@ abstract class FakeServerTestBase {
     }
 
 
-    /** The reply error of a failed rpc future. */
-    protected static ReplyError replyErrorOf(CompletableFuture<RPCResult> future) throws Exception {
+    /** The error of a call which failed. Fails when the call succeeded. */
+    protected static <T> Throwable errorOf(CompletableFuture<T> future) throws Exception {
         try {
             future.get(5, TimeUnit.SECONDS);
         } catch (ExecutionException e) {
-            return (ReplyError) e.getCause();
+            return e.getCause();
         }
-        throw new AssertionError("rpc succeeded, expected a reply error");
+        throw new AssertionError("the call succeeded, expected an error");
+    }
+
+
+    /** The reply error of a failed rpc future. */
+    protected static ReplyError replyErrorOf(CompletableFuture<RPCResult> future) throws Exception {
+        return (ReplyError) errorOf(future);
     }
 }

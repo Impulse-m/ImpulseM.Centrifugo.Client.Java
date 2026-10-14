@@ -3,7 +3,6 @@ package io.github.centrifugal.centrifuge;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
@@ -128,31 +127,19 @@ abstract class RpcTestBase extends FakeServerTestBase {
      */
     protected void syncWithServer() throws Exception {
         CompletableFuture<PresenceResult> marker = new CompletableFuture<>();
-        client.presence("sync", completing(marker));
+        client.presence("sync", into(marker));
         marker.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
     }
 
 
-    /** Adapts a callback to a future: an error completes it exceptionally. */
-    protected static <T> ResultCallback<T> completing(CompletableFuture<T> future) {
-        return (Throwable error, T result) -> {
-            if (error != null) {
-                future.completeExceptionally(error);
-            } else {
-                future.complete(result);
+    /** Answers every refresh with the reply, other commands by default. The id of each answer is the id of its command. */
+    protected void answerRefreshWith(Protocol.Reply.Builder reply) {
+        server.onCommand = (Protocol.Command cmd) -> {
+            if (!cmd.hasRefresh()) {
+                return null;
             }
+            return reply.clone().setId(cmd.getId()).build();
         };
-    }
-
-
-    /** The error of a call which failed. Fails when the call succeeded. */
-    protected static <T> Throwable errorOf(CompletableFuture<T> future) throws Exception {
-        try {
-            future.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
-        } catch (ExecutionException e) {
-            return e.getCause();
-        }
-        throw new AssertionError("the call succeeded, expected an error");
     }
 
 

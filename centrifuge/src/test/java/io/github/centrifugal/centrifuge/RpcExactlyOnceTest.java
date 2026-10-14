@@ -16,6 +16,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
@@ -377,7 +378,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         connect(c);
         server.deferCommand = (Protocol.Command cmd) ->cmd.hasRefresh();
         CompletableFuture<AuthResult> refreshFuture = new CompletableFuture<>();
-        c.refresh("token-2", completing(refreshFuture));
+        c.refresh("token-2", into(refreshFuture));
         syncWithServer();
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         RpcCall call = c.rpcCall("m", EMPTY_PAYLOAD, into(future));
@@ -645,21 +646,16 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
     // Answers connects and rpc calls with the server time the test holds, so the test moves the clock.
     private void answerWithServerTime(AtomicLong serverTime) {
-        server.onCommand = (Protocol.Command cmd) ->{
-            if (cmd.hasConnect()) {
-                return Protocol.Reply.newBuilder()
-                        .setId(cmd.getId())
-                        .setTime(serverTime.get())
-                        .setConnect(server.connectResult)
-                        .build();
-            }
-            if (!cmd.hasRpc()) {
-                return null;
+        answerRpcs("ok", serverTime::get);
+        Function<Protocol.Command, Protocol.Reply> rpcAnswer = server.onCommand;
+        server.onCommand = (Protocol.Command cmd) -> {
+            if (!cmd.hasConnect()) {
+                return rpcAnswer.apply(cmd);
             }
             return Protocol.Reply.newBuilder()
                     .setId(cmd.getId())
                     .setTime(serverTime.get())
-                    .setRpc(Protocol.RPCResult.newBuilder().setData(com.google.protobuf.ByteString.copyFromUtf8("ok")))
+                    .setConnect(server.connectResult)
                     .build();
         };
     }

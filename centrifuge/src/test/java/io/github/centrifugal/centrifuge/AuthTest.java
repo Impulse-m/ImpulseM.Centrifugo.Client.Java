@@ -186,15 +186,7 @@ public class AuthTest extends RpcTestBase {
         options.setToken("token-1");
         newAuthClient(options);
         connect(client);
-        server.onCommand = (Protocol.Command cmd) ->{
-            if (!cmd.hasRefresh()) {
-                return null;
-            }
-            return Protocol.Reply.newBuilder()
-                    .setId(cmd.getId())
-                    .setError(Protocol.Error.newBuilder().setCode(PERMISSION_DENIED).setMessage("denied"))
-                    .build();
-        };
+        refuseRefreshes();
 
         ReplyError error = (ReplyError) errorOf(refresh(client, "token-2"));
 
@@ -215,15 +207,7 @@ public class AuthTest extends RpcTestBase {
         server.connectResult = expiringResult("u1", "authenticated", 1);
         newAuthClient(optionsWithTokenGetter(new CopyOnWriteArrayList<Long>()));
         connect(client);
-        server.onCommand = (Protocol.Command cmd) ->{
-            if (!cmd.hasRefresh()) {
-                return null;
-            }
-            return Protocol.Reply.newBuilder()
-                    .setId(cmd.getId())
-                    .setError(Protocol.Error.newBuilder().setCode(PERMISSION_DENIED).setMessage("denied"))
-                    .build();
-        };
+        refuseRefreshes();
 
         awaitCondition("refresh error reported", () -> !errorEvents.isEmpty());
         drainExecutor();
@@ -240,15 +224,7 @@ public class AuthTest extends RpcTestBase {
         List<Long> fetchTimes = new CopyOnWriteArrayList<>();
         newAuthClient(optionsWithTokenGetter(fetchTimes), FAST_RETRY_MIN_MILLIS, FAST_RETRY_MAX_MILLIS);
         connect(client);
-        server.onCommand = (Protocol.Command cmd) ->{
-            if (!cmd.hasRefresh()) {
-                return null;
-            }
-            return Protocol.Reply.newBuilder()
-                    .setId(cmd.getId())
-                    .setError(Protocol.Error.newBuilder().setCode(PERMISSION_DENIED).setMessage("denied"))
-                    .build();
-        };
+        refuseRefreshes();
         awaitCondition("refused refresh sent", () -> refreshTokens().size() == 1);
         awaitCondition("refresh error reported", () -> !errorEvents.isEmpty());
 
@@ -305,15 +281,8 @@ public class AuthTest extends RpcTestBase {
         List<Long> fetchTimes = new CopyOnWriteArrayList<>();
         newAuthClient(optionsWithTokenGetter(fetchTimes));
         connect(client);
-        server.onCommand = (Protocol.Command cmd) ->{
-            if (!cmd.hasRefresh()) {
-                return null;
-            }
-            return Protocol.Reply.newBuilder()
-                    .setId(cmd.getId())
-                    .setRefresh(Protocol.RefreshResult.newBuilder().setUser("u1").setAuthClass("authenticated").setExpires(true).setTtl(1))
-                    .build();
-        };
+        answerRefreshWith(Protocol.Reply.newBuilder()
+                .setRefresh(Protocol.RefreshResult.newBuilder().setUser("u1").setAuthClass("authenticated").setExpires(true).setTtl(1)));
 
         refresh(client, "token-manual").get(5, TimeUnit.SECONDS);
 
@@ -602,21 +571,21 @@ public class AuthTest extends RpcTestBase {
 
 
     private void answerRefreshes(String user, String authClass) {
-        server.onCommand = (Protocol.Command cmd) ->{
-            if (!cmd.hasRefresh()) {
-                return null;
-            }
-            return Protocol.Reply.newBuilder()
-                    .setId(cmd.getId())
-                    .setRefresh(Protocol.RefreshResult.newBuilder().setUser(user).setAuthClass(authClass))
-                    .build();
-        };
+        answerRefreshWith(Protocol.Reply.newBuilder()
+                .setRefresh(Protocol.RefreshResult.newBuilder().setUser(user).setAuthClass(authClass)));
+    }
+
+
+    // Answers every refresh with the refused transition: the connection keeps its identity and its token.
+    private void refuseRefreshes() {
+        answerRefreshWith(Protocol.Reply.newBuilder()
+                .setError(Protocol.Error.newBuilder().setCode(PERMISSION_DENIED).setMessage("denied")));
     }
 
 
     private static CompletableFuture<AuthResult> refresh(Client c, String token) {
         CompletableFuture<AuthResult> future = new CompletableFuture<>();
-        c.refresh(token, completing(future));
+        c.refresh(token, into(future));
         return future;
     }
 
