@@ -35,6 +35,8 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     // Server error for a msg_id outside its window. The code is server-configurable, the test
     // only pins that the client surfaces it as a reply error.
     private static final int MSG_ID_INVALID = 107;
+    // Largest msg_id a JSON number carries exactly: 53 bits.
+    private static final long MSG_ID_MAX = (1L << 53) - 1;
 
     // msg_id -> payload of the calls the fake server ran.
     private final Map<Long, byte[]> records = new ConcurrentHashMap<>();
@@ -344,7 +346,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         for (Protocol.RPCRequest request : requests) {
             long msgId = request.getMsgId();
             assertTrue("msg_id increases", msgId > previous);
-            assertTrue("msg_id fits 53 bits", msgId <= Extensions.MSG_ID_MAX);
+            assertTrue("msg_id fits 53 bits", msgId <= MSG_ID_MAX);
             assertTrue("time part is the unix second", Math.abs((msgId >> Extensions.MSG_ID_SEQUENCE_BITS) - nowSeconds) <= 5);
             previous = msgId;
         }
@@ -390,22 +392,26 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void msgIdTimePartFollowsAServerClockThatMovedBack() throws Exception {
+    public void msgIdStaysIncreasingWhenTheServerClockMovesBack() throws Exception {
         enableRpcOptions();
         AtomicLong serverTime = new AtomicLong(System.currentTimeMillis() + 120_000L);
         answerWithServerTime(serverTime);
         Client c = newClient();
         connect(c);
         callAndWait(c);
-        long ahead = sentRpcRequests().get(0).getMsgId() >> Extensions.MSG_ID_SEQUENCE_BITS;
 
         serverTime.set(System.currentTimeMillis());
         callAndWait(c);
         callAndWait(c);
 
-        long corrected = sentRpcRequests().get(2).getMsgId() >> Extensions.MSG_ID_SEQUENCE_BITS;
-        assertTrue("the first call used the clock before the correction", ahead > System.currentTimeMillis() / 1000L + 100);
-        assertTrue("the third call uses the corrected clock", Math.abs(corrected - System.currentTimeMillis() / 1000L) <= 5);
+        List<Protocol.RPCRequest> requests = sentRpcRequests();
+        long first = requests.get(0).getMsgId();
+        long second = requests.get(1).getMsgId();
+        long third = requests.get(2).getMsgId();
+        assertTrue("the first call used the clock before the correction", (first >> Extensions.MSG_ID_SEQUENCE_BITS) > System.currentTimeMillis() / 1000L + 100);
+        assertTrue("the second call follows the first", second > first);
+        assertTrue("the third call follows the second", third > second);
+        assertEquals("the time part lags the corrected clock", first >> Extensions.MSG_ID_SEQUENCE_BITS, second >> Extensions.MSG_ID_SEQUENCE_BITS);
     }
 
 

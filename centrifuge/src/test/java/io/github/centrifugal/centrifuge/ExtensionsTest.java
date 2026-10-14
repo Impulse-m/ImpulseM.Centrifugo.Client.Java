@@ -1,5 +1,8 @@
 package io.github.centrifugal.centrifuge;
 
+import java.util.HashSet;
+import java.util.Set;
+
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
 import org.junit.Test;
@@ -12,6 +15,10 @@ import static org.junit.Assert.assertTrue;
 
 /** Unit tests of the arithmetic behind the protocol extensions. */
 public class ExtensionsTest {
+    // Largest msg_id a JSON number carries exactly: 53 bits.
+    private static final long MSG_ID_MAX = (1L << 53) - 1;
+
+
     @Test
     public void rpcOptionsFlagIsBit32() {
         assertEquals(4294967296L, Extensions.RPC_OPTIONS_FLAG);
@@ -84,10 +91,45 @@ public class ExtensionsTest {
 
 
     @Test
-    public void msgIdTimePartFollowsTheCorrectedClockWhenItGoesBack() {
+    public void msgIdNeverMovesBackWhenTheClockGoesBack() {
         long last = Extensions.nextMsgId(1_700_000_005_000L, 0L);
 
-        assertEquals(1_700_000_001L << Extensions.MSG_ID_SEQUENCE_BITS, Extensions.nextMsgId(1_700_000_001_000L, last));
+        assertEquals(last + 1, Extensions.nextMsgId(1_700_000_001_000L, last));
+    }
+
+
+    @Test
+    public void msgIdTimePartFollowsTheClockAgainOnceItPassesTheLastTimePart() {
+        long last = Extensions.nextMsgId(1_700_000_005_000L, 0L);
+        long lagging = Extensions.nextMsgId(1_700_000_001_000L, last);
+
+        assertEquals(1_700_000_006L << Extensions.MSG_ID_SEQUENCE_BITS, Extensions.nextMsgId(1_700_000_006_000L, lagging));
+    }
+
+
+    @Test
+    public void msgIdsStayUniqueAndIncreasingAcrossBackwardCorrections() {
+        long[] clocksMillis = {
+                1_700_000_005_000L,
+                1_700_000_005_000L,
+                1_700_000_007_000L,
+                1_700_000_003_000L,
+                1_700_000_003_000L,
+                1_700_000_005_000L,
+                1_700_000_005_000L,
+                1_700_000_008_000L,
+                1_700_000_001_000L,
+                1_700_000_008_000L
+        };
+        Set<Long> issued = new HashSet<>();
+        long last = 0L;
+        for (long clock : clocksMillis) {
+            long next = Extensions.nextMsgId(clock, last);
+
+            assertTrue(next > last);
+            assertTrue("msg_id issued twice: " + next, issued.add(next));
+            last = next;
+        }
     }
 
 
@@ -104,7 +146,7 @@ public class ExtensionsTest {
     public void msgIdFitsFiftyThreeBitsForTodaysClock() {
         long msgId = Extensions.nextMsgId(1_800_000_000_000L, 0L);
 
-        assertTrue(msgId <= Extensions.MSG_ID_MAX);
+        assertTrue(msgId <= MSG_ID_MAX);
         assertTrue(msgId > 0L);
     }
 

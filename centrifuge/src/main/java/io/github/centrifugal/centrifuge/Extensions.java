@@ -23,9 +23,6 @@ final class Extensions {
     /** Largest sequence a msg_id carries within one second. */
     static final long MSG_ID_SEQUENCE_MASK = (1L << MSG_ID_SEQUENCE_BITS) - 1;
 
-    /** Largest msg_id a JSON number carries exactly: 53 bits. */
-    static final long MSG_ID_MAX = (1L << 53) - 1;
-
     /** Returned by {@link #nextMsgId} when the sequence of the current second is used up. */
     static final long NO_MSG_ID = -1L;
 
@@ -42,17 +39,17 @@ final class Extensions {
 
 
     /**
-     * The next msg_id: the server-corrected unix second shifted left by
-     * {@link #MSG_ID_SEQUENCE_BITS}, plus a sequence that counts the msg_ids of one second. The
-     * time part follows the corrected clock on every call, so when a correction moves the clock
-     * back, the msg_ids move back with it and the sequence starts again. Keeping an old time
-     * part would put the msg_ids outside the server window. Returns {@link #NO_MSG_ID} when the
-     * sequence of the second is used up, the sequence never carries into the time part.
+     * The next msg_id, which is always greater than {@code lastMsgId}: the server-corrected unix
+     * second shifted left by {@link #MSG_ID_SEQUENCE_BITS}, or the msg_id after {@code lastMsgId}
+     * when the corrected clock is not past the time part of it. So a correction which moves the
+     * clock back keeps the time part of the last msg_id until the clock passes it, and no msg_id
+     * is issued twice within the server window. Returns {@link #NO_MSG_ID} when the sequence of
+     * the second is used up, the sequence never carries into the time part.
      */
     static long nextMsgId(long serverTimeMillis, long lastMsgId) {
-        long seconds = serverTimeMillis / 1000L;
-        if (seconds != (lastMsgId >>> MSG_ID_SEQUENCE_BITS)) {
-            return seconds << MSG_ID_SEQUENCE_BITS;
+        long candidate = (serverTimeMillis / 1000L) << MSG_ID_SEQUENCE_BITS;
+        if (candidate > lastMsgId) {
+            return candidate;
         }
         if ((lastMsgId & MSG_ID_SEQUENCE_MASK) >= MSG_ID_SEQUENCE_MASK) {
             return NO_MSG_ID;
