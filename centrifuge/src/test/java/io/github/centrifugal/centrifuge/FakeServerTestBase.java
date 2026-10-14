@@ -2,6 +2,8 @@ package io.github.centrifugal.centrifuge;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Semaphore;
@@ -54,7 +56,13 @@ abstract class FakeServerTestBase {
 
     /** Creates the client for the fake server; it is not connected yet. */
     protected Client newClient() {
-        client = new Client(server.url(), new Options(), new EventListener() {
+        return newClient(new Options());
+    }
+
+
+    /** Creates the client for the fake server with the given options; it is not connected yet. */
+    protected Client newClient(Options options) {
+        client = new Client(server.url(), options, new EventListener() {
             @Override
             public void onConnected(Client c, ConnectedEvent e) {
                 connectedSignals.release();
@@ -98,6 +106,26 @@ abstract class FakeServerTestBase {
                             .setData(com.google.protobuf.ByteString.copyFromUtf8(payload)))
                     .build();
         };
+    }
+
+
+    /** Makes the fake server confirm RPC options in its connect reply. */
+    protected void enableRpcOptions() {
+        server.connectResult = Protocol.ConnectResult.newBuilder()
+                .setClient("fake-client").setVersion("0.0.0").setPing(25)
+                .setFlag(Extensions.RPC_OPTIONS_FLAG).build();
+    }
+
+
+    /** The rpc requests the client sent, in order. */
+    protected List<Protocol.RPCRequest> sentRpcRequests() {
+        List<Protocol.RPCRequest> requests = new ArrayList<>();
+        for (Protocol.Command cmd : server.received()) {
+            if (cmd.hasRpc()) {
+                requests.add(cmd.getRpc());
+            }
+        }
+        return requests;
     }
 
 

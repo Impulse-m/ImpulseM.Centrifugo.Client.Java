@@ -67,4 +67,62 @@ public class ExtensionsTest {
         assertEquals(ReplyError.UNSUPPORTED, reply.getError().getCode());
         assertEquals("rpc headers are not supported by the server", reply.getError().getMessage());
     }
+
+
+    @Test
+    public void msgIdCarriesTheUnixSecondAndStartsSequenceAtZero() {
+        assertEquals(1_700_000_000L << 20, Extensions.nextMsgId(1_700_000_000_999L, 0L));
+    }
+
+
+    @Test
+    public void msgIdIncrementsWithinOneSecond() {
+        long first = Extensions.nextMsgId(1_700_000_000_100L, 0L);
+
+        assertEquals(first + 1, Extensions.nextMsgId(1_700_000_000_900L, first));
+    }
+
+
+    @Test
+    public void msgIdStaysIncreasingWhenTheClockGoesBack() {
+        long last = Extensions.nextMsgId(1_700_000_005_000L, 0L);
+
+        assertEquals(last + 1, Extensions.nextMsgId(1_700_000_001_000L, last));
+    }
+
+
+    @Test
+    public void msgIdFitsFiftyThreeBitsForTodaysClock() {
+        long msgId = Extensions.nextMsgId(1_800_000_000_000L, 0L);
+
+        assertTrue(msgId <= Extensions.MSG_ID_MAX);
+        assertTrue(msgId > 0L);
+    }
+
+
+    @Test
+    public void instanceAcceptsTwentyTwoToSixtyFourUrlSafeCharacters() {
+        assertTrue(Extensions.isValidInstance("abcdefghijklmnopqrstuv"));
+        assertTrue(Extensions.isValidInstance("ABCDEFGHIJKLMNOPQRSTUV_-"));
+        assertTrue(Extensions.isValidInstance(repeat('x', 64)));
+    }
+
+
+    @Test
+    public void instanceRejectsOtherLengthsAndCharacters() {
+        assertFalse(Extensions.isValidInstance(repeat('x', 21)));
+        assertFalse(Extensions.isValidInstance(repeat('x', 65)));
+        assertFalse(Extensions.isValidInstance("abcdefghijklmnopqrstu+"));
+        assertFalse(Extensions.isValidInstance("abcdefghijklmnopqrstuv\n"));
+        assertFalse(Extensions.isValidInstance(""));
+    }
+
+
+    private static String repeat(char c, int count) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < count; i++) {
+            builder.append(c);
+        }
+        return builder.toString();
+    }
 }

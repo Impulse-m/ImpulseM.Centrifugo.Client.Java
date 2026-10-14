@@ -14,6 +14,7 @@ import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 
 /**
@@ -242,6 +243,24 @@ public class RpcOptionsTest extends FakeServerTestBase {
         ReplyError error = replyErrorOf(future);
         assertEquals(ReplyError.UNSUPPORTED, error.getCode());
         assertTrue("nothing sent", rpcRequests().isEmpty());
+    }
+
+
+    @Test
+    public void timeoutIsReadBackAndDefaultsToZero() {
+        assertEquals(0L, new RpcOptions.Builder().build().getTimeout());
+        assertEquals(750L, new RpcOptions.Builder().timeout(750L).build().getTimeout());
+    }
+
+
+    @Test
+    public void timeoutRejectsANonPositiveValue() {
+        try {
+            new RpcOptions.Builder().timeout(0L);
+            fail("expected the timeout to be rejected");
+        } catch (IllegalArgumentException expected) {
+            assertTrue(expected.getMessage().contains("timeout"));
+        }
     }
 
 
