@@ -213,6 +213,19 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void cancelAfterCloseDoesNotThrow() throws Exception {
+        Client c = newClient();
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        RpcCall call = c.rpcCall("queued", EMPTY_PAYLOAD, into(future));
+        drainExecutor();
+        c.close(1000);
+        assertTrue("close fails the queued call", errorOf(future) instanceof IOException);
+
+        call.cancel();
+    }
+
+
+    @Test
     public void cancelBeforeSendNeverSendsTheCall() throws Exception {
         enableRpcOptions();
         answerRpcs("ok");

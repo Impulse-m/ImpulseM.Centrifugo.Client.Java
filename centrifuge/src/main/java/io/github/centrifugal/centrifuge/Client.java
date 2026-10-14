@@ -1411,7 +1411,11 @@ public class Client {
     }
 
     void cancelRpc(RpcCall call) {
-        this.executor.submit(() -> Client.this.rpcSession.cancel(call));
+        try {
+            this.executor.submit(() -> Client.this.rpcSession.cancel(call));
+        } catch (RejectedExecutionException ignored) {
+            // Executor already shut down: close completed the call.
+        }
     }
 
     /**

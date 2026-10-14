@@ -55,6 +55,9 @@ public final class RpcCall {
      * and nothing is sent. Has no effect once the call is done.
      */
     public void cancel() {
+        if (future.isDone()) {
+            return;
+        }
         this.client.cancelRpc(this);
     }
 }
