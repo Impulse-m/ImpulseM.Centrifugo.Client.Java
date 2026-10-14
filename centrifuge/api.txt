@@ -1,6 +1,18 @@
 // Signature format: 4.0
 package io.github.centrifugal.centrifuge {
 
+  public class AuthEvent {
+    method public String getAuthClass();
+    method public String getUser();
+  }
+
+  public class AuthResult {
+    method public String getAuthClass();
+    method public int getTtl();
+    method public String getUser();
+    method public boolean isExpires();
+  }
+
   public class Client {
     ctor public Client(String, io.github.centrifugal.centrifuge.Options!, io.github.centrifugal.centrifuge.EventListener!);
     method public boolean close(long);
@@ -15,6 +27,7 @@ package io.github.centrifugal.centrifuge {
     method public void presence(String, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.PresenceResult!>!);
     method public void presenceStats(String, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.PresenceStatsResult!>!);
     method public void publish(String, byte[]!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.PublishResult!>!);
+    method public void refresh(String, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.AuthResult!>!);
     method public void removeSubscription(io.github.centrifugal.centrifuge.Subscription!);
     method public void rpc(String, byte[]!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.RPCResult!>!);
     method public void rpc(String, byte[]!, io.github.centrifugal.centrifuge.RpcOptions!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.RPCResult!>!);
@@ -61,8 +74,10 @@ package io.github.centrifugal.centrifuge {
 
   public class ConnectedEvent {
     ctor public ConnectedEvent();
+    method public String getAuthClass();
     method public String getClient();
     method public byte[]! getData();
+    method public String getUser();
   }
 
   public class ConnectingEvent {
@@ -100,6 +115,7 @@ package io.github.centrifugal.centrifuge {
 
   public abstract class EventListener {
     ctor public EventListener();
+    method public void onAuth(io.github.centrifugal.centrifuge.Client!, io.github.centrifugal.centrifuge.AuthEvent!);
     method public void onConnected(io.github.centrifugal.centrifuge.Client!, io.github.centrifugal.centrifuge.ConnectedEvent!);
     method public void onConnecting(io.github.centrifugal.centrifuge.Client!, io.github.centrifugal.centrifuge.ConnectingEvent!);
     method public void onDisconnected(io.github.centrifugal.centrifuge.Client!, io.github.centrifugal.centrifuge.DisconnectedEvent!);

@@ -4,7 +4,9 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -73,6 +75,13 @@ public class Client {
     private volatile boolean rpcOptionsSupported = false;
     // Server clock minus local clock, from the last reply that carried a server time.
     private volatile long serverTimeOffset = 0;
+    // Identity the server last reported for the connection, see applyAuth.
+    private volatile String currentUser = "";
+    private volatile String currentAuthClass = "";
+    // Set while a refresh() call waits for its reply; rpc calls and further refresh calls
+    // queue in pendingAfterRefresh until it completes. Only touched on the executor thread.
+    private boolean refreshInFlight = false;
+    private final Deque<Runnable> pendingAfterRefresh = new ArrayDeque<>();
 
     Options getOpts() {
         return opts;
@@ -885,8 +894,11 @@ public class Client {
         ConnectedEvent event = new ConnectedEvent();
         event.setClient(result.getClient());
         event.setData(result.getData().toByteArray());
+        event.setUser(result.getUser());
+        event.setAuthClass(result.getAuthClass());
         this.setState(ClientState.CONNECTED);
         this.listener.onConnected(this, event);
+        this.applyAuth(result.getUser(), result.getAuthClass(), true);
         this.pingInterval = result.getPing() * 1000;
         this.sendPong = result.getPong();
 
@@ -1126,6 +1138,17 @@ public class Client {
         Long offset = Extensions.serverTimeOffsetFrom(reply.getTime(), System.currentTimeMillis());
         if (offset != null) {
             this.serverTimeOffset = offset;
+        }
+    }
+
+    // Records the identity the server reports for the connection. A connect always reports
+    // it, so the listener hears every connect; a refresh reports it only when it changed.
+    private void applyAuth(String user, String authClass, boolean always) {
+        boolean changed = !user.equals(this.currentUser) || !authClass.equals(this.currentAuthClass);
+        this.currentUser = user;
+        this.currentAuthClass = authClass;
+        if (always || changed) {
+            this.listener.onAuth(this, new AuthEvent(user, authClass));
         }
     }
 
@@ -1413,6 +1436,10 @@ public class Client {
     }
 
     private void rpcSynchronized(String method, byte[] data, RpcOptions options, ResultCallback<RPCResult> cb) {
+        if (this.refreshInFlight) {
+            this.pendingAfterRefresh.add(() -> Client.this.rpcSynchronized(method, data, options, cb));
+            return;
+        }
         Protocol.RPCRequest.Builder req = Protocol.RPCRequest.newBuilder()
                 .setData(com.google.protobuf.ByteString.copyFrom(data))
                 .setMethod(method);
@@ -1628,6 +1655,61 @@ public class Client {
         this.enqueueCommandFuture(cmd, f);
     }
 
+    /**
+     * Refresh the connection with a new token now, without waiting for the server to ask for one.
+     * On success the callback gets the identity the server reports after the refresh, and the
+     * refresh timer is rescheduled from the new TTL. An error leaves the connection and its
+     * identity as they were. Calls to {@link #rpc} issued while the refresh is in flight are sent
+     * after its reply, so they run under the new identity. Refresh calls are sent one after
+     * another, each with its own token, in call order.
+     *
+     * @param token: new connection token, must not be null.
+     * @param cb:    will be called when the refresh reply is received or an error happened.
+     */
+    public void refresh(String token, ResultCallback<AuthResult> cb) {
+        if (token == null) {
+            throw new NullPointerException("token must not be null");
+        }
+        this.executor.submit(() -> Client.this.refreshRequestSynchronized(token, cb));
+    }
+
+    private void refreshRequestSynchronized(String token, ResultCallback<AuthResult> cb) {
+        if (this.refreshInFlight) {
+            this.pendingAfterRefresh.add(() -> Client.this.refreshRequestSynchronized(token, cb));
+            return;
+        }
+        this.refreshInFlight = true;
+        this.token = token;
+        this.refreshSynchronized(token, (error, result) -> this.executor.submit(() -> this.finishRefresh(error, result, cb)));
+    }
+
+    private void finishRefresh(Throwable error, Protocol.RefreshResult result, ResultCallback<AuthResult> cb) {
+        this.refreshInFlight = false;
+        if (error == null && this.getState() == ClientState.CONNECTED) {
+            if (this.refreshTask != null) {
+                this.refreshTask.cancel(true);
+                this.refreshTask = null;
+            }
+            if (result.getExpires()) {
+                this.refreshTask = this.scheduler.schedule(Client.this::sendRefresh, result.getTtl(), TimeUnit.SECONDS);
+            }
+        }
+        this.drainAfterRefresh();
+        if (error != null) {
+            cb.onDone(error, null);
+        } else {
+            cb.onDone(null, new AuthResult(result.getUser(), result.getAuthClass(), result.getExpires(), result.getTtl()));
+        }
+    }
+
+    // Runs the calls that waited for a refresh, in order, until one starts another refresh.
+    private void drainAfterRefresh() {
+        while (!this.refreshInFlight && !this.pendingAfterRefresh.isEmpty()) {
+            Runnable next = this.pendingAfterRefresh.poll();
+            next.run();
+        }
+    }
+
     private void refreshSynchronized(String token, ResultCallback<Protocol.RefreshResult> cb) {
         Protocol.RefreshRequest req = Protocol.RefreshRequest.newBuilder()
                 .setToken(token)
@@ -1645,6 +1727,7 @@ public class Client {
                 cb.onDone(getReplyError(reply), null);
             } else {
                 Protocol.RefreshResult replyResult = reply.getRefresh();
+                this.applyAuth(replyResult.getUser(), replyResult.getAuthClass(), false);
                 cb.onDone(null, replyResult);
             }
         }).orTimeout(this.opts.getTimeout(), TimeUnit.MILLISECONDS).exceptionally(e -> {
