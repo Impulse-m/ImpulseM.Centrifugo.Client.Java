@@ -114,9 +114,21 @@ abstract class RpcTestBase extends FakeServerTestBase {
     }
 
 
+    /**
+     * Returns once the fake server has handled every command the client wrote before this call.
+     * The server handles the commands of a connection in order, so the reply to a marker command
+     * comes after them. Use it before asserting that the server did not receive a command.
+     */
+    protected void syncWithServer() throws Exception {
+        CompletableFuture<PresenceResult> marker = new CompletableFuture<>();
+        client.presence("sync", completing(marker));
+        marker.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+    }
+
+
     /** Adapts a callback to a future: an error completes it exceptionally. */
     protected static <T> ResultCallback<T> completing(CompletableFuture<T> future) {
-        return (error, result) -> {
+        return (Throwable error, T result) -> {
             if (error != null) {
                 future.completeExceptionally(error);
             } else {

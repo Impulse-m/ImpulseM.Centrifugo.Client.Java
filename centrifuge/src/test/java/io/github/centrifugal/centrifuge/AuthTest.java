@@ -73,14 +73,14 @@ public class AuthTest extends RpcTestBase {
         answerRpcs("after-refresh");
         newAuthClient(new Options());
         connect(client);
-        server.deferCommand = cmd -> cmd.hasRefresh();
+        server.deferCommand = (Protocol.Command cmd) ->cmd.hasRefresh();
 
         CompletableFuture<AuthResult> refreshFuture = refresh(client, "token-2");
         CompletableFuture<RPCResult> rpcFuture = new CompletableFuture<>();
         client.rpc("method", EMPTY_PAYLOAD, completing(rpcFuture));
 
         awaitCondition("refresh sent", () -> lastRefreshToken() != null);
-        drainExecutor();
+        syncWithServer();
         assertEquals("rpc must wait for the refresh reply", 0, sentRpcRequests().size());
         assertFalse(rpcFuture.isDone());
 
@@ -100,7 +100,7 @@ public class AuthTest extends RpcTestBase {
         options.setMaxPendingRpc(2);
         newAuthClient(options);
         connect(client);
-        server.deferCommand = cmd -> cmd.hasRefresh();
+        server.deferCommand = (Protocol.Command cmd) ->cmd.hasRefresh();
         CompletableFuture<AuthResult> refreshFuture = refresh(client, "token-2");
         awaitCondition("refresh sent", () -> lastRefreshToken() != null);
 
@@ -126,7 +126,7 @@ public class AuthTest extends RpcTestBase {
         answerRpcs("ok");
         newAuthClient(new Options());
         connect(client);
-        server.deferCommand = cmd -> cmd.hasRefresh();
+        server.deferCommand = (Protocol.Command cmd) ->cmd.hasRefresh();
         CompletableFuture<AuthResult> refreshFuture = refresh(client, "token-2");
         awaitCondition("refresh sent", () -> lastRefreshToken() != null);
         CompletableFuture<RPCResult> rpcFuture = new CompletableFuture<>();
@@ -174,7 +174,7 @@ public class AuthTest extends RpcTestBase {
         options.setToken("token-1");
         newAuthClient(options);
         connect(client);
-        server.onCommand = cmd -> {
+        server.onCommand = (Protocol.Command cmd) ->{
             if (!cmd.hasRefresh()) {
                 return null;
             }
@@ -203,7 +203,7 @@ public class AuthTest extends RpcTestBase {
         server.connectResult = expiringResult("u1", "authenticated", 1);
         newAuthClient(optionsWithTokenGetter(new CopyOnWriteArrayList<Long>()));
         connect(client);
-        server.onCommand = cmd -> {
+        server.onCommand = (Protocol.Command cmd) ->{
             if (!cmd.hasRefresh()) {
                 return null;
             }
@@ -228,7 +228,7 @@ public class AuthTest extends RpcTestBase {
         List<Long> fetchTimes = new CopyOnWriteArrayList<>();
         newAuthClient(optionsWithTokenGetter(fetchTimes));
         connect(client);
-        server.onCommand = cmd -> {
+        server.onCommand = (Protocol.Command cmd) ->{
             if (!cmd.hasRefresh()) {
                 return null;
             }
@@ -252,11 +252,11 @@ public class AuthTest extends RpcTestBase {
         server.connectResult = expiringResult("u1", "authenticated", 1);
         newAuthClient(optionsWithTokenGetter(new CopyOnWriteArrayList<Long>()));
         connect(client);
-        server.deferCommand = cmd -> cmd.hasRefresh();
+        server.deferCommand = (Protocol.Command cmd) ->cmd.hasRefresh();
         awaitCondition("timer refresh sent", () -> refreshTokens().size() == 1);
 
         CompletableFuture<AuthResult> manual = refresh(client, "token-manual");
-        drainExecutor();
+        syncWithServer();
         assertEquals("one refresh is outstanding", 1, refreshTokens().size());
 
         server.releaseDeferredCommands();
@@ -273,12 +273,12 @@ public class AuthTest extends RpcTestBase {
         server.connectResult = connectResultFor("u1", "authenticated");
         newAuthClient(new Options());
         connect(client);
-        server.deferCommand = cmd -> cmd.hasRefresh();
+        server.deferCommand = (Protocol.Command cmd) ->cmd.hasRefresh();
 
         CompletableFuture<AuthResult> first = refresh(client, "token-a");
         CompletableFuture<AuthResult> second = refresh(client, "token-b");
         awaitCondition("first refresh sent", () -> refreshTokens().size() == 1);
-        drainExecutor();
+        syncWithServer();
         assertEquals(Arrays.asList("token-a"), refreshTokens());
 
         server.releaseDeferredCommands();
@@ -323,7 +323,7 @@ public class AuthTest extends RpcTestBase {
     public void refreshRejectsNullToken() {
         newAuthClient(new Options());
 
-        client.refresh(null, (error, result) -> {
+        client.refresh(null, (Throwable error, AuthResult result) -> {
         });
     }
 
@@ -393,7 +393,7 @@ public class AuthTest extends RpcTestBase {
 
 
     private void answerRefreshes(String user, String authClass) {
-        server.onCommand = cmd -> {
+        server.onCommand = (Protocol.Command cmd) ->{
             if (!cmd.hasRefresh()) {
                 return null;
             }

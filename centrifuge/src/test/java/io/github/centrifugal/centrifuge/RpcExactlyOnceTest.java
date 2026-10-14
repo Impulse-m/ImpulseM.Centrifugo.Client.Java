@@ -288,7 +288,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
     @Test
     public void legacyServerRejectsCancelOfASentCall() throws Exception {
-        server.deferCommand = cmd -> cmd.hasRpc();
+        server.deferCommand = (Protocol.Command cmd) ->cmd.hasRpc();
         Client c = newClient();
         connect(c);
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
@@ -306,7 +306,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
     @Test
     public void legacyCallLostWithItsTransportFails() throws Exception {
-        server.deferCommand = cmd -> cmd.hasRpc();
+        server.deferCommand = (Protocol.Command cmd) ->cmd.hasRpc();
         Client c = newClient();
         connect(c);
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
@@ -485,7 +485,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     public void cancelOfAQueuedCallWhileConnectingIsLocal() throws Exception {
         enableRpcOptions();
         answerRpcs("ok");
-        server.deferCommand = cmd -> cmd.hasConnect();
+        server.deferCommand = (Protocol.Command cmd) ->cmd.hasConnect();
         Client c = newClient();
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         RpcCall call = c.rpcCall("queued", EMPTY_PAYLOAD, into(future));
@@ -507,7 +507,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     @Test
     public void msgIdInvalidIsSurfacedAndNotResent() throws Exception {
         enableRpcOptions();
-        server.onCommand = cmd -> {
+        server.onCommand = (Protocol.Command cmd) ->{
             if (!cmd.hasRpc()) {
                 return null;
             }
@@ -530,7 +530,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
     // Answers connects and rpc calls with the server time the test holds, so the test moves the clock.
     private void answerWithServerTime(AtomicLong serverTime) {
-        server.onCommand = cmd -> {
+        server.onCommand = (Protocol.Command cmd) ->{
             if (cmd.hasConnect()) {
                 return Protocol.Reply.newBuilder()
                         .setId(cmd.getId())
@@ -561,7 +561,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     // msg_id it has seen answers from the record with cached set. Calls are held while
     // holdCalls is set, and connects while holdConnect is set.
     private void serveDedup() {
-        server.onCommand = cmd -> {
+        server.onCommand = (Protocol.Command cmd) ->{
             if (cmd.hasConnect()) {
                 connectArrivals.release();
                 return null;
@@ -590,7 +590,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
                     .build();
         };
         // onCommand answers every call which is not held, so a call reaching here is held.
-        server.deferCommand = cmd -> {
+        server.deferCommand = (Protocol.Command cmd) ->{
             if (cmd.hasConnect()) {
                 return holdConnect.get();
             }
