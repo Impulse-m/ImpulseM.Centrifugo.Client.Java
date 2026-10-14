@@ -18,8 +18,8 @@ import okhttp3.WebSocket;
  * see {@link RpcSession}. Used on the client's executor thread only.
  */
 final class AuthRefresh {
-    // Server refresh errors which keep the connection and its identity: a refused transition,
-    // and a token which expired. The timer retries them with a fresh token.
+    // A refused transition keeps the connection and its identity, and is reported without a
+    // retry. A token which expired is retried by the timer with a fresh token.
     private static final int PERMISSION_DENIED = 103;
     private static final int TOKEN_EXPIRED = 109;
 
@@ -147,9 +147,9 @@ final class AuthRefresh {
         client.reportError(new RefreshError(error));
         if (error instanceof ReplyError) {
             ReplyError replyError = (ReplyError) error;
-            if (replyError.isTemporary() || replyError.getCode() == PERMISSION_DENIED || replyError.getCode() == TOKEN_EXPIRED) {
+            if (replyError.isTemporary() || replyError.getCode() == TOKEN_EXPIRED) {
                 scheduleRetry();
-            } else {
+            } else if (replyError.getCode() != PERMISSION_DENIED) {
                 client.processDisconnect(replyError.getCode(), replyError.getMessage(), false);
             }
         } else {

@@ -28,6 +28,9 @@ public class AuthTest extends RpcTestBase {
 
     private static final long ONE_SECOND_NANOS = 1_000_000_000L;
 
+    // Longer than the longest delay the refresh timer waits before a retry.
+    private static final long NO_RETRY_WINDOW_MILLIS = 21_000L;
+
 
     private final List<String> authLog = new CopyOnWriteArrayList<>();
 
@@ -219,6 +222,32 @@ public class AuthTest extends RpcTestBase {
         assertEquals(ClientState.CONNECTED, client.getState());
         assertFalse(disconnectedSignals.tryAcquire());
         assertEquals(Arrays.asList("u1/authenticated"), authLog);
+    }
+
+
+    @Test
+    public void refusedTimerRefreshIsNotRetried() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        List<Long> fetchTimes = new CopyOnWriteArrayList<>();
+        newAuthClient(optionsWithTokenGetter(fetchTimes));
+        connect(client);
+        server.onCommand = (Protocol.Command cmd) ->{
+            if (!cmd.hasRefresh()) {
+                return null;
+            }
+            return Protocol.Reply.newBuilder()
+                    .setId(cmd.getId())
+                    .setError(Protocol.Error.newBuilder().setCode(PERMISSION_DENIED).setMessage("denied"))
+                    .build();
+        };
+        awaitCondition("refused refresh sent", () -> refreshTokens().size() == 1);
+        awaitCondition("refresh error reported", () -> !errorEvents.isEmpty());
+
+        Thread.sleep(NO_RETRY_WINDOW_MILLIS);
+
+        assertEquals("the refused refresh is not sent again", 1, refreshTokens().size());
+        assertEquals("the token is not fetched again", 1, fetchTimes.size());
+        assertEquals(ClientState.CONNECTED, client.getState());
     }
 
 
