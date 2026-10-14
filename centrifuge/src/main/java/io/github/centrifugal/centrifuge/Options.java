@@ -142,7 +142,7 @@ public class Options {
 
     /**
      * Set how many rpc calls may wait for the connection at once: calls issued while it is
-     * down and calls kept for a resend. Calls beyond the bound fail with
+     * down or a refresh is in flight, and calls kept for a resend. Calls beyond the bound fail with
      * {@link ReplyError#LIMIT_EXCEEDED}. Read when the client is created. Default 32.
      *
      * @throws IllegalArgumentException when the bound is less than 1.
