@@ -19,6 +19,8 @@ import static org.junit.Assert.fail;
  */
 abstract class RpcTestBase extends FakeServerTestBase {
     protected static final long WAIT_MILLIS = 5_000L;
+    // The instance the exactly-once tests set, so that their calls are tracked.
+    protected static final String TEST_INSTANCE = "abcdefghijklmnopqrstuv";
 
 
     /** Makes the fake server confirm RPC options in its connect reply. */
@@ -53,10 +55,21 @@ abstract class RpcTestBase extends FakeServerTestBase {
     }
 
 
-    /** Creates the client for the fake server with the default options, whose connect and disconnect are signalled. */
+    /**
+     * Creates the client for the fake server with the instance set, whose connect and disconnect are
+     * signalled. Its calls are tracked once the server confirms RPC options.
+     */
     @Override
     protected Client newClient() {
-        return newClient(new Options());
+        return newClient(instanceOptions());
+    }
+
+
+    /** Options with the test instance set. */
+    protected static Options instanceOptions() {
+        Options options = new Options();
+        options.setInstance(TEST_INSTANCE);
+        return options;
     }
 
 

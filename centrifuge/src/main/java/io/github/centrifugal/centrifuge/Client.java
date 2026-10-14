@@ -103,6 +103,10 @@ public class Client {
         return this.rpcOptionsSupported;
     }
 
+    boolean hasInstance() {
+        return !this.opts.getInstance().isEmpty();
+    }
+
     boolean isRefreshing() {
         return this.auth.isInFlight();
     }
@@ -1411,8 +1415,9 @@ public class Client {
     /**
      * Send RPC with method and per-call options to server and get the call back, to cancel it
      * with {@link RpcCall#cancel()}. Same as {@link #rpc(String, byte[], RpcOptions, ResultCallback)}.
-     * With a server which confirmed RPC options, a call which is not answered is kept across a
-     * reconnect and sent again with the same msg_id, so the server runs it once.
+     * With a server which confirms RPC options and an instance set with {@link Options#setInstance},
+     * a call which is not answered is kept across a reconnect and sent again with the same msg_id,
+     * so the server runs it once. Otherwise the call is plain and a call lost with its transport fails.
      *
      * @param method:  of RPC call.
      * @param data:    a custom payload for RPC call.

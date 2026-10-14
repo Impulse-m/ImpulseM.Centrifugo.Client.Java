@@ -122,7 +122,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
     @Test
     public void callsBeyondTheQueueBoundFailWithLimitExceeded() throws Exception {
-        Options options = new Options();
+        Options options = instanceOptions();
         options.setMaxPendingRpc(2);
         Client c = newClient(options);
         answerRpcs("ok");
@@ -420,6 +420,80 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void capabilityWithoutInstanceSendsPlainCalls() throws Exception {
+        enableRpcOptions();
+        answerRpcs("ok");
+        Client c = newClient(new Options());
+        connect(c);
+
+        callAndWait(c);
+        callAndWait(c);
+
+        List<Protocol.RPCRequest> requests = sentRpcRequests();
+        assertEquals(2, requests.size());
+        for (Protocol.RPCRequest request : requests) {
+            assertEquals("no msg_id", 0, request.getMsgId());
+            assertEquals("no ack", 0, request.getAckCount());
+            assertFalse(request.getRetransmit());
+        }
+    }
+
+
+    @Test
+    public void capabilityWithoutInstanceStillSendsHeaders() throws Exception {
+        enableRpcOptions();
+        answerRpcs("ok");
+        Client c = newClient(new Options());
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+
+        c.rpcCall("m", EMPTY_PAYLOAD, headerOptions(), into(future));
+
+        future.get(5, TimeUnit.SECONDS);
+        assertEquals("test", sentRpcRequests().get(0).getHeadersMap().get("x-request-source"));
+    }
+
+
+    @Test
+    public void lostCallWithoutInstanceFailsWithItsTransport() throws Exception {
+        enableRpcOptions();
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();
+        Client c = newClient(new Options());
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("m", EMPTY_PAYLOAD, into(future));
+        awaitRequestCount(1);
+
+        server.closeConnection();
+
+        assertTrue("transport closed", errorOf(future) instanceof IOException);
+        assertEquals("the call is not sent again", 1, sentRpcRequests().size());
+    }
+
+
+    @Test
+    public void cancelWithoutInstanceIsRejectedAndSendsNothing() throws Exception {
+        enableRpcOptions();
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();
+        Client c = newClient(new Options());
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        RpcCall call = c.rpcCall("m", EMPTY_PAYLOAD, into(future));
+        awaitRequestCount(1);
+
+        call.cancel();
+
+        ReplyError error = replyErrorOf(future);
+        assertEquals(ReplyError.UNSUPPORTED, error.getCode());
+        assertEquals("rpc cancel needs the instance option", error.getMessage());
+        syncWithServer();
+        for (Protocol.RPCRequest request : sentRpcRequests()) {
+            assertEquals("no cancel is sent", 0, request.getCancel());
+        }
+    }
+
+
+    @Test
     public void msgIdsStrictlyIncreaseAndFitFiftyThreeBits() throws Exception {
         enableRpcOptions();
         answerRpcs("ok");
@@ -458,7 +532,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
     @Test
     public void unsetInstanceIsNotSentOnConnect() throws Exception {
-        Client c = newClient();
+        Client c = newClient(new Options());
         connect(c);
 
         assertEquals("", lastConnectRequest().getInstance());
@@ -487,7 +561,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     public void lostCallsBeyondTheBoundAreKeptAndResent() throws Exception {
         enableRpcOptions();
         serveDedup();
-        Options options = new Options();
+        Options options = instanceOptions();
         options.setMaxPendingRpc(2);
         Client c = newClient(options);
         connect(c);
@@ -514,7 +588,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     public void newCallsAreRefusedWhileLostCallsAreOverTheBound() throws Exception {
         enableRpcOptions();
         serveDedup();
-        Options options = new Options();
+        Options options = instanceOptions();
         options.setMaxPendingRpc(2);
         Client c = newClient(options);
         connect(c);
@@ -543,7 +617,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     public void cancelledLostCallsDoNotUseTheQueueBound() throws Exception {
         enableRpcOptions();
         serveDedup();
-        Options options = new Options();
+        Options options = instanceOptions();
         options.setMaxPendingRpc(2);
         Client c = newClient(options);
         connect(c);

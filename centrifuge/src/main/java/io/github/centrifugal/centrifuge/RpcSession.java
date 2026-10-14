@@ -86,6 +86,12 @@ final class RpcSession {
             call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel is not supported by the server", false));
             return;
         }
+        if (client.getState() == ClientState.CONNECTED && !client.hasInstance()) {
+            // Without an instance the calls are plain: the server has no record of them to cancel.
+            queue.remove(call);
+            call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel needs the instance option", false));
+            return;
+        }
         if (!call.everSent) {
             queue.remove(call);
             call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
@@ -207,16 +213,18 @@ final class RpcSession {
 
 
     // Writes the call on the current transport. A call with headers on a connection without RPC
-    // options fails with the reply error the server would give. A call which was not sent takes a
-    // new msg_id on each attempt, since nothing reached the server. A call which was sent keeps
-    // its msg_id, and is marked as a resend.
+    // options fails with the reply error the server would give. A call is tracked when the connection
+    // confirms RPC options and the client has an instance: only a tracked call carries a msg_id. A call
+    // which was not sent takes a new msg_id on each attempt, since nothing reached the server. A call
+    // which was sent keeps its msg_id, and is marked as a resend.
     private void write(RpcCall call) {
         boolean supported = client.hasRpcOptions();
         if (!supported && !call.headers.isEmpty()) {
             call.future.complete(Extensions.unsupportedRpcReply(0));
             return;
         }
-        if (supported && !call.everSent) {
+        boolean tracked = supported && client.hasInstance();
+        if (tracked && !call.everSent) {
             try {
                 call.msgId = msgIds.next(client.serverTimeMillis());
             } catch (IllegalStateException e) {
@@ -226,10 +234,10 @@ final class RpcSession {
         }
         int id = client.nextCommandId();
         call.commandId = id;
-        List<Long> acks = supported ? takeAcks() : Collections.<Long>emptyList();
+        List<Long> acks = tracked ? takeAcks() : Collections.<Long>emptyList();
         Protocol.Command cmd = Protocol.Command.newBuilder()
                 .setId(id)
-                .setRpc(buildRpcRequest(call, supported, acks))
+                .setRpc(buildRpcRequest(call, tracked, acks))
                 .build();
         // Each attempt has a future of its own, which the transport settles. A refusal which is sent
         // again settles the attempt only, not the call.
@@ -240,13 +248,13 @@ final class RpcSession {
         if (client.sendCommand(cmd)) {
             call.everSent = true;
             call.resendAsNew = false;
-            call.wireTracked = supported;
+            call.wireTracked = tracked;
             return;
         }
         client.removeFuture(id);
         onWire.remove(id);
         pendingAcks.addAll(0, acks);
-        if (!supported) {
+        if (!tracked) {
             call.future.completeExceptionally(new IOException());
         } else if (!call.everSent && queue.isFull()) {
             call.future.completeExceptionally(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls wait for the connection", false));
@@ -256,12 +264,12 @@ final class RpcSession {
     }
 
 
-    private static Protocol.RPCRequest buildRpcRequest(RpcCall call, boolean supported, List<Long> acks) {
+    private static Protocol.RPCRequest buildRpcRequest(RpcCall call, boolean tracked, List<Long> acks) {
         Protocol.RPCRequest.Builder req = Protocol.RPCRequest.newBuilder()
                 .setData(com.google.protobuf.ByteString.copyFrom(call.data))
                 .setMethod(call.method)
                 .putAllHeaders(call.headers);
-        if (supported) {
+        if (tracked) {
             req.setMsgId(call.msgId)
                     .setRetransmit(call.everSent && !call.resendAsNew)
                     .addAllAck(acks);
