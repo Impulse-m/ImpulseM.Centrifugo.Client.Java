@@ -4,10 +4,8 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Deque;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -26,7 +24,6 @@ import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
 import java8.util.concurrent.CompletableFuture;
-import java8.util.concurrent.CompletionException;
 import okhttp3.Credentials;
 import okhttp3.Headers;
 import okhttp3.OkHttpClient;
@@ -52,13 +49,9 @@ public class Client {
     private final Map<Integer, CompletableFuture<Protocol.Reply>> futures = new ConcurrentHashMap<>();
     private final Map<Integer, Protocol.Command> connectCommands = new ConcurrentHashMap<>();
     private final Map<Integer, Protocol.Command> connectAsyncCommands = new ConcurrentHashMap<>();
-    // rpc calls waiting for the connection: not sent yet, or lost with their transport.
-    private final RpcQueue rpcQueue;
-    // rpc calls written to the current transport, by the id of their command.
-    private final Map<Integer, RpcCall> rpcsOnWire = new ConcurrentHashMap<>();
-    // msg_ids of the replies received, sent as the ack of the next rpc call.
-    private final List<Long> pendingAcks = new ArrayList<>();
-    private long lastMsgId = 0;
+    // The exactly-once rpc calls, and the refreshes of the connection token.
+    private final RpcSession rpcSession;
+    private final AuthRefresh auth;
 
     private volatile ClientState state = ClientState.DISCONNECTED;
     private final Map<String, Subscription> subs = new ConcurrentHashMap<>();
@@ -76,7 +69,6 @@ public class Client {
     private int pingInterval;
     private boolean sendPong;
     private ScheduledFuture<?> pingTask;
-    private ScheduledFuture<?> refreshTask;
     private ScheduledFuture<?> reconnectTask;
     private int reconnectAttempts = 0;
     private boolean refreshRequired = false;
@@ -87,10 +79,6 @@ public class Client {
     // Identity the server last reported for the connection, see applyAuth.
     private volatile String currentUser = "";
     private volatile String currentAuthClass = "";
-    // Set while a refresh() call waits for its reply; rpc calls and further refresh calls
-    // queue in pendingAfterRefresh until it completes. Only touched on the executor thread.
-    private boolean refreshInFlight = false;
-    private final Deque<Runnable> pendingAfterRefresh = new ArrayDeque<>();
 
     Options getOpts() {
         return opts;
@@ -102,6 +90,49 @@ public class Client {
 
     ScheduledExecutorService getScheduler() {
         return scheduler;
+    }
+
+    // The helpers below serve RpcSession and AuthRefresh, which run on the executor thread.
+
+    WebSocket transport() {
+        return this.ws;
+    }
+
+    int nextCommandId() {
+        return this.getNextId();
+    }
+
+    boolean hasRpcOptions() {
+        return this.rpcOptionsSupported;
+    }
+
+    boolean isRefreshing() {
+        return this.auth.isInFlight();
+    }
+
+    void flushRpc() {
+        this.rpcSession.flush();
+    }
+
+    void storeToken(String token) {
+        this.token = token;
+    }
+
+    void reportError(Throwable cause) {
+        this.listener.onError(this, new ErrorEvent(cause));
+    }
+
+    void addFuture(int id, CompletableFuture<Protocol.Reply> future) {
+        this.futures.put(id, future);
+    }
+
+    void removeFuture(int id) {
+        this.futures.remove(id);
+    }
+
+    // Sends the command on the current transport. Returns whether the transport took it.
+    boolean sendCommand(Protocol.Command cmd) {
+        return this.ws.send(ByteString.of(this.serializeCommand(cmd)));
     }
 
     private static final int NORMAL_CLOSURE_STATUS = 1000;
@@ -162,7 +193,8 @@ public class Client {
         this.opts = opts;
         this.listener = listener;
         this.backoff = new Backoff();
-        this.rpcQueue = new RpcQueue(opts.getMaxPendingRpc());
+        this.rpcSession = new RpcSession(this, opts.getMaxPendingRpc());
+        this.auth = new AuthRefresh(this);
         this.token = opts.getToken();
         if (opts.getData() != null) {
             this.data = com.google.protobuf.ByteString.copyFrom(opts.getData());
@@ -309,10 +341,7 @@ public class Client {
             this.pingTask.cancel(true);
             this.pingTask = null;
         }
-        if (this.refreshTask != null) {
-            this.refreshTask.cancel(true);
-            this.refreshTask = null;
-        }
+        this.auth.cancelTimer();
         if (this.reconnectTask != null) {
             this.reconnectTask.cancel(true);
             this.reconnectTask = null;
@@ -345,27 +374,9 @@ public class Client {
         }
 
         // rpc calls with a msg_id are kept for a resend when the client reconnects; the rest fail.
-        boolean keepRpcs = Boolean.TRUE.equals(shouldReconnect);
-        List<RpcCall> lostRpcs = new ArrayList<>();
-        for (Map.Entry<Integer, CompletableFuture<Protocol.Reply>> entry : this.futures.entrySet()) {
-            RpcCall call = this.rpcsOnWire.get(entry.getKey());
-            if (keepRpcs && call != null && call.wireTracked) {
-                lostRpcs.add(call);
-                continue;
-            }
-            CompletableFuture<Protocol.Reply> f = entry.getValue();
+        this.rpcSession.onTransportLost(Boolean.TRUE.equals(shouldReconnect));
+        for (CompletableFuture<Protocol.Reply> f : this.futures.values()) {
             f.completeExceptionally(new IOException());
-        }
-        this.rpcsOnWire.clear();
-        for (RpcCall call : lostRpcs) {
-            if (!this.rpcQueue.offer(call)) {
-                call.future.completeExceptionally(new IOException());
-            }
-        }
-        if (!keepRpcs) {
-            for (RpcCall call : this.rpcQueue.drain()) {
-                call.future.completeExceptionally(new IOException());
-            }
         }
         // Drop the pending command registry along with the futures: no reply can
         // arrive for a connection that is gone, and command IDs are never reused.
@@ -999,7 +1010,7 @@ public class Client {
         }
 
         this.connectCommands.clear();
-        this.flushRpcQueue();
+        this.flushRpc();
 
         for (Map.Entry<Integer, Protocol.Command> entry : this.connectAsyncCommands.entrySet()) {
             Protocol.Command cmd = entry.getValue();
@@ -1019,83 +1030,7 @@ public class Client {
 
         this.pingTask = this.scheduler.schedule(Client.this::waitServerPing, this.pingInterval + this.opts.getMaxServerPingDelay(), TimeUnit.MILLISECONDS);
 
-        if (result.getExpires()) {
-            int ttl = result.getTtl();
-            this.refreshTask = this.scheduler.schedule(Client.this::sendRefresh, ttl, TimeUnit.SECONDS);
-        }
-    }
-
-    private void sendRefresh() {
-        if (this.opts.getTokenGetter() == null) {
-            return;
-        }
-        this.executor.submit(() -> {
-            final WebSocket refreshWs = Client.this.ws;
-            Client.this.opts.getTokenGetter().getConnectionToken(new ConnectionTokenEvent(), (err, token) -> Client.this.executor.submit(() -> {
-            // If the connection has been replaced since this refresh was
-            // issued, the callback (and any token it carries) is stale.
-            if (Client.this.ws != refreshWs) {
-                return;
-            }
-            if (Client.this.getState() != ClientState.CONNECTED) {
-                return;
-            }
-            if (err != null) {
-                if (err instanceof UnauthorizedException) {
-                    Client.this.failUnauthorized();
-                    return;
-                }
-                Client.this.listener.onError(Client.this, new ErrorEvent(new TokenError(err)));
-                Client.this.refreshTask = Client.this.scheduler.schedule(
-                        Client.this::sendRefresh,
-                        Client.this.backoff.duration(0, 10000, 20000),
-                        TimeUnit.MILLISECONDS
-                );
-                return;
-            }
-            if (token == null || token.equals("")) {
-                this.failUnauthorized();
-                return;
-            }
-            Client.this.token = token;
-            refreshSynchronized(token, (error, result) -> {
-                if (Client.this.ws != refreshWs) {
-                    return;
-                }
-                if (Client.this.getState() != ClientState.CONNECTED) {
-                    return;
-                }
-                if (error != null) {
-                    Client.this.listener.onError(Client.this, new ErrorEvent(new RefreshError(error)));
-                    if (error instanceof ReplyError) {
-                        ReplyError e;
-                        e = (ReplyError) error;
-                        if (e.isTemporary()) {
-                            Client.this.refreshTask = Client.this.scheduler.schedule(
-                                    Client.this::sendRefresh,
-                                    Client.this.backoff.duration(0, 10000, 20000),
-                                    TimeUnit.MILLISECONDS
-                            );
-                        } else {
-                            Client.this.processDisconnect(e.getCode(), e.getMessage(), false);
-                        }
-                        return;
-                    } else {
-                        Client.this.refreshTask = Client.this.scheduler.schedule(
-                                Client.this::sendRefresh,
-                                Client.this.backoff.duration(0, 10000, 20000),
-                                TimeUnit.MILLISECONDS
-                        );
-                    }
-                    return;
-                }
-                if (result.getExpires()) {
-                    int ttl = result.getTtl();
-                    Client.this.refreshTask = Client.this.scheduler.schedule(Client.this::sendRefresh, ttl, TimeUnit.SECONDS);
-                }
-            });
-        }));
-        });
+        this.auth.scheduleExpiry(result.getExpires(), result.getTtl());
     }
 
     private void sendConnect() {
@@ -1156,7 +1091,7 @@ public class Client {
         this.ws.send(ByteString.of(this.serializeCommand(cmd)));
     }
 
-    private void failUnauthorized() {
+    void failUnauthorized() {
         this.processDisconnect(DISCONNECTED_UNAUTHORIZED, "unauthorized", false);
     }
 
@@ -1395,8 +1330,7 @@ public class Client {
         if (this.getState() != ClientState.CONNECTED) {
             this.connectCommands.put(cmd.getId(), cmd);
         } else {
-            boolean sent = this.ws.send(ByteString.of(this.serializeCommand(cmd)));
-            if (!sent) {
+            if (!this.sendCommand(cmd)) {
                 f.completeExceptionally(new IOException());
             }
         }
@@ -1479,173 +1413,12 @@ public class Client {
         Map<String, String> headers = options != null ? options.getHeaders() : Collections.<String, String>emptyMap();
         long timeout = options != null && options.getTimeout() > 0 ? options.getTimeout() : this.opts.getTimeout();
         RpcCall call = new RpcCall(this, method, data, headers, timeout, cb);
-        this.executor.submit(() -> Client.this.rpcSynchronized(call));
+        this.rpcSession.submit(call);
         return call;
     }
 
-    private void rpcSynchronized(RpcCall call) {
-        if (this.refreshInFlight) {
-            this.pendingAfterRefresh.add(() -> Client.this.rpcSynchronized(call));
-            return;
-        }
-        // The deadline starts here and holds across resends. The callback runs on the
-        // executor, also when the call was cancelled before it started.
-        call.future.orTimeout(call.timeout, TimeUnit.MILLISECONDS)
-                .whenComplete((reply, error) -> this.executor.submit(() -> this.finishRpc(call, reply, error)));
-        if (call.future.isDone()) {
-            return;
-        }
-        call.msgId = this.nextMsgId();
-        this.enqueueRpc(call);
-    }
-
-    private void enqueueRpc(RpcCall call) {
-        if (this.getState() == ClientState.CONNECTED) {
-            this.writeRpc(call, false);
-        } else if (!this.rpcQueue.offer(call)) {
-            call.future.completeExceptionally(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls wait for the connection", false));
-        }
-    }
-
-    // Writes the call on the current transport. A call with headers on a connection without
-    // RPC options fails here with the reply error a server would give, and nothing is written.
-    // A call with a msg_id which did not reach the server waits for the next connection.
-    private void writeRpc(RpcCall call, boolean retransmit) {
-        if (!this.rpcOptionsSupported && !call.headers.isEmpty()) {
-            call.future.complete(Extensions.unsupportedRpcReply(call.commandId));
-            return;
-        }
-        int id = this.getNextId();
-        call.commandId = id;
-        boolean tracked = this.rpcOptionsSupported;
-        Protocol.Command cmd = Protocol.Command.newBuilder()
-                .setId(id)
-                .setRpc(this.buildRpcRequest(call, retransmit))
-                .build();
-        this.futures.put(id, call.future);
-        this.rpcsOnWire.put(id, call);
-        boolean sent = this.ws.send(ByteString.of(this.serializeCommand(cmd)));
-        if (sent) {
-            call.everSent = true;
-            call.wireTracked = tracked;
-            return;
-        }
-        this.futures.remove(id);
-        this.rpcsOnWire.remove(id);
-        if (!tracked || !this.rpcQueue.offer(call)) {
-            call.future.completeExceptionally(new IOException());
-        }
-    }
-
-    private Protocol.RPCRequest buildRpcRequest(RpcCall call, boolean retransmit) {
-        Protocol.RPCRequest.Builder req = Protocol.RPCRequest.newBuilder()
-                .setData(com.google.protobuf.ByteString.copyFrom(call.data))
-                .setMethod(call.method)
-                .putAllHeaders(call.headers);
-        if (this.rpcOptionsSupported) {
-            req.setMsgId(call.msgId)
-                    .setRetransmit(retransmit)
-                    .addAllAck(this.pendingAcks);
-            this.pendingAcks.clear();
-        }
-        return req.build();
-    }
-
-    // Sends the rpc calls that waited for the connection, once its connect reply is in. Calls
-    // lost with an earlier transport are sent again in msg_id order, with retransmit set, and
-    // keep their deadline. Without RPC options on this connection they fail instead.
-    private void flushRpcQueue() {
-        for (RpcCall call : this.rpcQueue.drain()) {
-            if (call.cancelPending) {
-                if (this.rpcOptionsSupported) {
-                    this.writeCancel(call.msgId);
-                }
-                continue;
-            }
-            if (call.future.isDone()) {
-                continue;
-            }
-            if (call.everSent && !this.rpcOptionsSupported) {
-                call.future.completeExceptionally(new IOException());
-                continue;
-            }
-            this.writeRpc(call, call.everSent);
-        }
-    }
-
-    // Sends a cancel for a msg_id: an RPCRequest without method and data. Its reply is not awaited.
-    private void writeCancel(long msgId) {
-        Protocol.RPCRequest req = Protocol.RPCRequest.newBuilder()
-                .setCancel(msgId)
-                .addAllAck(this.pendingAcks)
-                .build();
-        this.pendingAcks.clear();
-        Protocol.Command cmd = Protocol.Command.newBuilder()
-                .setId(this.getNextId())
-                .setRpc(req)
-                .build();
-        this.ws.send(ByteString.of(this.serializeCommand(cmd)));
-    }
-
     void cancelRpc(RpcCall call) {
-        this.executor.submit(() -> Client.this.cancelRpcSynchronized(call));
-    }
-
-    private void cancelRpcSynchronized(RpcCall call) {
-        if (call.future.isDone()) {
-            return;
-        }
-        if (this.getState() == ClientState.CONNECTED && !this.rpcOptionsSupported) {
-            call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel is not supported by the server", false));
-            return;
-        }
-        if (!call.everSent) {
-            this.rpcQueue.remove(call);
-            call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
-            return;
-        }
-        if (this.getState() == ClientState.CONNECTED) {
-            this.writeCancel(call.msgId);
-        } else {
-            // The call was lost with its transport and waits in the queue: the cancel goes out
-            // with the next connection, or is dropped when that one has no RPC options.
-            call.cancelPending = true;
-            this.rpcQueue.keep(call);
-        }
-        call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
-    }
-
-    private void finishRpc(RpcCall call, Protocol.Reply reply, Throwable error) {
-        if (call.commandId != 0) {
-            this.futures.remove(call.commandId);
-            this.rpcsOnWire.remove(call.commandId);
-        }
-        if (!call.cancelPending) {
-            this.rpcQueue.remove(call);
-        }
-        if (reply == null) {
-            Throwable cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
-            call.callback.onDone(cause, null);
-            return;
-        }
-        if (call.wireTracked) {
-            this.pendingAcks.add(call.msgId);
-        }
-        if (reply.getError().getCode() != 0) {
-            call.callback.onDone(getReplyError(reply), null);
-            return;
-        }
-        Protocol.RPCResult rpcResult = reply.getRpc();
-        RPCResult result = new RPCResult();
-        result.setData(rpcResult.getData().toByteArray());
-        result.setCached(rpcResult.getCached());
-        call.callback.onDone(null, result);
-    }
-
-    // msg_id of the next rpc call, see Extensions.nextMsgId. Used on the executor thread only.
-    private long nextMsgId() {
-        this.lastMsgId = Extensions.nextMsgId(this.serverTimeMillis(), this.lastMsgId);
-        return this.lastMsgId;
+        this.executor.submit(() -> Client.this.rpcSession.cancel(call));
     }
 
     /**
@@ -1844,47 +1617,11 @@ public class Client {
         if (token == null) {
             throw new NullPointerException("token must not be null");
         }
-        this.executor.submit(() -> Client.this.refreshRequestSynchronized(token, cb));
+        this.executor.submit(() -> Client.this.auth.refreshWith(token, cb));
     }
 
-    private void refreshRequestSynchronized(String token, ResultCallback<AuthResult> cb) {
-        if (this.refreshInFlight) {
-            this.pendingAfterRefresh.add(() -> Client.this.refreshRequestSynchronized(token, cb));
-            return;
-        }
-        this.refreshInFlight = true;
-        this.token = token;
-        this.refreshSynchronized(token, (error, result) -> this.executor.submit(() -> this.finishRefresh(error, result, cb)));
-    }
-
-    private void finishRefresh(Throwable error, Protocol.RefreshResult result, ResultCallback<AuthResult> cb) {
-        this.refreshInFlight = false;
-        if (error == null && this.getState() == ClientState.CONNECTED) {
-            if (this.refreshTask != null) {
-                this.refreshTask.cancel(true);
-                this.refreshTask = null;
-            }
-            if (result.getExpires()) {
-                this.refreshTask = this.scheduler.schedule(Client.this::sendRefresh, result.getTtl(), TimeUnit.SECONDS);
-            }
-        }
-        this.drainAfterRefresh();
-        if (error != null) {
-            cb.onDone(error, null);
-        } else {
-            cb.onDone(null, new AuthResult(result.getUser(), result.getAuthClass(), result.getExpires(), result.getTtl()));
-        }
-    }
-
-    // Runs the calls that waited for a refresh, in order, until one starts another refresh.
-    private void drainAfterRefresh() {
-        while (!this.refreshInFlight && !this.pendingAfterRefresh.isEmpty()) {
-            Runnable next = this.pendingAfterRefresh.poll();
-            next.run();
-        }
-    }
-
-    private void refreshSynchronized(String token, ResultCallback<Protocol.RefreshResult> cb) {
+    // Sends a refresh command with the token. The callback gets the reply, or the error.
+    void sendRefreshCommand(String token, ResultCallback<Protocol.RefreshResult> cb) {
         Protocol.RefreshRequest req = Protocol.RefreshRequest.newBuilder()
                 .setToken(token)
                 .build();

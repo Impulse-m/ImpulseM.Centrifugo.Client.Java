@@ -28,8 +28,6 @@ public final class RpcCall {
     boolean everSent;
     // The last write carried msg_id, so the server knows the call and may answer a resend.
     boolean wireTracked;
-    // The call is locally done, and a cancel for it waits for the next connection.
-    boolean cancelPending;
 
 
     RpcCall(
@@ -50,10 +48,10 @@ public final class RpcCall {
 
 
     /**
-     * Cancels the call. A call which was not sent is not sent. A call which was sent is
-     * cancelled on the server over the current connection, or over the next one when the
-     * connection is down. The call is rejected with {@link ReplyError#CANCELLED}. On a
-     * connection whose server does not support RPC options the call is rejected with
+     * Cancels the call and rejects it with {@link ReplyError#CANCELLED}. A call which was not
+     * sent yet is never sent. A call which was sent is cancelled on the server over the current
+     * connection, or over the next one when the connection is down. On a connection whose
+     * server does not support RPC options, cancelling a call which was sent rejects it with
      * {@link ReplyError#UNSUPPORTED} and nothing is sent. Has no effect once the call is done.
      */
     public void cancel() {

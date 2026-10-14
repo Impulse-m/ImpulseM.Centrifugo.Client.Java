@@ -35,17 +35,6 @@ public class RpcQueueTest {
 
 
     @Test
-    public void keepAddsWithoutTheBound() {
-        RpcQueue queue = new RpcQueue(1);
-        queue.offer(call(1L));
-
-        queue.keep(call(2L));
-
-        assertEquals(2, queue.drain().size());
-    }
-
-
-    @Test
     public void drainReturnsTheCallsInMsgIdOrderAndEmptiesTheQueue() {
         RpcQueue queue = new RpcQueue(10);
         RpcCall third = call(30L);

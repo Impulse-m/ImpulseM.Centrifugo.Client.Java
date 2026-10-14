@@ -1,18 +1,21 @@
 package io.github.centrifugal.centrifuge;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.TreeMap;
+import java.util.Set;
 
 
 /**
- * The rpc calls that wait for the connection: calls issued while it is down, calls lost
- * with their transport, and cancels still to send. Ordered by msg_id and bounded by the
- * capacity. Used on the client's executor thread only.
+ * The rpc calls that wait for the connection: calls issued while it is down or a refresh is in
+ * flight, and calls lost with their transport. Bounded by the capacity. Used on the client's
+ * executor thread only.
  */
 final class RpcQueue {
     private final int capacity;
-    private final TreeMap<Long, RpcCall> calls = new TreeMap<>();
+    // Identity semantics: two calls are the same only when they are the same object.
+    private final Set<RpcCall> calls = new LinkedHashSet<>();
 
 
     RpcQueue(int capacity) {
@@ -25,26 +28,31 @@ final class RpcQueue {
         if (calls.size() >= capacity) {
             return false;
         }
-        calls.put(call.msgId, call);
+        calls.add(call);
         return true;
     }
 
 
-    /** Adds a call that is already counted by the queue, without the bound. */
-    void keep(RpcCall call) {
-        calls.put(call.msgId, call);
-    }
-
-
     void remove(RpcCall call) {
-        calls.remove(call.msgId, call);
+        calls.remove(call);
     }
 
 
-    /** Removes every call and returns them in msg_id order. */
+    /**
+     * Removes every call and returns them in resend order: the calls with a msg_id first, in
+     * msg_id order, then the calls which were never sent, in the order they were added.
+     */
     List<RpcCall> drain() {
-        List<RpcCall> drained = new ArrayList<>(calls.values());
+        List<RpcCall> drained = new ArrayList<>(calls);
         calls.clear();
+        Collections.sort(drained, (RpcCall first, RpcCall second) -> Long.compare(resendKey(first), resendKey(second)));
         return drained;
+    }
+
+
+    // A call without a msg_id sorts after every call with one. Collections.sort is stable, so
+    // calls with equal keys keep the order they were added in.
+    private static long resendKey(RpcCall call) {
+        return call.msgId != 0 ? call.msgId : Long.MAX_VALUE;
     }
 }
