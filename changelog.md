@@ -1,3 +1,15 @@
+Unreleased
+==========
+
+* Connection identity: `onAuth` reports the user and auth class of the connection on every connect, and when a refresh changes them.
+* `Client.refresh(token, callback)` refreshes the connection token on demand. An error is reported unchanged, and keeps the connection and its identity. At most 32 refreshes are in progress, a refresh beyond that fails with `LIMIT_EXCEEDED`.
+* `Options.setInstance` sets the connection instance, a secret the application supplies. With it, rpc calls on a server which confirms RPC options are exactly-once: each call carries a `msg_id`, is kept across a reconnect and sent again with the retransmit flag. Without an instance calls are plain, as before.
+* `Client.rpcCall` returns an `RpcCall`, which `cancel()` cancels on the server when the connection carries the cancel. `RPCResult.isCached()` tells whether the server answered from its record.
+* `Options.setMaxPendingRpc` (32 by default) bounds the unsettled calls of a client with an instance. A call beyond it fails at once with `LIMIT_EXCEEDED`.
+* Error codes 16 (`LIMIT_EXCEEDED`) and 17 (`CANCELLED`) join 15 (`UNSUPPORTED`). They are client-local, a server never sends them.
+* A refused rpc call is sent again when the server sets the `x-centrifugo-retry` metadata key: `new_msg_id` after a re-sync of the clock, with a new `msg_id`, at most twice; `later` after 250 ms, 500 ms and 1 s, with the same `msg_id`, at most three times. The call's deadline bounds the attempts.
+* Deviation from upstream: a timer refresh refused with 103 keeps the connection and its identity, and is not retried. A timer refresh refused with 109 is retried with a fresh token, instead of disconnecting. Other codes behave as upstream.
+
 0.3.1
 =====
 
