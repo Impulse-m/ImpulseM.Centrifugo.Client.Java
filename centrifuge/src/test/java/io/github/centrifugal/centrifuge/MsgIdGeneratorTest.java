@@ -90,11 +90,24 @@ public class MsgIdGeneratorTest {
 
 
     @Test
-    public void twoGeneratorsInTheSameSecondGiveDifferentFirstIds() {
+    public void twoScriptedGeneratorsInTheSameSecondGiveDifferentFirstIds() {
         MsgIdGenerator first = new MsgIdGenerator(lanes(7));
         MsgIdGenerator second = new MsgIdGenerator(lanes(9));
 
         assertNotEquals(first.next(SERVER_MILLIS), second.next(SERVER_MILLIS));
+    }
+
+
+    // The default lane source is random: the check runs with it, not with scripted lanes, so a constant
+    // default lane fails here. A collision is rare: each pair has a chance below 2^-19.
+    @Test
+    public void twoDefaultGeneratorsInTheSameSecondGiveDifferentFirstIds() {
+        for (int i = 0; i < 20; i++) {
+            MsgIdGenerator first = new MsgIdGenerator();
+            MsgIdGenerator second = new MsgIdGenerator();
+
+            assertNotEquals("run " + i, first.next(SERVER_MILLIS), second.next(SERVER_MILLIS));
+        }
     }
 
 
