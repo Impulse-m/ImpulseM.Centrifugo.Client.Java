@@ -508,6 +508,73 @@ public class AuthTest extends RpcTestBase {
 
 
     @Test
+    public void tokenOfAnAcceptedConnectSurvivesADroppedRefresh() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        Options options = new Options();
+        options.setToken("token-1");
+        newAuthClient(options);
+        connect(client);
+        client.disconnect();
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+        CompletableFuture<AuthResult> refreshed = refresh(client, "token-2");
+
+        connect(client);
+        awaitCondition("refresh sent after the connect", () -> refreshTokens().size() == 1);
+        server.closeConnection();
+
+        assertTrue("the dropped refresh fails", errorOf(refreshed) instanceof IOException);
+        awaitCondition("reconnected", () -> connectedEvents.size() >= 3);
+        assertEquals("the connect accepted token-2, so the next connect carries it", "token-2", lastConnectRequest().getToken());
+    }
+
+
+    @Test
+    public void droppedRefreshKeepsTheQueuedTokenOfAnotherRefresh() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        Options options = new Options();
+        options.setToken("token-1");
+        newAuthClient(options);
+        connect(client);
+        client.disconnect();
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+        CompletableFuture<AuthResult> first = refresh(client, "token-2");
+        CompletableFuture<AuthResult> second = refresh(client, "token-3");
+
+        connect(client);
+        awaitCondition("first refresh sent", () -> refreshTokens().size() == 1);
+        server.closeConnection();
+
+        assertTrue("the first refresh fails with the dropped transport", errorOf(first) instanceof IOException);
+        awaitCondition("reconnected", () -> connectedEvents.size() >= 3);
+        assertEquals("the queued refresh keeps its token for the next connect", "token-3", lastConnectRequest().getToken());
+    }
+
+
+    @Test
+    public void refusedRefreshAfterAnAcceptedConnectKeepsTheConnectedToken() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        Options options = new Options();
+        options.setToken("token-1");
+        newAuthClient(options);
+        connect(client);
+        client.disconnect();
+        answerRefreshes("u1", "authenticated");
+        CompletableFuture<AuthResult> first = refresh(client, "token-2");
+        connect(client);
+        first.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        refuseRefreshes();
+
+        ReplyError error = (ReplyError) errorOf(refresh(client, "token-3"));
+
+        assertEquals(PERMISSION_DENIED, error.getCode());
+        server.onCommand = null;
+        server.closeConnection();
+        awaitCondition("reconnected", () -> connectedEvents.size() >= 3);
+        assertEquals("the connection runs on token-2, so the next connect carries it", "token-2", lastConnectRequest().getToken());
+    }
+
+
+    @Test
     public void manualRefreshNearExpiryKeepsOneTimerChain() throws Exception {
         server.connectResult = expiringResult("u1", "authenticated", 1);
         List<Long> fetchTimes = new CopyOnWriteArrayList<>();

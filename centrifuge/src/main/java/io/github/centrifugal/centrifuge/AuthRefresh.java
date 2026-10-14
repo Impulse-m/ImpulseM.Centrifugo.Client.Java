@@ -141,7 +141,6 @@ final class AuthRefresh {
      * executor, after the connection is torn down.
      */
     void failWaiting() {
-        restoreConnectToken();
         while (!waiting.isEmpty()) {
             Waiting next = waiting.poll();
             if (next.token == null) {
@@ -296,7 +295,7 @@ final class AuthRefresh {
         inFlightCallbacks = null;
         requestedInProgress -= callbacks.size();
         if (error != null) {
-            restoreConnectToken();
+            settleConnectToken(error);
             for (ResultCallback<AuthResult> cb : callbacks) {
                 cb.onDone(error, null);
             }
@@ -351,6 +350,21 @@ final class AuthRefresh {
             connectTokenStored = true;
         }
         client.storeToken(token);
+    }
+
+
+    // Settles the token of a refresh made while the connection was down, once the refresh failed. Only a
+    // refusal puts back the token the connection had before; the others keep the token, since the connect
+    // may have carried it. Nothing is put back while another requested refresh may still be refused.
+    private void settleConnectToken(Throwable error) {
+        if (requestedInProgress > 0) {
+            return;
+        }
+        if (error instanceof ReplyError) {
+            restoreConnectToken();
+        } else {
+            connectTokenStored = false;
+        }
     }
 
 
