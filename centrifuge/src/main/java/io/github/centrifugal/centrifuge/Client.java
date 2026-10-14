@@ -10,6 +10,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -1438,8 +1439,11 @@ public class Client {
      * @param options: per-call options, null for a plain call.
      * @param cb:      will be called as soon as rpc response received or error happened.
      * @return the call.
+     * @throws NullPointerException when the method or the data is null.
      */
     public RpcCall rpcCall(String method, byte[] data, RpcOptions options, ResultCallback<RPCResult> cb) {
+        Objects.requireNonNull(method, "method");
+        Objects.requireNonNull(data, "data");
         Map<String, String> headers = options != null ? options.getHeaders() : Collections.<String, String>emptyMap();
         long timeout = options != null && options.getTimeout() > 0 ? options.getTimeout() : this.opts.getTimeout();
         RpcCall call = new RpcCall(this, method, data, headers, timeout, cb);

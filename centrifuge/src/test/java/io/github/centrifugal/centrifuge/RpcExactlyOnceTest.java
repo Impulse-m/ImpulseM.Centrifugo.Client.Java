@@ -358,6 +358,36 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void nullMethodOrDataIsRefusedAtTheCallAndTheQueuedCallsStillGoOut() throws Exception {
+        enableRpcOptions();
+        answerRpcs("ok");
+        Client c = newClient();
+        CompletableFuture<RPCResult> before = new CompletableFuture<>();
+        CompletableFuture<RPCResult> after = new CompletableFuture<>();
+        c.rpcCall("first", EMPTY_PAYLOAD, into(before));
+        assertNullArgumentRefused(c, null, EMPTY_PAYLOAD);
+        assertNullArgumentRefused(c, "m", null);
+        c.rpcCall("second", EMPTY_PAYLOAD, into(after));
+
+        connect(c);
+
+        before.get(5, TimeUnit.SECONDS);
+        after.get(5, TimeUnit.SECONDS);
+        assertEquals("only the two valid calls are sent", 2, sentRpcRequests().size());
+    }
+
+
+    private void assertNullArgumentRefused(Client c, String method, byte[] data) {
+        try {
+            c.rpcCall(method, data, into(new CompletableFuture<RPCResult>()));
+            fail("a null argument is refused at the call");
+        } catch (NullPointerException expected) {
+            // Refused on the caller's thread: nothing was queued.
+        }
+    }
+
+
+    @Test
     public void cancelsLostWithTheTransportAreCappedAtTheBound() throws Exception {
         enableRpcOptions();
         server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();

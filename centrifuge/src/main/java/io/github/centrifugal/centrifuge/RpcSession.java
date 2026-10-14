@@ -181,7 +181,13 @@ final class RpcSession {
                 call.future.completeExceptionally(new IOException());
                 continue;
             }
-            write(call);
+            // A call which fails to write fails alone: the calls behind it are still written, and the
+            // connect path which flushes them goes on.
+            try {
+                write(call);
+            } catch (RuntimeException e) {
+                call.future.completeExceptionally(e);
+            }
         }
     }
 
