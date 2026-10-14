@@ -29,8 +29,16 @@ public class ReplyError extends Throwable {
         this.message = message;
         this.temporary = temporary;
         this.appCode = appCode;
-        this.appType = appType;
-        this.metadata = Collections.unmodifiableMap(new HashMap<>(metadata));
+        if (appType != null) {
+            this.appType = appType;
+        } else {
+            this.appType = "";
+        }
+        if (metadata != null) {
+            this.metadata = Collections.unmodifiableMap(new HashMap<String, String>(metadata));
+        } else {
+            this.metadata = Collections.emptyMap();
+        }
     }
 
     public int getCode() {

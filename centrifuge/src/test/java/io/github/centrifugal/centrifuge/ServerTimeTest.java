@@ -14,25 +14,33 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertTrue;
 
+
 /**
  * serverTimeMillis() follows the server time carried by replies (Reply.time), and a reply
  * without a server time keeps the last offset.
  */
 public class ServerTimeTest {
-
     private static final long SERVER_AHEAD_MILLIS = 60_000L;
+
+
     private static final long TOLERANCE_MILLIS = 5_000L;
+
 
     private static final byte[] EMPTY_PAYLOAD = "{}".getBytes(StandardCharsets.UTF_8);
 
+
     private FakeCentrifugoServer server;
+
+
     private Client client;
+
 
     @Before
     public void setUp() throws IOException {
         server = new FakeCentrifugoServer();
         server.start();
     }
+
 
     @After
     public void tearDown() throws InterruptedException {
@@ -41,6 +49,39 @@ public class ServerTimeTest {
         }
         server.stop();
     }
+
+
+    @Test
+    public void serverTimeIsLocalTimeBeforeAnyReplyCarriesIt() throws Exception {
+        connect();
+
+        assertServerClockAhead(0L);
+    }
+
+
+    @Test
+    public void serverTimeFollowsReplyTime() throws Exception {
+        answerRpcsWithTime(System.currentTimeMillis() + SERVER_AHEAD_MILLIS);
+        connect();
+
+        rpcAndWait();
+
+        assertServerClockAhead(SERVER_AHEAD_MILLIS);
+    }
+
+
+    @Test
+    public void replyWithoutServerTimeKeepsLastOffset() throws Exception {
+        answerRpcsWithTime(System.currentTimeMillis() + SERVER_AHEAD_MILLIS);
+        connect();
+        rpcAndWait();
+
+        answerRpcsWithTime(0L);
+        rpcAndWait();
+
+        assertServerClockAhead(SERVER_AHEAD_MILLIS);
+    }
+
 
     // Answers rpcs with an empty result carrying the given server time, 0 meaning unset.
     private void answerRpcsWithTime(long time) {
@@ -56,6 +97,7 @@ public class ServerTimeTest {
         };
     }
 
+
     private void rpcAndWait() throws Exception {
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         client.rpc("method", EMPTY_PAYLOAD, (error, result) -> {
@@ -68,11 +110,15 @@ public class ServerTimeTest {
         future.get(5, TimeUnit.SECONDS);
     }
 
+
     private void assertServerClockAhead(long expectedMillis) {
         long diff = client.serverTimeMillis() - System.currentTimeMillis();
-        assertTrue("server time offset " + diff + " not near " + expectedMillis,
-                Math.abs(diff - expectedMillis) < TOLERANCE_MILLIS);
+        assertTrue(
+                "server time offset " + diff + " not near " + expectedMillis,
+                Math.abs(diff - expectedMillis) < TOLERANCE_MILLIS
+        );
     }
+
 
     private void connect() throws InterruptedException {
         Semaphore connected = new Semaphore(0);
@@ -84,34 +130,5 @@ public class ServerTimeTest {
         });
         client.connect();
         assertTrue("connected", connected.tryAcquire(5, TimeUnit.SECONDS));
-    }
-
-    @Test
-    public void serverTimeIsLocalTimeBeforeAnyReplyCarriesIt() throws Exception {
-        connect();
-
-        assertServerClockAhead(0L);
-    }
-
-    @Test
-    public void serverTimeFollowsReplyTime() throws Exception {
-        answerRpcsWithTime(System.currentTimeMillis() + SERVER_AHEAD_MILLIS);
-        connect();
-
-        rpcAndWait();
-
-        assertServerClockAhead(SERVER_AHEAD_MILLIS);
-    }
-
-    @Test
-    public void replyWithoutServerTimeKeepsLastOffset() throws Exception {
-        answerRpcsWithTime(System.currentTimeMillis() + SERVER_AHEAD_MILLIS);
-        connect();
-        rpcAndWait();
-
-        answerRpcsWithTime(0L);
-        rpcAndWait();
-
-        assertServerClockAhead(SERVER_AHEAD_MILLIS);
     }
 }

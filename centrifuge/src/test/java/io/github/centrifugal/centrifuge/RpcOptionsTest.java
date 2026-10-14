@@ -19,25 +19,34 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
+
 /**
  * RPC options over the fork protocol: the connection capability, per-call headers,
  * the error fields of a reply error. Checked over the wire against the in-process
  * {@link FakeCentrifugoServer}.
  */
 public class RpcOptionsTest {
-
     private static final byte[] EMPTY_PAYLOAD = "{}".getBytes(StandardCharsets.UTF_8);
 
+
     private FakeCentrifugoServer server;
+
+
     private Client client;
+
+
     private final Semaphore connectedSignals = new Semaphore(0);
+
+
     private final Semaphore disconnectedSignals = new Semaphore(0);
+
 
     @Before
     public void setUp() throws IOException {
         server = new FakeCentrifugoServer();
         server.start();
     }
+
 
     @After
     public void tearDown() throws InterruptedException {
@@ -47,31 +56,6 @@ public class RpcOptionsTest {
         server.stop();
     }
 
-    private Client newClient() {
-        client = new Client(server.url(), new Options(), new EventListener() {
-            @Override
-            public void onConnected(Client c, ConnectedEvent e) {
-                connectedSignals.release();
-            }
-
-            @Override
-            public void onDisconnected(Client c, DisconnectedEvent e) {
-                disconnectedSignals.release();
-            }
-        });
-        return client;
-    }
-
-    private void connect(Client c) throws InterruptedException {
-        c.connect();
-        assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
-    }
-
-    private void confirmRpcOptions() {
-        server.connectResult = Protocol.ConnectResult.newBuilder()
-                .setClient("fake-client").setVersion("0.0.0").setPing(25)
-                .setFlag(Extensions.RPC_OPTIONS_FLAG).build();
-    }
 
     @Test
     public void connectRequestAdvertisesRpcOptionsBit() throws Exception {
@@ -87,6 +71,7 @@ public class RpcOptionsTest {
         assertEquals(Extensions.RPC_OPTIONS_FLAG, connectRequest.getFlag());
     }
 
+
     @Test
     public void capabilityIsOnWhenConnectReplyHasRpcOptionsBit() throws Exception {
         confirmRpcOptions();
@@ -95,6 +80,7 @@ public class RpcOptionsTest {
 
         assertTrue(c.getCapabilities().isRpcOptionsSupported());
     }
+
 
     @Test
     public void capabilityIsOnWhenRpcOptionsBitComesWithOtherBits() throws Exception {
@@ -107,6 +93,7 @@ public class RpcOptionsTest {
         assertTrue(c.getCapabilities().isRpcOptionsSupported());
     }
 
+
     @Test
     public void capabilityIsOffWhenConnectReplyHasNoRpcOptionsBit() throws Exception {
         server.connectResult = Protocol.ConnectResult.newBuilder()
@@ -118,6 +105,7 @@ public class RpcOptionsTest {
         assertFalse(c.getCapabilities().isRpcOptionsSupported());
     }
 
+
     @Test
     public void capabilityIsOffWhenConnectReplyHasNoFlag() throws Exception {
         Client c = newClient();
@@ -125,6 +113,7 @@ public class RpcOptionsTest {
 
         assertFalse(c.getCapabilities().isRpcOptionsSupported());
     }
+
 
     @Test
     public void capabilityIsClearedOnReconnectUntilConnectReplyConfirmsIt() throws Exception {
@@ -153,6 +142,7 @@ public class RpcOptionsTest {
         assertTrue(c.getCapabilities().isRpcOptionsSupported());
     }
 
+
     @Test
     public void capabilityIsClearedOnDisconnect() throws Exception {
         confirmRpcOptions();
@@ -165,6 +155,7 @@ public class RpcOptionsTest {
 
         assertFalse(c.getCapabilities().isRpcOptionsSupported());
     }
+
 
     @Test
     public void capabilitySnapshotDoesNotChangeAfterwards() throws Exception {
@@ -180,52 +171,6 @@ public class RpcOptionsTest {
         assertFalse(c.getCapabilities().isRpcOptionsSupported());
     }
 
-    private static ResultCallback<RPCResult> into(CompletableFuture<RPCResult> future) {
-        return (error, result) -> {
-            if (error != null) {
-                future.completeExceptionally(error);
-            } else {
-                future.complete(result);
-            }
-        };
-    }
-
-    private static RpcOptions headerOptions() {
-        return new RpcOptions.Builder().header("x-request-source", "test").build();
-    }
-
-    private static ReplyError replyErrorOf(CompletableFuture<RPCResult> future) throws Exception {
-        try {
-            future.get(5, TimeUnit.SECONDS);
-        } catch (ExecutionException e) {
-            return (ReplyError) e.getCause();
-        }
-        throw new AssertionError("rpc succeeded, expected a reply error");
-    }
-
-    private List<Protocol.RPCRequest> rpcRequests() {
-        List<Protocol.RPCRequest> requests = new ArrayList<>();
-        for (Protocol.Command cmd : server.received()) {
-            if (cmd.hasRpc()) {
-                requests.add(cmd.getRpc());
-            }
-        }
-        return requests;
-    }
-
-    // Answers every rpc with a result carrying the payload, other commands by default.
-    private void answerRpcs(String payload) {
-        server.onCommand = cmd -> {
-            if (!cmd.hasRpc()) {
-                return null;
-            }
-            return Protocol.Reply.newBuilder()
-                    .setId(cmd.getId())
-                    .setRpc(Protocol.RPCResult.newBuilder()
-                            .setData(com.google.protobuf.ByteString.copyFromUtf8(payload)))
-                    .build();
-        };
-    }
 
     @Test
     public void rpcWithHeadersIsSentAndResultDelivered() throws Exception {
@@ -245,6 +190,7 @@ public class RpcOptionsTest {
         assertEquals(1, sent.get(0).getHeadersCount());
     }
 
+
     @Test
     public void rpcWithHeadersFailsWithoutCapabilityAndIsNotSent() throws Exception {
         answerRpcs("pong");
@@ -259,6 +205,7 @@ public class RpcOptionsTest {
         assertEquals("rpc headers are not supported by the server", error.getMessage());
         assertTrue("nothing sent", rpcRequests().isEmpty());
     }
+
 
     @Test
     public void plainRpcWorksWithoutCapability() throws Exception {
@@ -275,6 +222,7 @@ public class RpcOptionsTest {
         assertEquals(0, rpcRequests().get(0).getHeadersCount());
     }
 
+
     @Test
     public void plainRpcWorksWithCapability() throws Exception {
         confirmRpcOptions();
@@ -290,6 +238,7 @@ public class RpcOptionsTest {
         assertEquals(0, rpcRequests().get(0).getHeadersCount());
     }
 
+
     @Test
     public void emptyOptionsAreAPlainCallWithoutCapability() throws Exception {
         answerRpcs("pong");
@@ -304,31 +253,6 @@ public class RpcOptionsTest {
         assertEquals(0, rpcRequests().get(0).getHeadersCount());
     }
 
-    // Starts a connect that the server holds, queues an rpc while it is connecting, then
-    // lets the connect reply through. Returns once the rpc is queued.
-    private CompletableFuture<RPCResult> rpcQueuedWhileConnecting(Client c, RpcOptions options) throws Exception {
-        Semaphore connectHeld = new Semaphore(0);
-        server.deferCommand = cmd -> {
-            if (cmd.hasConnect()) {
-                connectHeld.release();
-                return true;
-            }
-            return false;
-        };
-        c.connect();
-        assertTrue("connect held", connectHeld.tryAcquire(5, TimeUnit.SECONDS));
-
-        CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        c.rpc("method", EMPTY_PAYLOAD, options, into(future));
-        // Tasks run in submission order on the client executor, so this returns once the
-        // rpc above has been queued.
-        c.getExecutor().submit(() -> {
-        }).get(5, TimeUnit.SECONDS);
-
-        server.releaseDeferredCommands();
-        assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
-        return future;
-    }
 
     @Test
     public void rpcWithHeadersQueuedWhileConnectingIsSentWhenConnectReplyConfirmsIt() throws Exception {
@@ -343,6 +267,7 @@ public class RpcOptionsTest {
         assertEquals("test", rpcRequests().get(0).getHeadersMap().get("x-request-source"));
     }
 
+
     @Test
     public void rpcWithHeadersQueuedWhileConnectingFailsWhenConnectReplyDoesNotConfirmIt() throws Exception {
         answerRpcs("pong");
@@ -354,6 +279,7 @@ public class RpcOptionsTest {
         assertEquals(ReplyError.UNSUPPORTED, error.getCode());
         assertTrue("nothing sent", rpcRequests().isEmpty());
     }
+
 
     @Test
     public void replyErrorCarriesApplicationFields() throws Exception {
@@ -386,6 +312,7 @@ public class RpcOptionsTest {
         assertEquals("demo", error.getMetadata().get("reason"));
     }
 
+
     @Test
     public void replyErrorApplicationFieldsAreEmptyWhenAbsent() throws Exception {
         server.onCommand = cmd -> {
@@ -408,6 +335,7 @@ public class RpcOptionsTest {
         assertEquals("", error.getAppType());
         assertTrue(error.getMetadata().isEmpty());
     }
+
 
     @Test
     public void replyErrorMetadataIsUnmodifiable() throws Exception {
@@ -433,5 +361,114 @@ public class RpcOptionsTest {
         } catch (UnsupportedOperationException expected) {
             assertEquals(1, error.getMetadata().size());
         }
+    }
+
+
+    private Client newClient() {
+        client = new Client(server.url(), new Options(), new EventListener() {
+            @Override
+            public void onConnected(Client c, ConnectedEvent e) {
+                connectedSignals.release();
+            }
+
+
+            @Override
+            public void onDisconnected(Client c, DisconnectedEvent e) {
+                disconnectedSignals.release();
+            }
+        });
+        return client;
+    }
+
+
+    private void connect(Client c) throws InterruptedException {
+        c.connect();
+        assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+    }
+
+
+    private void confirmRpcOptions() {
+        server.connectResult = Protocol.ConnectResult.newBuilder()
+                .setClient("fake-client").setVersion("0.0.0").setPing(25)
+                .setFlag(Extensions.RPC_OPTIONS_FLAG).build();
+    }
+
+
+    private static ResultCallback<RPCResult> into(CompletableFuture<RPCResult> future) {
+        return (error, result) -> {
+            if (error != null) {
+                future.completeExceptionally(error);
+            } else {
+                future.complete(result);
+            }
+        };
+    }
+
+
+    private static RpcOptions headerOptions() {
+        return new RpcOptions.Builder().header("x-request-source", "test").build();
+    }
+
+
+    private static ReplyError replyErrorOf(CompletableFuture<RPCResult> future) throws Exception {
+        try {
+            future.get(5, TimeUnit.SECONDS);
+        } catch (ExecutionException e) {
+            return (ReplyError) e.getCause();
+        }
+        throw new AssertionError("rpc succeeded, expected a reply error");
+    }
+
+
+    private List<Protocol.RPCRequest> rpcRequests() {
+        List<Protocol.RPCRequest> requests = new ArrayList<>();
+        for (Protocol.Command cmd : server.received()) {
+            if (cmd.hasRpc()) {
+                requests.add(cmd.getRpc());
+            }
+        }
+        return requests;
+    }
+
+
+    // Answers every rpc with a result carrying the payload, other commands by default.
+    private void answerRpcs(String payload) {
+        server.onCommand = cmd -> {
+            if (!cmd.hasRpc()) {
+                return null;
+            }
+            return Protocol.Reply.newBuilder()
+                    .setId(cmd.getId())
+                    .setRpc(Protocol.RPCResult.newBuilder()
+                            .setData(com.google.protobuf.ByteString.copyFromUtf8(payload)))
+                    .build();
+        };
+    }
+
+
+    // Starts a connect that the server holds, queues an rpc while it is connecting, then
+    // lets the connect reply through. Returns once the rpc is queued.
+    private CompletableFuture<RPCResult> rpcQueuedWhileConnecting(Client c, RpcOptions options) throws Exception {
+        Semaphore connectHeld = new Semaphore(0);
+        server.deferCommand = cmd -> {
+            if (cmd.hasConnect()) {
+                connectHeld.release();
+                return true;
+            }
+            return false;
+        };
+        c.connect();
+        assertTrue("connect held", connectHeld.tryAcquire(5, TimeUnit.SECONDS));
+
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpc("method", EMPTY_PAYLOAD, options, into(future));
+        // Tasks run in submission order on the client executor, so this returns once the
+        // rpc above has been queued.
+        c.getExecutor().submit(() -> {
+        }).get(5, TimeUnit.SECONDS);
+
+        server.releaseDeferredCommands();
+        assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+        return future;
     }
 }
