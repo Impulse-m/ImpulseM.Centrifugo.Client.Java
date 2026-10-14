@@ -84,10 +84,19 @@ public class ExtensionsTest {
 
 
     @Test
-    public void msgIdStaysIncreasingWhenTheClockGoesBack() {
+    public void msgIdTimePartFollowsTheCorrectedClockWhenItGoesBack() {
         long last = Extensions.nextMsgId(1_700_000_005_000L, 0L);
 
-        assertEquals(last + 1, Extensions.nextMsgId(1_700_000_001_000L, last));
+        assertEquals(1_700_000_001L << Extensions.MSG_ID_SEQUENCE_BITS, Extensions.nextMsgId(1_700_000_001_000L, last));
+    }
+
+
+    @Test
+    public void msgIdSequenceStopsAtItsLimitWithinOneSecond() {
+        long last = (1_700_000_000L << Extensions.MSG_ID_SEQUENCE_BITS) | Extensions.MSG_ID_SEQUENCE_MASK;
+
+        assertEquals(Extensions.NO_MSG_ID, Extensions.nextMsgId(1_700_000_000_500L, last));
+        assertEquals((1_700_000_001L << Extensions.MSG_ID_SEQUENCE_BITS), Extensions.nextMsgId(1_700_000_001_000L, last));
     }
 
 

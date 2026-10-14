@@ -20,8 +20,14 @@ final class Extensions {
     /** Bits of the sequence part of a msg_id, which is unix seconds shifted left by these bits. */
     static final int MSG_ID_SEQUENCE_BITS = 20;
 
+    /** Largest sequence a msg_id carries within one second. */
+    static final long MSG_ID_SEQUENCE_MASK = (1L << MSG_ID_SEQUENCE_BITS) - 1;
+
     /** Largest msg_id a JSON number carries exactly: 53 bits. */
     static final long MSG_ID_MAX = (1L << 53) - 1;
+
+    /** Returned by {@link #nextMsgId} when the sequence of the current second is used up. */
+    static final long NO_MSG_ID = -1L;
 
 
     private static final String UNSUPPORTED_RPC_MESSAGE = "rpc headers are not supported by the server";
@@ -37,12 +43,21 @@ final class Extensions {
 
     /**
      * The next msg_id: the server-corrected unix second shifted left by
-     * {@link #MSG_ID_SEQUENCE_BITS}, or one above the last msg_id when that is not larger, so
-     * msg_ids of one client strictly increase.
+     * {@link #MSG_ID_SEQUENCE_BITS}, plus a sequence that counts the msg_ids of one second. The
+     * time part follows the corrected clock on every call, so when a correction moves the clock
+     * back, the msg_ids move back with it and the sequence starts again. Keeping an old time
+     * part would put the msg_ids outside the server window. Returns {@link #NO_MSG_ID} when the
+     * sequence of the second is used up, the sequence never carries into the time part.
      */
     static long nextMsgId(long serverTimeMillis, long lastMsgId) {
-        long candidate = (serverTimeMillis / 1000L) << MSG_ID_SEQUENCE_BITS;
-        return candidate > lastMsgId ? candidate : lastMsgId + 1;
+        long seconds = serverTimeMillis / 1000L;
+        if (seconds != (lastMsgId >>> MSG_ID_SEQUENCE_BITS)) {
+            return seconds << MSG_ID_SEQUENCE_BITS;
+        }
+        if ((lastMsgId & MSG_ID_SEQUENCE_MASK) >= MSG_ID_SEQUENCE_MASK) {
+            return NO_MSG_ID;
+        }
+        return lastMsgId + 1;
     }
 
 
