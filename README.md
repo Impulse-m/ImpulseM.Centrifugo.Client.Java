@@ -154,7 +154,9 @@ RpcCall call = client.rpcCall("my.method.name", data, new ResultCallback<RPCResu
 call.cancel();
 ```
 
-Calls which wait for the connection (issued while it is down, or lost with a transport) are bounded by `Options.setMaxPendingRpc`, 32 by default. A call beyond the bound fails with `ReplyError.LIMIT_EXCEEDED` (16). A lost call beyond the bound on a reconnect fails the same way, the oldest calls are kept. Without the capability, calls are sent without a `msg_id`, nothing is resent, and a call lost with its transport fails with an `IOException`.
+Calls which wait for the connection (issued while it is down or while a refresh is in flight, or lost with a transport) are bounded by `Options.setMaxPendingRpc`, 32 by default. A call beyond the bound fails with `ReplyError.LIMIT_EXCEEDED` (16). A lost call beyond the bound on a reconnect fails the same way, the oldest calls are kept. Without the capability, calls are sent without a `msg_id`, nothing is resent, and a call lost with its transport fails with an `IOException`.
+
+The `msg_id` carries the server time, corrected by the server time of each reply, and is taken when the call is first written. The time part follows the corrected clock on every call, so after a correction that moves the clock back, the `msg_id` values move back with it. A server rejects a `msg_id` outside its window with a reply error, which the client surfaces as it is, with the server's code. The client does not send such a call again, since the code is configured on the server. A call which needs a new `msg_id` after a rejection must be issued again by the application.
 
 ### Connection instance
 
