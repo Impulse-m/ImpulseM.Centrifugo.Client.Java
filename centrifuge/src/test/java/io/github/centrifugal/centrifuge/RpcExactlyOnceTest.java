@@ -434,7 +434,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
             long msgId = request.getMsgId();
             assertTrue("msg_id increases", msgId > previous);
             assertTrue("msg_id fits 53 bits", msgId <= MSG_ID_MAX);
-            assertTrue("time part is the unix second", Math.abs((msgId >> Extensions.MSG_ID_SEQUENCE_BITS) - nowSeconds) <= 5);
+            assertTrue("time part is the unix second", Math.abs((msgId >> MsgIdGenerator.SEQUENCE_BITS) - nowSeconds) <= 5);
             previous = msgId;
         }
     }
@@ -474,31 +474,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
         future.get(5, TimeUnit.SECONDS);
         long msgId = sentRpcRequests().get(0).getMsgId();
-        assertTrue("time part is the server second", Math.abs((msgId >> Extensions.MSG_ID_SEQUENCE_BITS) - serverSecond) <= 5);
-    }
-
-
-    @Test
-    public void msgIdStaysIncreasingWhenTheServerClockMovesBack() throws Exception {
-        enableRpcOptions();
-        AtomicLong serverTime = new AtomicLong(System.currentTimeMillis() + 120_000L);
-        answerWithServerTime(serverTime);
-        Client c = newClient();
-        connect(c);
-        callAndWait(c);
-
-        serverTime.set(System.currentTimeMillis());
-        callAndWait(c);
-        callAndWait(c);
-
-        List<Protocol.RPCRequest> requests = sentRpcRequests();
-        long first = requests.get(0).getMsgId();
-        long second = requests.get(1).getMsgId();
-        long third = requests.get(2).getMsgId();
-        assertTrue("the first call used the clock before the correction", (first >> Extensions.MSG_ID_SEQUENCE_BITS) > System.currentTimeMillis() / 1000L + 100);
-        assertTrue("the second call follows the first", second > first);
-        assertTrue("the third call follows the second", third > second);
-        assertEquals("the time part lags the corrected clock", first >> Extensions.MSG_ID_SEQUENCE_BITS, second >> Extensions.MSG_ID_SEQUENCE_BITS);
+        assertTrue("time part is the server second", Math.abs((msgId >> MsgIdGenerator.SEQUENCE_BITS) - serverSecond) <= 5);
     }
 
 

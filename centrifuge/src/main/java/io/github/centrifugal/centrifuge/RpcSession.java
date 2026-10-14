@@ -34,7 +34,7 @@ final class RpcSession {
     // the sent calls made since the last such connection, not by the queue bound. It is not capped,
     // since a dropped cancel would leave the call running on the server.
     private final List<Long> pendingCancels = new ArrayList<>();
-    private long lastMsgId = 0;
+    private final MsgIdGenerator msgIds = new MsgIdGenerator();
 
 
     RpcSession(Client client, int capacity) {
@@ -184,13 +184,12 @@ final class RpcSession {
             return;
         }
         if (supported && !call.everSent) {
-            long msgId = Extensions.nextMsgId(client.serverTimeMillis(), lastMsgId);
-            if (msgId == Extensions.NO_MSG_ID) {
-                call.future.completeExceptionally(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls in one second", false));
+            try {
+                call.msgId = msgIds.next(client.serverTimeMillis());
+            } catch (IllegalStateException e) {
+                call.future.completeExceptionally(e);
                 return;
             }
-            lastMsgId = msgId;
-            call.msgId = msgId;
         }
         int id = client.nextCommandId();
         call.commandId = id;

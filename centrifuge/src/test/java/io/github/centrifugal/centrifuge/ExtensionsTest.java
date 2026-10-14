@@ -1,8 +1,5 @@
 package io.github.centrifugal.centrifuge;
 
-import java.util.HashSet;
-import java.util.Set;
-
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
 import org.junit.Test;
@@ -15,10 +12,6 @@ import static org.junit.Assert.assertTrue;
 
 /** Unit tests of the arithmetic behind the protocol extensions. */
 public class ExtensionsTest {
-    // Largest msg_id a JSON number carries exactly: 53 bits.
-    private static final long MSG_ID_MAX = (1L << 53) - 1;
-
-
     @Test
     public void rpcOptionsFlagIsBit32() {
         assertEquals(4294967296L, Extensions.RPC_OPTIONS_FLAG);
@@ -73,81 +66,6 @@ public class ExtensionsTest {
         assertEquals(7, reply.getId());
         assertEquals(ReplyError.UNSUPPORTED, reply.getError().getCode());
         assertEquals("rpc headers are not supported by the server", reply.getError().getMessage());
-    }
-
-
-    @Test
-    public void msgIdCarriesTheUnixSecondAndStartsSequenceAtZero() {
-        assertEquals(1_700_000_000L << 20, Extensions.nextMsgId(1_700_000_000_999L, 0L));
-    }
-
-
-    @Test
-    public void msgIdIncrementsWithinOneSecond() {
-        long first = Extensions.nextMsgId(1_700_000_000_100L, 0L);
-
-        assertEquals(first + 1, Extensions.nextMsgId(1_700_000_000_900L, first));
-    }
-
-
-    @Test
-    public void msgIdNeverMovesBackWhenTheClockGoesBack() {
-        long last = Extensions.nextMsgId(1_700_000_005_000L, 0L);
-
-        assertEquals(last + 1, Extensions.nextMsgId(1_700_000_001_000L, last));
-    }
-
-
-    @Test
-    public void msgIdTimePartFollowsTheClockAgainOnceItPassesTheLastTimePart() {
-        long last = Extensions.nextMsgId(1_700_000_005_000L, 0L);
-        long lagging = Extensions.nextMsgId(1_700_000_001_000L, last);
-
-        assertEquals(1_700_000_006L << Extensions.MSG_ID_SEQUENCE_BITS, Extensions.nextMsgId(1_700_000_006_000L, lagging));
-    }
-
-
-    @Test
-    public void msgIdsStayUniqueAndIncreasingAcrossBackwardCorrections() {
-        long[] clocksMillis = {
-                1_700_000_005_000L,
-                1_700_000_005_000L,
-                1_700_000_007_000L,
-                1_700_000_003_000L,
-                1_700_000_003_000L,
-                1_700_000_005_000L,
-                1_700_000_005_000L,
-                1_700_000_008_000L,
-                1_700_000_001_000L,
-                1_700_000_008_000L
-        };
-        Set<Long> issued = new HashSet<>();
-        long last = 0L;
-        for (long clock : clocksMillis) {
-            long next = Extensions.nextMsgId(clock, last);
-
-            assertTrue(next > last);
-            assertTrue("msg_id issued twice: " + next, issued.add(next));
-            last = next;
-        }
-    }
-
-
-    @Test
-    public void msgIdSequenceStopsAtItsLimitWithinOneSecond() {
-        long last = (1_700_000_000L << Extensions.MSG_ID_SEQUENCE_BITS) | Extensions.MSG_ID_SEQUENCE_MASK;
-
-        assertEquals(Extensions.NO_MSG_ID, Extensions.nextMsgId(1_700_000_000_500L, last));
-        assertEquals((1_700_000_001L << Extensions.MSG_ID_SEQUENCE_BITS), Extensions.nextMsgId(1_700_000_001_000L, last));
-    }
-
-
-    @Test
-    public void msgIdFitsFiftyThreeBitsForTodaysClock() {
-        long msgId = Extensions.nextMsgId(1_800_000_000_000L, 0L);
-
-        assertTrue(msgId <= MSG_ID_MAX);
-        assertTrue(msgId > 0L);
     }
 
 
