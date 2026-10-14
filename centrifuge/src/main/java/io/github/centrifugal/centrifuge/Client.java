@@ -125,11 +125,6 @@ public class Client {
         return this.token;
     }
 
-    // The refresh state, for the tests.
-    AuthRefresh authRefresh() {
-        return this.auth;
-    }
-
     void reportError(Throwable cause) {
         this.listener.onError(this, new ErrorEvent(cause));
     }

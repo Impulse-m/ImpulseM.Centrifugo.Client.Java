@@ -94,18 +94,6 @@ final class AuthRefresh {
     }
 
 
-    /** Whether a timer refresh is scheduled. For the tests. */
-    boolean hasScheduledTimer() {
-        return timer != null;
-    }
-
-
-    /** The number of refreshes waiting for the refresh in flight. For the tests. */
-    int waitingCount() {
-        return waiting.size();
-    }
-
-
     /**
      * Refreshes the connection with a token the caller gave. Runs on the executor. A refresh with the
      * token of the last pending refresh call shares its command, otherwise it waits its turn. A refresh

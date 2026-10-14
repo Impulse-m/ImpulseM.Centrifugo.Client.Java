@@ -251,16 +251,21 @@ public class AuthTest extends RpcTestBase {
     public void refusedTimerRefreshIsNotRetried() throws Exception {
         server.connectResult = expiringResult("u1", "authenticated", 1);
         List<Long> fetchTimes = new CopyOnWriteArrayList<>();
-        newAuthClient(optionsWithTokenGetter(fetchTimes), FAST_RETRY_MIN_MILLIS, FAST_RETRY_MAX_MILLIS);
+        ManualScheduler clock = new ManualScheduler();
+        newAuthClientOnClock(optionsWithTokenGetter(fetchTimes), clock);
         connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
         refuseRefreshes();
+        int scheduled = clock.requestedDelays().size();
+
+        clock.advance(1000);
         awaitCondition("refused refresh sent", () -> refreshTokens().size() == 1);
         awaitCondition("refresh error reported", () -> !errorEvents.isEmpty());
-        // The error is reported on the executor before the retry would be scheduled, so once the executor
+        // The error is reported on the executor before a retry would be scheduled, so once the executor
         // has run everything queued before this call, a retry is either scheduled or it is not.
         drainExecutor();
 
-        assertFalse("no retry is scheduled", client.authRefresh().hasScheduledTimer());
+        assertEquals("no retry is scheduled", scheduled, clock.requestedDelays().size());
         assertEquals("the refused refresh is not sent again", 1, refreshTokens().size());
         assertEquals("the token is not fetched again", 1, fetchTimes.size());
         assertEquals(ClientState.CONNECTED, client.getState());
@@ -426,13 +431,16 @@ public class AuthTest extends RpcTestBase {
     @Test
     public void timerEntriesDoNotCountAgainstTheRefreshBound() throws Exception {
         server.connectResult = expiringResult("u1", "authenticated", 1);
-        newAuthClient(optionsWithTokenGetter(new CopyOnWriteArrayList<Long>()));
+        ManualScheduler clock = new ManualScheduler();
+        newAuthClientOnClock(optionsWithTokenGetter(new CopyOnWriteArrayList<Long>()), clock);
         connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
         server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
         CompletableFuture<AuthResult> first = refresh(client, "token-0");
         awaitCondition("refresh sent", () -> refreshTokens().size() == 1);
         // The timer fires one ttl after the connect and queues behind the refresh in flight.
-        awaitCondition("timer queued behind the refresh", () -> client.authRefresh().waitingCount() == 1);
+        clock.advance(1000);
+        drainExecutor();
 
         List<CompletableFuture<AuthResult>> accepted = new ArrayList<>();
         for (int i = 1; i < 32; i++) {
@@ -777,6 +785,12 @@ public class AuthTest extends RpcTestBase {
 
     private void newAuthClient(Options options, int retryMinMillis, int retryMaxMillis) {
         client = new Client(server.url(), options, authListener(), retryMinMillis, retryMaxMillis, Executors.newScheduledThreadPool(1));
+    }
+
+
+    // A client whose timers run on the clock: the test moves it, so the refresh timer fires when the test says.
+    private void newAuthClientOnClock(Options options, ManualScheduler clock) {
+        client = new Client(server.url(), options, authListener(), FAST_RETRY_MIN_MILLIS, FAST_RETRY_MAX_MILLIS, clock);
     }
 
 
