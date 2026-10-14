@@ -6,6 +6,7 @@ package io.github.centrifugal.centrifuge {
     method public boolean close(long);
     method public void connect();
     method public void disconnect();
+    method public io.github.centrifugal.centrifuge.ClientCapabilities! getCapabilities();
     method public io.github.centrifugal.centrifuge.ClientState! getState();
     method public io.github.centrifugal.centrifuge.Subscription! getSubscription(String);
     method public void history(String, io.github.centrifugal.centrifuge.HistoryOptions!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.HistoryResult!>!);
@@ -16,8 +17,14 @@ package io.github.centrifugal.centrifuge {
     method public void publish(String, byte[]!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.PublishResult!>!);
     method public void removeSubscription(io.github.centrifugal.centrifuge.Subscription!);
     method public void rpc(String, byte[]!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.RPCResult!>!);
+    method public void rpc(String, byte[]!, io.github.centrifugal.centrifuge.RpcOptions!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.RPCResult!>!);
     method public void send(byte[]!, io.github.centrifugal.centrifuge.CompletionCallback!);
+    method public long serverTimeMillis();
     method public void setToken(String);
+  }
+
+  public final class ClientCapabilities {
+    method public boolean isRpcOptionsSupported();
   }
 
   public class ClientInfo {
@@ -227,16 +234,31 @@ package io.github.centrifugal.centrifuge {
 
   public class ReplyError {
     ctor public ReplyError(int, String, boolean);
+    ctor public ReplyError(int, String, boolean, int, String, Map<String,String>);
+    method public int getAppCode();
+    method public String getAppType();
     method public int getCode();
     method public String getMessage();
+    method public Map<String,String> getMetadata();
     method public boolean isTemporary();
     method public void setCode(int);
     method public void setMessage(String);
     method public void setTemporary(boolean);
+    field public static final int UNSUPPORTED = 15; // 0xf
   }
 
   public interface ResultCallback<T> {
     method public void onDone(Throwable, T!);
+  }
+
+  public final class RpcOptions {
+    method public Map<String,String> getHeaders();
+  }
+
+  public static class RpcOptions.Builder {
+    ctor public RpcOptions.Builder();
+    method public io.github.centrifugal.centrifuge.RpcOptions! build();
+    method public io.github.centrifugal.centrifuge.RpcOptions.Builder! header(String, String);
   }
 
   public class ServerJoinEvent {
