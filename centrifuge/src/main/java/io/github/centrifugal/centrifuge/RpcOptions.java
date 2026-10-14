@@ -14,6 +14,8 @@ public final class RpcOptions {
     public static class Builder {
         private final Map<String, String> headers = new LinkedHashMap<>();
 
+        private long timeout;
+
 
         /** Adds a header. Adding the same key again replaces its value. */
         public Builder header(String key, String value) {
@@ -40,9 +42,6 @@ public final class RpcOptions {
         public RpcOptions build() {
             return new RpcOptions(this);
         }
-
-
-        private long timeout;
     }
 
 
