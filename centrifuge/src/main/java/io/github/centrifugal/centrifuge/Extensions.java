@@ -1,5 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
+import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
+
 
 /**
  * Helpers for the protocol extensions of the server fork: connect flag bits and
@@ -12,6 +14,9 @@ final class Extensions {
      * Bit 32 is a long shift, so it is not truncated the way an int shift would be.
      */
     static final long RPC_OPTIONS_FLAG = 1L << 32;
+
+
+    private static final String UNSUPPORTED_RPC_MESSAGE = "rpc headers are not supported by the server";
 
 
     /** Whether the bit {@code flag} is set in the bitmask {@code flags}. */
@@ -36,6 +41,20 @@ final class Extensions {
     /** Server time estimated from a local time and the offset of the server clock. */
     static long estimateServerTime(long localTime, long offset) {
         return localTime + offset;
+    }
+
+
+    /**
+     * The reply of a call the client did not send: the server would have answered it with
+     * {@link ReplyError#UNSUPPORTED}. Completes the call's future like any other reply.
+     */
+    static Protocol.Reply unsupportedRpcReply(int id) {
+        return Protocol.Reply.newBuilder()
+                .setId(id)
+                .setError(Protocol.Error.newBuilder()
+                        .setCode(ReplyError.UNSUPPORTED)
+                        .setMessage(UNSUPPORTED_RPC_MESSAGE))
+                .build();
     }
 
 

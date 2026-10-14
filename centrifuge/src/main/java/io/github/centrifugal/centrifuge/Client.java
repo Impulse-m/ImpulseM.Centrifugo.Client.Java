@@ -120,9 +120,6 @@ public class Client {
     // impossible (only sent when SUBSCRIPTION_FLAG_REJECT_UNRECOVERED was requested).
     static final int ERROR_CODE_UNRECOVERABLE_POSITION = 112;
 
-    // Reply error of an rpc with headers on a connection without RPC options support.
-    private static final String UNSUPPORTED_RPC_HEADERS_MESSAGE = "rpc headers are not supported by the server";
-
     // Server-sent "state invalidated" codes. The server determines that the
     // client's cached state and/or token are no longer valid and asks the client
     // to drop them and re-sync.
@@ -429,6 +426,8 @@ public class Client {
 
         this.httpClient = okHttpBuilder.build();
         this.httpClientOwned = baseClient == null;
+        // Each transport starts without capabilities; its connect reply confirms them.
+        this.rpcOptionsSupported = false;
         this.ws = this.httpClient.newWebSocket(request, new WebSocketListener() {
             @Override
             public void onOpen(WebSocket webSocket, Response response) {
@@ -1361,12 +1360,7 @@ public class Client {
         if (!cmd.hasRpc() || cmd.getRpc().getHeadersCount() == 0 || this.rpcOptionsSupported) {
             return false;
         }
-        f.complete(Protocol.Reply.newBuilder()
-                .setId(cmd.getId())
-                .setError(Protocol.Error.newBuilder()
-                        .setCode(ReplyError.UNSUPPORTED)
-                        .setMessage(UNSUPPORTED_RPC_HEADERS_MESSAGE))
-                .build());
+        f.complete(Extensions.unsupportedRpcReply(cmd.getId()));
         return true;
     }
 

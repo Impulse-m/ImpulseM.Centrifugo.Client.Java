@@ -1,5 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
+import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
+
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
@@ -54,5 +56,15 @@ public class ExtensionsTest {
     @Test
     public void estimatedServerTimeIsLocalTimeWithoutOffset() {
         assertEquals(1_000_000L, Extensions.estimateServerTime(1_000_000L, 0L));
+    }
+
+
+    @Test
+    public void unsupportedRpcReplyAnswersTheCommandWithCodeFifteen() {
+        Protocol.Reply reply = Extensions.unsupportedRpcReply(7);
+
+        assertEquals(7, reply.getId());
+        assertEquals(ReplyError.UNSUPPORTED, reply.getError().getCode());
+        assertEquals("rpc headers are not supported by the server", reply.getError().getMessage());
     }
 }
