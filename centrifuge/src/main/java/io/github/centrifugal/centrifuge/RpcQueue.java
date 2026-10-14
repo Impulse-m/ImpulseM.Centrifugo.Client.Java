@@ -9,28 +9,15 @@ import java.util.Set;
 
 /**
  * The rpc calls that wait for the connection: calls issued while it is down or a refresh is in
- * flight, and calls lost with their transport. The capacity bounds the calls issued, see
- * {@link #isFull}; a call which was sent already is kept whatever the size. Used on the client's
- * executor thread only.
+ * flight, and calls lost with their transport. The bound on the calls is not applied here, see
+ * {@link RpcSession#submit}. The queue keeps the order in which the calls are sent again. Used on
+ * the client's executor thread only.
  */
 final class RpcQueue {
-    private final int capacity;
     // Identity semantics: two calls are the same only when they are the same object.
     private final Set<RpcCall> calls = new LinkedHashSet<>();
 
 
-    RpcQueue(int capacity) {
-        this.capacity = capacity;
-    }
-
-
-    /** Whether the queue holds as many calls as its capacity, so a call issued now is refused. */
-    boolean isFull() {
-        return calls.size() >= capacity;
-    }
-
-
-    /** Adds the call. The capacity does not apply, so a call lost with its transport is kept. */
     void add(RpcCall call) {
         calls.add(call);
     }

@@ -11,6 +11,7 @@ import java.util.Set;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
@@ -48,11 +49,16 @@ final class RpcSession {
     // since a dropped cancel would leave the call running on the server.
     private final List<Long> pendingCancels = new ArrayList<>();
     private final MsgIdGenerator msgIds = new MsgIdGenerator();
+    // The bound of the calls which are not settled, see submit.
+    private final int maxPending;
+    // The calls which are not settled: counted when they are submitted, released when they are delivered.
+    private final AtomicInteger pending = new AtomicInteger();
 
 
-    RpcSession(Client client, int capacity) {
+    RpcSession(Client client, int maxPending) {
         this.client = client;
-        this.queue = new RpcQueue(capacity);
+        this.queue = new RpcQueue();
+        this.maxPending = maxPending;
     }
 
 
@@ -60,11 +66,23 @@ final class RpcSession {
      * Starts the deadline of the call and hands the call to the executor. Called on the caller's
      * thread. The deadline starts here, so it holds for a call waiting for a refresh, and across
      * resends. The callback runs on the executor, also when the call was cancelled before it started.
+     * A client with an instance refuses a call beyond the bound at once, with LIMIT_EXCEEDED: the call
+     * is not registered and the bound counts every call which is not settled.
      */
     void submit(RpcCall call) {
-        // The executor rejects the call once the client is closed. Nothing is registered then, so
-        // the deadline cannot fire later and call back on another thread.
-        client.getExecutor().submit(() -> start(call));
+        if (pending.incrementAndGet() > maxPending && client.hasInstance()) {
+            pending.decrementAndGet();
+            client.getExecutor().submit(() -> call.callback.onDone(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls are pending", false), null));
+            return;
+        }
+        try {
+            // The executor rejects the call once the client is closed. Nothing is registered then, so
+            // the deadline cannot fire later and call back on another thread.
+            client.getExecutor().submit(() -> start(call));
+        } catch (RejectedExecutionException e) {
+            pending.decrementAndGet();
+            throw e;
+        }
         call.future.orTimeout(call.timeout, TimeUnit.MILLISECONDS)
                 .whenComplete((Protocol.Reply reply, Throwable error) -> finishOnExecutor(call, reply, error));
     }
@@ -187,18 +205,12 @@ final class RpcSession {
 
 
     // Writes the call now when the connection is up and no refresh is in flight. Otherwise the call
-    // waits in the queue, unless the queue is full: the bound applies to the calls issued here.
+    // waits in the queue.
     private void start(RpcCall call) {
         if (call.future.isDone()) {
             return;
         }
-        if (client.getState() == ClientState.CONNECTED && !client.isRefreshing()) {
-            write(call);
-        } else if (queue.isFull()) {
-            call.future.completeExceptionally(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls wait for the connection", false));
-        } else {
-            queue.add(call);
-        }
+        writeOrQueue(call);
     }
 
 
@@ -256,8 +268,6 @@ final class RpcSession {
         pendingAcks.addAll(0, acks);
         if (!tracked) {
             call.future.completeExceptionally(new IOException());
-        } else if (!call.everSent && queue.isFull()) {
-            call.future.completeExceptionally(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls wait for the connection", false));
         } else {
             queue.add(call);
         }
@@ -437,6 +447,7 @@ final class RpcSession {
     // Hands the outcome of the call to its callback. Reads no session state, so it is safe once the
     // session is gone with the executor.
     private void deliver(RpcCall call, Protocol.Reply reply, Throwable error) {
+        pending.decrementAndGet();
         if (reply == null) {
             call.callback.onDone(Extensions.unwrapCompletion(error), null);
             return;

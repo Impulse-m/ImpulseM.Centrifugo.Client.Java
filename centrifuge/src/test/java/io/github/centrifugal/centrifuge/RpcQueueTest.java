@@ -6,51 +6,25 @@ import java.util.List;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 
 public class RpcQueueTest {
     @Test
-    public void isFullWhenTheCapacityIsReached() {
-        RpcQueue queue = new RpcQueue(2);
-
-        assertFalse(queue.isFull());
-        queue.add(call(1L));
-        assertFalse(queue.isFull());
-        queue.add(call(2L));
-        assertTrue(queue.isFull());
-    }
-
-
-    @Test
-    public void addKeepsCallsBeyondTheCapacity() {
-        RpcQueue queue = new RpcQueue(1);
+    public void addKeepsEveryCall() {
+        RpcQueue queue = new RpcQueue();
 
         queue.add(call(1L));
         queue.add(call(2L));
 
-        assertTrue(queue.isFull());
         assertEquals(2, queue.drain().size());
     }
 
 
     @Test
-    public void removingACallFreesARoomInTheQueue() {
-        RpcQueue queue = new RpcQueue(1);
-        RpcCall first = call(1L);
-        queue.add(first);
-
-        queue.remove(first);
-
-        assertFalse(queue.isFull());
-    }
-
-
-    @Test
     public void drainReturnsTheCallsInMsgIdOrderAndEmptiesTheQueue() {
-        RpcQueue queue = new RpcQueue(10);
+        RpcQueue queue = new RpcQueue();
         RpcCall third = call(30L);
         RpcCall first = call(10L);
         RpcCall second = call(20L);
@@ -69,8 +43,23 @@ public class RpcQueueTest {
 
 
     @Test
+    public void callsWithoutMsgIdFollowTheCallsWithOne() {
+        RpcQueue queue = new RpcQueue();
+        RpcCall unsent = call(0L);
+        RpcCall sent = call(5L);
+        queue.add(unsent);
+        queue.add(sent);
+
+        List<RpcCall> drained = queue.drain();
+
+        assertSame(sent, drained.get(0));
+        assertSame(unsent, drained.get(1));
+    }
+
+
+    @Test
     public void removeOnlyRemovesTheSameCall() {
-        RpcQueue queue = new RpcQueue(10);
+        RpcQueue queue = new RpcQueue();
         RpcCall kept = call(5L);
         queue.add(kept);
 

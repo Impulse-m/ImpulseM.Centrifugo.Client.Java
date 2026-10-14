@@ -108,6 +108,7 @@ public class AuthTest extends RpcTestBase {
         server.connectResult = connectResultFor("u1", "authenticated");
         answerRpcs("ok");
         Options options = new Options();
+        options.setInstance("abcdefghijklmnopqrstuv");
         options.setMaxPendingRpc(2);
         newAuthClient(options);
         connect(client);

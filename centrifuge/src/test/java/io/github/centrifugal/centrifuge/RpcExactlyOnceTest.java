@@ -558,34 +558,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void lostCallsBeyondTheBoundAreKeptAndResent() throws Exception {
-        enableRpcOptions();
-        serveDedup();
-        Options options = instanceOptions();
-        options.setMaxPendingRpc(2);
-        Client c = newClient(options);
-        connect(c);
-        holdCalls.set(true);
-        List<CompletableFuture<RPCResult>> futures = sendHeldCalls(c, 3);
-
-        holdCalls.set(false);
-        server.closeConnection();
-
-        for (CompletableFuture<RPCResult> future : futures) {
-            future.get(5, TimeUnit.SECONDS);
-        }
-        List<Protocol.RPCRequest> requests = sentRpcRequests();
-        assertEquals(6, requests.size());
-        for (int i = 0; i < 3; i++) {
-            assertEquals(requests.get(i).getMsgId(), requests.get(i + 3).getMsgId());
-            assertTrue(requests.get(i + 3).getRetransmit());
-        }
-        assertEquals("each call ran once", 3, executions.get());
-    }
-
-
-    @Test
-    public void newCallsAreRefusedWhileLostCallsAreOverTheBound() throws Exception {
+    public void lostCallKeepsItsSlotAcrossTheReconnect() throws Exception {
         enableRpcOptions();
         serveDedup();
         Options options = instanceOptions();
@@ -595,7 +568,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         connectArrivals.drainPermits();
         holdCalls.set(true);
         holdConnect.set(true);
-        List<CompletableFuture<RPCResult>> futures = sendHeldCalls(c, 3);
+        List<CompletableFuture<RPCResult>> futures = sendHeldCalls(c, 2);
         server.closeConnection();
         assertTrue("reconnect started", connectArrivals.tryAcquire(5, TimeUnit.SECONDS));
 
@@ -609,12 +582,112 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         for (CompletableFuture<RPCResult> future : futures) {
             future.get(5, TimeUnit.SECONDS);
         }
-        assertEquals("each call ran once", 3, executions.get());
+        assertEquals("each call ran once", 2, executions.get());
+        callAndWait(c);
     }
 
 
     @Test
-    public void cancelledLostCallsDoNotUseTheQueueBound() throws Exception {
+    public void thirtyThirdCallWhileDisconnectedIsRefusedAtOnce() throws Exception {
+        enableRpcOptions();
+        answerRpcs("ok");
+        Client c = newClient();
+        List<CompletableFuture<RPCResult>> held = new ArrayList<>();
+        for (int i = 0; i < 32; i++) {
+            CompletableFuture<RPCResult> future = new CompletableFuture<>();
+            held.add(future);
+            c.rpcCall("held" + i, EMPTY_PAYLOAD, into(future));
+        }
+        CompletableFuture<RPCResult> refused = new CompletableFuture<>();
+
+        c.rpcCall("refused", EMPTY_PAYLOAD, into(refused));
+
+        drainExecutor();
+        assertEquals(ReplyError.LIMIT_EXCEEDED, replyErrorOf(refused).getCode());
+        for (CompletableFuture<RPCResult> future : held) {
+            assertFalse("held while disconnected", future.isDone());
+        }
+        connect(c);
+        for (CompletableFuture<RPCResult> future : held) {
+            future.get(5, TimeUnit.SECONDS);
+        }
+        assertEquals(32, sentRpcRequests().size());
+    }
+
+
+    @Test
+    public void settledCallsFreeTheirSlots() throws Exception {
+        enableRpcOptions();
+        answerRpcs("ok");
+        Options options = instanceOptions();
+        options.setMaxPendingRpc(2);
+        Client c = newClient(options);
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        CompletableFuture<RPCResult> second = new CompletableFuture<>();
+        c.rpcCall("a", EMPTY_PAYLOAD, into(first));
+        c.rpcCall("b", EMPTY_PAYLOAD, into(second));
+        CompletableFuture<RPCResult> refused = new CompletableFuture<>();
+        c.rpcCall("c", EMPTY_PAYLOAD, into(refused));
+        assertEquals(ReplyError.LIMIT_EXCEEDED, replyErrorOf(refused).getCode());
+
+        connect(c);
+        first.get(5, TimeUnit.SECONDS);
+        second.get(5, TimeUnit.SECONDS);
+        callAndWait(c);
+
+        assertEquals(3, sentRpcRequests().size());
+    }
+
+
+    @Test
+    public void legacyCallHoldsItsSlotUntilItSettles() throws Exception {
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();
+        Options options = instanceOptions();
+        options.setMaxPendingRpc(1);
+        Client c = newClient(options);
+        connect(c);
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        c.rpcCall("first", EMPTY_PAYLOAD, into(first));
+        awaitRequestCount(1);
+        CompletableFuture<RPCResult> refused = new CompletableFuture<>();
+
+        c.rpcCall("second", EMPTY_PAYLOAD, into(refused));
+
+        assertEquals(ReplyError.LIMIT_EXCEEDED, replyErrorOf(refused).getCode());
+        server.deferCommand = null;
+        server.releaseDeferredCommands();
+        first.get(5, TimeUnit.SECONDS);
+        callAndWait(c);
+    }
+
+
+    @Test
+    public void callsWithoutAnInstanceHaveNoBound() throws Exception {
+        enableRpcOptions();
+        answerRpcs("ok");
+        Options options = new Options();
+        options.setMaxPendingRpc(1);
+        Client c = newClient(options);
+        List<CompletableFuture<RPCResult>> futures = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            CompletableFuture<RPCResult> future = new CompletableFuture<>();
+            futures.add(future);
+            c.rpcCall("m" + i, EMPTY_PAYLOAD, into(future));
+        }
+
+        drainExecutor();
+        for (CompletableFuture<RPCResult> future : futures) {
+            assertFalse("held, not refused", future.isDone());
+        }
+        connect(c);
+        for (CompletableFuture<RPCResult> future : futures) {
+            future.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+
+    @Test
+    public void cancelledCallsFreeTheirSlots() throws Exception {
         enableRpcOptions();
         serveDedup();
         Options options = instanceOptions();
