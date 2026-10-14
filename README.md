@@ -166,7 +166,7 @@ The server scopes the records of a client by a connection instance, which the ap
 * keep it per installation or per tab, in storage of its own;
 * never log or share it. Whoever knows it can retransmit and cancel calls in its scope.
 
-`setInstance` throws `IllegalArgumentException` for a value outside that pattern. `null` clears the instance. Without an instance a call has no scope on the server, so it is not deduplicated.
+`setInstance` throws `IllegalArgumentException` for a value outside that pattern. It is the unchecked error the Java API uses for an invalid argument: `ConfigurationError` is a checked `Throwable` reported through `ErrorEvent`, and throwing it would change the signature of `setInstance`. `null` clears the instance. Without an instance a call has no scope on the server, so it is not deduplicated.
 
 ```java
 byte[] bytes = new byte[16];
