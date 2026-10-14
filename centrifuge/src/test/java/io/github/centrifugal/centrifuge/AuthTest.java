@@ -29,6 +29,7 @@ import static org.junit.Assert.assertTrue;
 public class AuthTest extends RpcTestBase {
     private static final int PERMISSION_DENIED = 103;
     private static final int TOKEN_EXPIRED = 109;
+    private static final int UNAUTHORIZED = 101;
 
     private static final long ONE_SECOND_NANOS = 1_000_000_000L;
 
@@ -47,6 +48,9 @@ public class AuthTest extends RpcTestBase {
 
 
     private final List<ErrorEvent> errorEvents = new CopyOnWriteArrayList<>();
+
+
+    private final List<DisconnectedEvent> disconnectedEvents = new CopyOnWriteArrayList<>();
 
 
     @Test
@@ -255,6 +259,21 @@ public class AuthTest extends RpcTestBase {
         assertEquals("the refused refresh is not sent again", 1, refreshTokens().size());
         assertEquals("the token is not fetched again", 1, fetchTimes.size());
         assertEquals(ClientState.CONNECTED, client.getState());
+    }
+
+
+    @Test
+    public void timerRefreshRefusedWithAnotherCodeDisconnectsWithIt() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        newAuthClient(optionsWithTokenGetter(new CopyOnWriteArrayList<Long>()));
+        connect(client);
+        answerRefreshWith(Protocol.Reply.newBuilder()
+                .setError(Protocol.Error.newBuilder().setCode(UNAUTHORIZED).setMessage("unauthorized")));
+
+        awaitCondition("disconnected", () -> !disconnectedEvents.isEmpty());
+
+        assertEquals(UNAUTHORIZED, disconnectedEvents.get(0).getCode());
+        assertEquals(ClientState.DISCONNECTED, client.getState());
     }
 
 
@@ -525,6 +544,7 @@ public class AuthTest extends RpcTestBase {
 
             @Override
             public void onDisconnected(Client c, DisconnectedEvent e) {
+                disconnectedEvents.add(e);
                 disconnectedSignals.release();
             }
         };

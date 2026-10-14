@@ -178,6 +178,19 @@ String instance = java.util.Base64.getUrlEncoder().withoutPadding().encodeToStri
 options.setInstance(instance);
 ```
 
+## Refreshing the connection token on demand
+
+`Client.refresh(token, callback)` replaces the connection token now, without waiting for the server to ask for one. On success the callback gets the identity the server reports, and the refresh timer is rescheduled from the new TTL. The token of the connection is replaced only by a token the server accepted. An error is passed to the callback unchanged, with its code and metadata. The connection, its identity and its refresh timer stay as they were, and the refresh is not retried: the caller asked for it, so the caller decides. `rpc` calls issued while a refresh command is in flight wait for its reply. At most 32 refreshes are in progress; a refresh beyond that fails at once with `ReplyError.LIMIT_EXCEEDED` (16).
+
+The refresh timer runs before the token expires. Its errors follow the upstream rule, with two deviations from upstream:
+
+| Error of the timer refresh | Behaviour |
+|---|---|
+| temporary, or a client error (code below 100) | reported as an `ErrorEvent`, retried with backoff and a fresh token (upstream) |
+| 109 token expired | reported as an `ErrorEvent`, retried with backoff and a fresh token. **Deviation:** upstream disconnects with 109 on a refresh. The connect treats 109 the same way, as a request for a fresh token. |
+| 103 permission denied | reported as an `ErrorEvent`, the connection and its identity are kept, and there is no retry. **Deviation:** upstream disconnects with 103. The server refused the identity change of the token the getter returned, and the same token would be refused again. The server ends the connection at its expiry, and the reconnect fetches a token from the getter, so the identity changes then. An application which needs the change now calls `refresh()` and handles 103. |
+| anything else | the connection is disconnected with the server's code, and does not reconnect (upstream) |
+
 ## CI status
 
 [![Test](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/actions/workflows/ci.yml/badge.svg)](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/actions/workflows/ci.yml)
