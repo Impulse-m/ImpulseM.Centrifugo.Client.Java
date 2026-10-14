@@ -43,6 +43,8 @@ public class Client {
     private boolean httpClientOwned;
     private final String endpoint;
     private final Options opts;
+    // The instance of the connection, read from the options when the client is created.
+    private final String instance;
     private String token;
     private com.google.protobuf.ByteString data;
     private final EventListener listener;
@@ -104,7 +106,7 @@ public class Client {
     }
 
     boolean hasInstance() {
-        return !this.opts.getInstance().isEmpty();
+        return !this.instance.isEmpty();
     }
 
     boolean isRefreshing() {
@@ -117,6 +119,15 @@ public class Client {
 
     void storeToken(String token) {
         this.token = token;
+    }
+
+    String getConnectionToken() {
+        return this.token;
+    }
+
+    // The refresh state, for the tests.
+    AuthRefresh authRefresh() {
+        return this.auth;
     }
 
     void reportError(Throwable cause) {
@@ -209,6 +220,7 @@ public class Client {
     Client(final String endpoint, final Options opts, final EventListener listener, final int authRetryMinMillis, final int authRetryMaxMillis) {
         this.endpoint = endpoint;
         this.opts = opts;
+        this.instance = opts.getInstance();
         this.listener = listener;
         this.backoff = new Backoff();
         this.rpcSession = new RpcSession(this, opts.getMaxPendingRpc());
@@ -301,14 +313,7 @@ public class Client {
                 // (e.g. orTimeout/exceptionally re-submits) get queued before
                 // we mark the executor shutdown.
                 Client.this.processDisconnect(DISCONNECTED_DISCONNECT_CALLED, "client closed", false);
-                // processDisconnect returns early when the client is already disconnected, so the pending
-                // commands (a refresh among them) and the rpc calls which wait for a connection are failed
-                // here, before the executor shuts down.
-                for (CompletableFuture<Protocol.Reply> f : Client.this.futures.values()) {
-                    f.completeExceptionally(new IOException());
-                }
-                Client.this.rpcSession.onTransportLost(false);
-                Client.this.auth.failWaiting();
+                Client.this.failPendingOnClose();
                 Client.this.setState(ClientState.CLOSED);
                 if (Client.this.ws != null) {
                     Client.this.ws.cancel();
@@ -333,6 +338,16 @@ public class Client {
             return this.executor.awaitTermination(awaitMilliseconds, TimeUnit.MILLISECONDS);
         }
         return false;
+    }
+
+    // Fails the pending commands (a refresh among them) and the rpc calls which wait for a connection.
+    // processDisconnect returns early when the client is already disconnected, so close calls this too.
+    private void failPendingOnClose() {
+        for (CompletableFuture<Protocol.Reply> f : this.futures.values()) {
+            f.completeExceptionally(new IOException());
+        }
+        this.rpcSession.onTransportLost(false);
+        this.auth.failWaiting();
     }
 
     void processDisconnect(int code, String reason, Boolean shouldReconnect) {
@@ -1065,7 +1080,7 @@ public class Client {
         if (this.opts.getName().length() > 0) build.setName(this.opts.getName());
         if (this.opts.getVersion().length() > 0) build.setVersion(this.opts.getVersion());
         if (this.data != null) build.setData(this.data);
-        if (this.opts.getInstance().length() > 0) build.setInstance(this.opts.getInstance());
+        if (this.instance.length() > 0) build.setInstance(this.instance);
         if (this.serverSubs.size() > 0) {
             for (Map.Entry<String, ServerSubscription> entry : this.serverSubs.entrySet()) {
                 Protocol.SubscribeRequest.Builder subReqBuild = Protocol.SubscribeRequest.newBuilder();
@@ -1433,12 +1448,9 @@ public class Client {
         return call;
     }
 
+    // Executor already shut down: close completed the call.
     void cancelRpc(RpcCall call) {
-        try {
-            this.executor.submit(() -> Client.this.rpcSession.cancel(call));
-        } catch (RejectedExecutionException ignored) {
-            // Executor already shut down: close completed the call.
-        }
+        Extensions.submitOrIgnore(this.executor, () -> Client.this.rpcSession.cancel(call));
     }
 
     /**
@@ -1627,9 +1639,12 @@ public class Client {
      * On success the callback gets the identity the server reports after the refresh, and the
      * refresh timer is rescheduled from the new TTL. An error leaves the connection and its
      * identity as they were. Calls to {@link #rpc} issued while the refresh is in flight are sent
-     * after its reply, so they run under the new identity. Refresh calls are sent one after
-     * another, each with its own token, in call order. At most 32 refreshes are in progress: a refresh
-     * beyond that calls back with {@link ReplyError#LIMIT_EXCEEDED}.
+     * after its reply, so they run under the new identity. Refresh commands are sent one after
+     * another, in call order. A refresh with the same token as the last refresh still pending shares
+     * its command and its callback; a refresh with another token waits for it. At most 32 refresh calls
+     * are in progress: a refresh beyond that calls back with {@link ReplyError#LIMIT_EXCEEDED}. A refresh
+     * made while the client is not connected sets the token the next connect sends; when the server
+     * refuses it, the previous token is restored.
      *
      * @param token: new connection token, must not be null.
      * @param cb:    will be called when the refresh reply is received or an error happened.

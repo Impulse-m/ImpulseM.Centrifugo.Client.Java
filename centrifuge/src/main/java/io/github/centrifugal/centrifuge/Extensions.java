@@ -58,6 +58,19 @@ final class Extensions {
 
 
     /**
+     * Submits the task to the executor, and drops it once the executor is shut down: the client is
+     * closed then, and the state the task would change went with it.
+     */
+    static void submitOrIgnore(ExecutorService executor, Runnable task) {
+        try {
+            executor.submit(task);
+        } catch (RejectedExecutionException ignored) {
+            // The client is closed.
+        }
+    }
+
+
+    /**
      * The failure a dependent stage wrapped in a {@link CompletionException}, or the failure itself
      * when nothing was wrapped.
      */

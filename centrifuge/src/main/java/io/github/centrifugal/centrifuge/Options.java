@@ -120,6 +120,7 @@ public class Options {
      * installation or per tab and stores itself. It must match {@code [A-Za-z0-9_-]{22,64}}
      * (at least 128 bits). The server scopes exactly-once RPC records by it, so whoever knows
      * it can retransmit and cancel calls in its scope: never log or share it. Null clears it.
+     * Read when the client is created: a later change does not reach that client.
      *
      * @throws IllegalArgumentException when the value does not match the pattern.
      */
