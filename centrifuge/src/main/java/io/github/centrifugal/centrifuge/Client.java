@@ -249,7 +249,7 @@ public class Client {
      * that carried one. Local time when no such reply has been seen.
      */
     public long serverTimeMillis() {
-        return System.currentTimeMillis() + this.serverTimeOffset;
+        return Extensions.estimateServerTime(System.currentTimeMillis(), this.serverTimeOffset);
     }
 
     private int _id = 0;
@@ -1070,7 +1070,7 @@ public class Client {
 
     // The refresh timer fired. AuthRefresh fetches a token and refreshes with it, on the executor.
     void sendRefresh(long generation) {
-        this.executor.submit(() -> this.auth.onTimer(generation));
+        Extensions.submitOrIgnore(this.executor, () -> this.auth.onTimer(generation));
     }
 
     private void sendConnect() {
@@ -1135,10 +1135,11 @@ public class Client {
         this.processDisconnect(DISCONNECTED_UNAUTHORIZED, "unauthorized", false);
     }
 
-    // A reply without a server time keeps the last offset. The proto zero value (0) means unset.
+    // A reply without a server time keeps the last offset.
     private void observeServerTime(Protocol.Reply reply) {
-        if (reply.getTime() != 0) {
-            this.serverTimeOffset = reply.getTime() - System.currentTimeMillis();
+        Long offset = Extensions.serverTimeOffsetFrom(reply.getTime(), System.currentTimeMillis());
+        if (offset != null) {
+            this.serverTimeOffset = offset;
         }
     }
 

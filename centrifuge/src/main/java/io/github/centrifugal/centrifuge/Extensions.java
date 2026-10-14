@@ -45,6 +45,25 @@ final class Extensions {
 
 
     /**
+     * Offset of the server clock from the local clock, from the server time of a reply and
+     * the local time it arrived at. Null when the reply carries no server time: the proto
+     * zero value (0) means unset.
+     */
+    static Long serverTimeOffsetFrom(long serverTime, long localTime) {
+        if (serverTime == 0) {
+            return null;
+        }
+        return serverTime - localTime;
+    }
+
+
+    /** Server time estimated from a local time and the offset of the server clock. */
+    static long estimateServerTime(long localTime, long offset) {
+        return localTime + offset;
+    }
+
+
+    /**
      * Runs the task on the executor. Once the executor is shut down it rejects the task, and the task
      * then runs on the calling thread, so a callback which the task delivers still runs exactly once.
      */

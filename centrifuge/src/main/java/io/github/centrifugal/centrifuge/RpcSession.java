@@ -481,7 +481,7 @@ final class RpcSession {
         resendWaiting.add(call);
         call.resendGeneration++;
         final int generation = call.resendGeneration;
-        call.resendTask = client.getScheduler().schedule(() -> client.getExecutor().submit(() -> resendLater(call, generation)), delayNanos, TimeUnit.NANOSECONDS);
+        call.resendTask = client.getScheduler().schedule(() -> Extensions.submitOrIgnore(client.getExecutor(), () -> resendLater(call, generation)), delayNanos, TimeUnit.NANOSECONDS);
     }
 
 
@@ -546,7 +546,7 @@ final class RpcSession {
     // Keeps the attempt of a call which settled locally, so that a late reply is acked. The attempt is
     // forgotten one call timeout later, or with the transport.
     private void keepLate(RpcCall call) {
-        call.lateTask = client.getScheduler().schedule(() -> client.getExecutor().submit(() -> forgetLate(call)), call.timeout, TimeUnit.MILLISECONDS);
+        call.lateTask = client.getScheduler().schedule(() -> Extensions.submitOrIgnore(client.getExecutor(), () -> forgetLate(call)), call.timeout, TimeUnit.MILLISECONDS);
     }
 
 

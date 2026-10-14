@@ -6,6 +6,7 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 
@@ -29,6 +30,32 @@ public class ExtensionsTest {
         assertFalse(Extensions.hasFlag(0L, Extensions.RPC_OPTIONS_FLAG));
         assertFalse(Extensions.hasFlag(1L, Extensions.RPC_OPTIONS_FLAG));
         assertFalse(Extensions.hasFlag(1L << 31, Extensions.RPC_OPTIONS_FLAG));
+    }
+
+
+    @Test
+    public void serverTimeOffsetIsServerTimeMinusLocalTime() {
+        assertEquals(Long.valueOf(500L), Extensions.serverTimeOffsetFrom(1_000_500L, 1_000_000L));
+        assertEquals(Long.valueOf(-250L), Extensions.serverTimeOffsetFrom(999_750L, 1_000_000L));
+    }
+
+
+    @Test
+    public void zeroServerTimeMeansNoOffset() {
+        assertNull(Extensions.serverTimeOffsetFrom(0L, 1_000_000L));
+    }
+
+
+    @Test
+    public void estimatedServerTimeAddsOffsetToLocalTime() {
+        assertEquals(1_000_500L, Extensions.estimateServerTime(1_000_000L, 500L));
+        assertEquals(999_750L, Extensions.estimateServerTime(1_000_000L, -250L));
+    }
+
+
+    @Test
+    public void estimatedServerTimeIsLocalTimeWithoutOffset() {
+        assertEquals(1_000_000L, Extensions.estimateServerTime(1_000_000L, 0L));
     }
 
 
