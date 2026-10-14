@@ -14,6 +14,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
@@ -30,7 +31,11 @@ import static org.junit.Assert.fail;
  * The fake server keeps the record a dedup store would: a call runs once per msg_id, and a
  * resend gets the stored answer.
  */
-public class RpcExactlyOnceTest extends FakeServerTestBase {
+public class RpcExactlyOnceTest extends RpcTestBase {
+    // Server error for a msg_id outside its window. The code is server-configurable, the test
+    // only pins that the client surfaces it as a reply error.
+    private static final int MSG_ID_INVALID = 107;
+
     // msg_id -> payload of the calls the fake server ran.
     private final Map<Long, byte[]> records = new ConcurrentHashMap<>();
     private final AtomicInteger executions = new AtomicInteger();
@@ -353,7 +358,7 @@ public class RpcExactlyOnceTest extends FakeServerTestBase {
         Client c = newClient(options);
         connect(c);
 
-        assertEquals("abcdefghijklmnopqrstuv", connectRequest().getInstance());
+        assertEquals("abcdefghijklmnopqrstuv", lastConnectRequest().getInstance());
     }
 
 
@@ -362,7 +367,193 @@ public class RpcExactlyOnceTest extends FakeServerTestBase {
         Client c = newClient();
         connect(c);
 
-        assertEquals("", connectRequest().getInstance());
+        assertEquals("", lastConnectRequest().getInstance());
+    }
+
+
+    @Test
+    public void msgIdUsesTheServerClockForACallQueuedBeforeConnect() throws Exception {
+        enableRpcOptions();
+        AtomicLong serverTime = new AtomicLong(System.currentTimeMillis() - 40_000L);
+        answerWithServerTime(serverTime);
+        Client c = newClient();
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("early", EMPTY_PAYLOAD, into(future));
+        long serverSecond = serverTime.get() / 1000L;
+
+        connect(c);
+
+        future.get(5, TimeUnit.SECONDS);
+        long msgId = sentRpcRequests().get(0).getMsgId();
+        assertTrue("time part is the server second", Math.abs((msgId >> Extensions.MSG_ID_SEQUENCE_BITS) - serverSecond) <= 5);
+    }
+
+
+    @Test
+    public void msgIdTimePartFollowsAServerClockThatMovedBack() throws Exception {
+        enableRpcOptions();
+        AtomicLong serverTime = new AtomicLong(System.currentTimeMillis() + 120_000L);
+        answerWithServerTime(serverTime);
+        Client c = newClient();
+        connect(c);
+        callAndWait(c);
+        long ahead = sentRpcRequests().get(0).getMsgId() >> Extensions.MSG_ID_SEQUENCE_BITS;
+
+        serverTime.set(System.currentTimeMillis());
+        callAndWait(c);
+        callAndWait(c);
+
+        long corrected = sentRpcRequests().get(2).getMsgId() >> Extensions.MSG_ID_SEQUENCE_BITS;
+        assertTrue("the first call used the clock before the correction", ahead > System.currentTimeMillis() / 1000L + 100);
+        assertTrue("the third call uses the corrected clock", Math.abs(corrected - System.currentTimeMillis() / 1000L) <= 5);
+    }
+
+
+    @Test
+    public void lostCallsBeyondTheBoundFailAndTheOldestAreKept() throws Exception {
+        enableRpcOptions();
+        serveDedup();
+        Options options = new Options();
+        options.setMaxPendingRpc(2);
+        Client c = newClient(options);
+        connect(c);
+        holdCalls.set(true);
+        List<CompletableFuture<RPCResult>> futures = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            CompletableFuture<RPCResult> future = new CompletableFuture<>();
+            futures.add(future);
+            c.rpcCall("step" + i, EMPTY_PAYLOAD, into(future));
+        }
+        for (int i = 0; i < 3; i++) {
+            assertTrue("call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
+        }
+
+        holdCalls.set(false);
+        server.closeConnection();
+
+        assertEquals(ReplyError.LIMIT_EXCEEDED, replyErrorOf(futures.get(2)).getCode());
+        futures.get(0).get(5, TimeUnit.SECONDS);
+        futures.get(1).get(5, TimeUnit.SECONDS);
+        List<Protocol.RPCRequest> requests = sentRpcRequests();
+        assertEquals(5, requests.size());
+        assertEquals(requests.get(0).getMsgId(), requests.get(3).getMsgId());
+        assertEquals(requests.get(1).getMsgId(), requests.get(4).getMsgId());
+        assertTrue(requests.get(3).getRetransmit());
+    }
+
+
+    @Test
+    public void cancelledLostCallsDoNotUseTheQueueBound() throws Exception {
+        enableRpcOptions();
+        serveDedup();
+        Options options = new Options();
+        options.setMaxPendingRpc(2);
+        Client c = newClient(options);
+        connect(c);
+        connectArrivals.drainPermits();
+        holdCalls.set(true);
+        holdConnect.set(true);
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        CompletableFuture<RPCResult> second = new CompletableFuture<>();
+        RpcCall firstCall = c.rpcCall("a", EMPTY_PAYLOAD, into(first));
+        RpcCall secondCall = c.rpcCall("b", EMPTY_PAYLOAD, into(second));
+        assertTrue("first call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
+        assertTrue("second call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
+        long firstMsgId = sentRpcRequests().get(0).getMsgId();
+        long secondMsgId = sentRpcRequests().get(1).getMsgId();
+        server.closeConnection();
+        assertTrue("reconnect started", connectArrivals.tryAcquire(5, TimeUnit.SECONDS));
+
+        firstCall.cancel();
+        secondCall.cancel();
+
+        assertEquals(ReplyError.CANCELLED, replyErrorOf(first).getCode());
+        assertEquals(ReplyError.CANCELLED, replyErrorOf(second).getCode());
+        CompletableFuture<RPCResult> accepted = new CompletableFuture<>();
+        c.rpcCall("c", EMPTY_PAYLOAD, into(accepted));
+        holdConnect.set(false);
+        holdCalls.set(false);
+        server.releaseDeferredCommands();
+
+        accepted.get(5, TimeUnit.SECONDS);
+        assertEquals(firstMsgId, awaitCancel(firstMsgId).getCancel());
+        assertEquals(secondMsgId, awaitCancel(secondMsgId).getCancel());
+    }
+
+
+    @Test
+    public void cancelOfAQueuedCallWhileConnectingIsLocal() throws Exception {
+        enableRpcOptions();
+        answerRpcs("ok");
+        server.deferCommand = cmd -> cmd.hasConnect();
+        Client c = newClient();
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        RpcCall call = c.rpcCall("queued", EMPTY_PAYLOAD, into(future));
+        c.connect();
+        awaitCondition("connect sent", () -> server.received().stream().anyMatch(Protocol.Command::hasConnect));
+
+        call.cancel();
+
+        assertEquals(ReplyError.CANCELLED, replyErrorOf(future).getCode());
+        server.releaseDeferredCommands();
+        assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+        callAndWait(c);
+        for (Protocol.RPCRequest request : sentRpcRequests()) {
+            assertFalse("the cancelled call is never sent", "queued".equals(request.getMethod()));
+        }
+    }
+
+
+    @Test
+    public void msgIdInvalidIsSurfacedAndNotResent() throws Exception {
+        enableRpcOptions();
+        server.onCommand = cmd -> {
+            if (!cmd.hasRpc()) {
+                return null;
+            }
+            return Protocol.Reply.newBuilder()
+                    .setId(cmd.getId())
+                    .setError(Protocol.Error.newBuilder().setCode(MSG_ID_INVALID).setMessage("msg_id outside the window"))
+                    .build();
+        };
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("late", EMPTY_PAYLOAD, into(future));
+
+        ReplyError error = (ReplyError) errorOf(future);
+
+        assertEquals(MSG_ID_INVALID, error.getCode());
+        assertEquals("the call is rejected, not sent again", 1, sentRpcRequests().size());
+    }
+
+
+    // Answers connects and rpc calls with the server time the test holds, so the test moves the clock.
+    private void answerWithServerTime(AtomicLong serverTime) {
+        server.onCommand = cmd -> {
+            if (cmd.hasConnect()) {
+                return Protocol.Reply.newBuilder()
+                        .setId(cmd.getId())
+                        .setTime(serverTime.get())
+                        .setConnect(server.connectResult)
+                        .build();
+            }
+            if (!cmd.hasRpc()) {
+                return null;
+            }
+            return Protocol.Reply.newBuilder()
+                    .setId(cmd.getId())
+                    .setTime(serverTime.get())
+                    .setRpc(Protocol.RPCResult.newBuilder().setData(com.google.protobuf.ByteString.copyFromUtf8("ok")))
+                    .build();
+        };
+    }
+
+
+    private static void callAndWait(Client c) throws Exception {
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("m", EMPTY_PAYLOAD, into(future));
+        future.get(5, TimeUnit.SECONDS);
     }
 
 
@@ -405,39 +596,6 @@ public class RpcExactlyOnceTest extends FakeServerTestBase {
             }
             return cmd.hasRpc() && cmd.getRpc().getCancel() == 0;
         };
-    }
-
-
-    private Protocol.ConnectRequest connectRequest() {
-        for (Protocol.Command cmd : server.received()) {
-            if (cmd.hasConnect()) {
-                return cmd.getConnect();
-            }
-        }
-        throw new AssertionError("no connect request was sent");
-    }
-
-
-    private Protocol.RPCRequest awaitCancel(long msgId) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 5000;
-        while (System.currentTimeMillis() < deadline) {
-            for (Protocol.RPCRequest request : sentRpcRequests()) {
-                if (request.getCancel() == msgId) {
-                    return request;
-                }
-            }
-            Thread.sleep(10);
-        }
-        throw new AssertionError("no cancel was sent for msg_id " + msgId);
-    }
-
-
-    private void awaitRequestCount(int count) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 5000;
-        while (sentRpcRequests().size() < count && System.currentTimeMillis() < deadline) {
-            Thread.sleep(10);
-        }
-        assertEquals(count, sentRpcRequests().size());
     }
 
 
