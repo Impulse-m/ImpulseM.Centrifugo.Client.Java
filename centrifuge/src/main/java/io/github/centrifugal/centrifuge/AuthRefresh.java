@@ -41,12 +41,11 @@ final class AuthRefresh {
     // A refused transition keeps the connection and its identity, and is reported without a
     // retry. A token which expired is retried by the timer with a fresh token.
     private static final int PERMISSION_DENIED = 103;
-    private static final int TOKEN_EXPIRED = 109;
-
-    private static final int RETRY_MIN_MILLIS = 10000;
-    private static final int RETRY_MAX_MILLIS = 20000;
 
     private final Client client;
+    // The bounds of the retry delay after a failed token fetch or refresh, in milliseconds.
+    private final int retryMinMillis;
+    private final int retryMaxMillis;
     private final Backoff backoff = new Backoff();
     // The refresh in flight is the one which runs now. The refreshes waiting for it run in order.
     private boolean inFlight = false;
@@ -64,8 +63,10 @@ final class AuthRefresh {
     private volatile String currentAuthClass = "";
 
 
-    AuthRefresh(Client client) {
+    AuthRefresh(Client client, int retryMinMillis, int retryMaxMillis) {
         this.client = client;
+        this.retryMinMillis = retryMinMillis;
+        this.retryMaxMillis = retryMaxMillis;
     }
 
 
@@ -145,7 +146,7 @@ final class AuthRefresh {
 
 
     private void scheduleRetry() {
-        scheduleTimer(backoff.duration(0, RETRY_MIN_MILLIS, RETRY_MAX_MILLIS), TimeUnit.MILLISECONDS);
+        scheduleTimer(backoff.duration(0, retryMinMillis, retryMaxMillis), TimeUnit.MILLISECONDS);
     }
 
 
@@ -224,7 +225,7 @@ final class AuthRefresh {
         client.reportError(new RefreshError(error));
         if (error instanceof ReplyError) {
             ReplyError replyError = (ReplyError) error;
-            if (replyError.isTemporary() || replyError.getCode() == TOKEN_EXPIRED) {
+            if (replyError.isTemporary() || replyError.getCode() == Client.ERROR_CODE_TOKEN_EXPIRED) {
                 scheduleRetry();
             } else if (replyError.getCode() != PERMISSION_DENIED) {
                 client.processDisconnect(replyError.getCode(), replyError.getMessage(), false);

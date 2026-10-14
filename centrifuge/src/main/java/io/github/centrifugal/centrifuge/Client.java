@@ -170,6 +170,14 @@ public class Client {
     // impossible (only sent when SUBSCRIPTION_FLAG_REJECT_UNRECOVERED was requested).
     static final int ERROR_CODE_UNRECOVERABLE_POSITION = 112;
 
+    // Server error code of an expired connection token: the connect and the timer refresh retry it
+    // with a fresh token.
+    static final int ERROR_CODE_TOKEN_EXPIRED = 109;
+
+    // Bounds of the retry delay after a failed token fetch or refresh, in milliseconds.
+    static final int AUTH_RETRY_MIN_MILLIS = 10000;
+    static final int AUTH_RETRY_MAX_MILLIS = 20000;
+
     // Server-sent "state invalidated" codes. The server determines that the
     // client's cached state and/or token are no longer valid and asks the client
     // to drop them and re-sync.
@@ -190,12 +198,17 @@ public class Client {
      * @param listener: client event handler.
      */
     public Client(final String endpoint, final Options opts, final EventListener listener) {
+        this(endpoint, opts, listener, AUTH_RETRY_MIN_MILLIS, AUTH_RETRY_MAX_MILLIS);
+    }
+
+    // The retry bounds of the token refresh are a parameter so that the tests do not wait for the defaults.
+    Client(final String endpoint, final Options opts, final EventListener listener, final int authRetryMinMillis, final int authRetryMaxMillis) {
         this.endpoint = endpoint;
         this.opts = opts;
         this.listener = listener;
         this.backoff = new Backoff();
         this.rpcSession = new RpcSession(this, opts.getMaxPendingRpc());
-        this.auth = new AuthRefresh(this);
+        this.auth = new AuthRefresh(this, authRetryMinMillis, authRetryMaxMillis);
         this.token = opts.getToken();
         if (opts.getData() != null) {
             this.data = com.google.protobuf.ByteString.copyFrom(opts.getData());
@@ -928,7 +941,7 @@ public class Client {
         }
         if (reply.getError().getCode() != 0) {
             this.handleConnectionError(this.getReplyError(reply));
-            if (reply.getError().getCode() == 109) { // Token expired.
+            if (reply.getError().getCode() == ERROR_CODE_TOKEN_EXPIRED) {
                 this.refreshRequired = true;
                 this.ws.close(NORMAL_CLOSURE_STATUS, "");
             } else if (reply.getError().getTemporary()) {

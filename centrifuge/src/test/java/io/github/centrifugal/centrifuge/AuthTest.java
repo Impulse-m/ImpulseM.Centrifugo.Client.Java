@@ -28,11 +28,13 @@ import static org.junit.Assert.assertTrue;
  */
 public class AuthTest extends RpcTestBase {
     private static final int PERMISSION_DENIED = 103;
+    private static final int TOKEN_EXPIRED = 109;
 
     private static final long ONE_SECOND_NANOS = 1_000_000_000L;
 
-    // Longer than the longest delay the refresh timer waits before a retry.
-    private static final long NO_RETRY_WINDOW_MILLIS = 21_000L;
+    // Retry bounds of the tests which wait for a retry: far shorter than the client defaults.
+    private static final int FAST_RETRY_MIN_MILLIS = 50;
+    private static final int FAST_RETRY_MAX_MILLIS = 100;
 
 
     private final List<String> authLog = new CopyOnWriteArrayList<>();
@@ -236,7 +238,7 @@ public class AuthTest extends RpcTestBase {
     public void refusedTimerRefreshIsNotRetried() throws Exception {
         server.connectResult = expiringResult("u1", "authenticated", 1);
         List<Long> fetchTimes = new CopyOnWriteArrayList<>();
-        newAuthClient(optionsWithTokenGetter(fetchTimes));
+        newAuthClient(optionsWithTokenGetter(fetchTimes), FAST_RETRY_MIN_MILLIS, FAST_RETRY_MAX_MILLIS);
         connect(client);
         server.onCommand = (Protocol.Command cmd) ->{
             if (!cmd.hasRefresh()) {
@@ -250,11 +252,50 @@ public class AuthTest extends RpcTestBase {
         awaitCondition("refused refresh sent", () -> refreshTokens().size() == 1);
         awaitCondition("refresh error reported", () -> !errorEvents.isEmpty());
 
-        Thread.sleep(NO_RETRY_WINDOW_MILLIS);
+        // A retry would be scheduled within the fast retry bound, so this window shows one if it exists.
+        Thread.sleep(300L);
 
         assertEquals("the refused refresh is not sent again", 1, refreshTokens().size());
         assertEquals("the token is not fetched again", 1, fetchTimes.size());
         assertEquals(ClientState.CONNECTED, client.getState());
+    }
+
+
+    @Test
+    public void timerRefreshWithAnExpiredTokenRetriesWithAFreshToken() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        AtomicInteger fetches = new AtomicInteger();
+        Options options = new Options();
+        options.setToken("token-initial");
+        options.setTokenGetter(new ConnectionTokenGetter() {
+            @Override
+            public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
+                cb.Done(null, "token-" + fetches.incrementAndGet());
+            }
+        });
+        newAuthClient(options, FAST_RETRY_MIN_MILLIS, FAST_RETRY_MAX_MILLIS);
+        connect(client);
+        server.onCommand = (Protocol.Command cmd) -> {
+            if (!cmd.hasRefresh()) {
+                return null;
+            }
+            if ("token-1".equals(cmd.getRefresh().getToken())) {
+                return Protocol.Reply.newBuilder()
+                        .setId(cmd.getId())
+                        .setError(Protocol.Error.newBuilder().setCode(TOKEN_EXPIRED).setMessage("token expired"))
+                        .build();
+            }
+            return Protocol.Reply.newBuilder()
+                    .setId(cmd.getId())
+                    .setRefresh(Protocol.RefreshResult.newBuilder().setUser("u1").setAuthClass("authenticated").setExpires(true).setTtl(1))
+                    .build();
+        };
+
+        awaitCondition("retry sent with a fresh token", () -> refreshTokens().size() >= 2);
+
+        assertEquals(Arrays.asList("token-1", "token-2"), refreshTokens().subList(0, 2));
+        assertEquals(ClientState.CONNECTED, client.getState());
+        assertFalse(disconnectedSignals.tryAcquire());
     }
 
 
@@ -461,7 +502,17 @@ public class AuthTest extends RpcTestBase {
 
 
     private void newAuthClient(Options options) {
-        newClient(options, new EventListener() {
+        newAuthClient(options, Client.AUTH_RETRY_MIN_MILLIS, Client.AUTH_RETRY_MAX_MILLIS);
+    }
+
+
+    private void newAuthClient(Options options, int retryMinMillis, int retryMaxMillis) {
+        client = new Client(server.url(), options, authListener(), retryMinMillis, retryMaxMillis);
+    }
+
+
+    private EventListener authListener() {
+        return new EventListener() {
             @Override
             public void onConnected(Client c, ConnectedEvent e) {
                 connectedEvents.add(e);
@@ -486,7 +537,7 @@ public class AuthTest extends RpcTestBase {
             public void onDisconnected(Client c, DisconnectedEvent e) {
                 disconnectedSignals.release();
             }
-        });
+        };
     }
 
 
