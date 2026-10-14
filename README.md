@@ -191,6 +191,18 @@ The refresh timer runs before the token expires. Its errors follow the upstream 
 | 103 permission denied | reported as an `ErrorEvent`, the connection and its identity are kept, and there is no retry. **Deviation:** upstream disconnects with 103. The server refused the identity change of the token the getter returned, and the same token would be refused again. The server ends the connection at its expiry, and the reconnect fetches a token from the getter, so the identity changes then. An application which needs the change now calls `refresh()` and handles 103. |
 | anything else | the connection is disconnected with the server's code, and does not reconnect (upstream) |
 
+## Client error codes
+
+The client reports the calls it did not send, or cancelled, with the codes of `ReplyError`. They are client-local, and the server never sends them:
+
+| Code | `ReplyError` constant | Meaning |
+|---|---|---|
+| 15 | `UNSUPPORTED` | the call was not sent: the connection cannot carry what it asks for (headers, or a cancel) |
+| 16 | `LIMIT_EXCEEDED` | the call was not sent: the calls of a client with an instance reached `Options.setMaxPendingRpc`, or the refreshes in progress reached 32 |
+| 17 | `CANCELLED` | the call was cancelled with `RpcCall.cancel()` |
+
+Codes 15 to 19 are reserved for client-local errors of the fork SDKs; a server never sends them.
+
 ## CI status
 
 [![Test](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/actions/workflows/ci.yml/badge.svg)](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/actions/workflows/ci.yml)

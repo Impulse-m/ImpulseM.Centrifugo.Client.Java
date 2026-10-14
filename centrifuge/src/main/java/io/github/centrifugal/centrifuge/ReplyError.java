@@ -6,19 +6,23 @@ import java.util.Map;
 
 public class ReplyError extends Throwable {
     /**
-     * Code of a call the client did not send because the server does not support RPC
-     * options (headers) on this connection.
+     * Client-local code of a call the client did not send, because the connection cannot carry what
+     * the call asks for: headers, or a cancel, on a server which does not support RPC options, or a
+     * cancel for a client without an instance. A server never sends this code.
      */
     public static final int UNSUPPORTED = 15;
 
     /**
-     * Code of a call the client did not send because too many rpc calls already wait for the
-     * connection, see {@link Options#setMaxPendingRpc(int)}.
+     * Client-local code of a call the client did not send, because a bound is reached: the calls
+     * of a client with an instance, see {@link Options#setMaxPendingRpc(int)}, or the refreshes in
+     * progress, see {@link Client#refresh}. A server never sends this code.
      */
     public static final int LIMIT_EXCEEDED = 16;
 
     /**
-     * Code of a call the client cancelled with {@link RpcCall#cancel()}.
+     * Client-local code of a call cancelled with {@link RpcCall#cancel()}. A deadline on a sent call
+     * rejects with {@link java.util.concurrent.TimeoutException}, not with this code. A server never
+     * sends this code.
      */
     public static final int CANCELLED = 17;
 
