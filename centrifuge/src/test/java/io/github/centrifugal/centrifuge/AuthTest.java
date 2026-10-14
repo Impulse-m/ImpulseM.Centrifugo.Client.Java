@@ -1,5 +1,6 @@
 package io.github.centrifugal.centrifuge;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -7,6 +8,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
@@ -367,6 +369,54 @@ public class AuthTest extends RpcTestBase {
         answerRefreshes("", "");
         refresh(client, "token-2").get(5, TimeUnit.SECONDS);
         assertEquals(Arrays.asList("/"), authLog);
+    }
+
+
+    @Test
+    public void refreshesWaitingForAnInFlightRefreshFailOnClose() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        newAuthClient(new Options());
+        connect(client);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+        CompletableFuture<AuthResult> first = refresh(client, "token-a");
+        CompletableFuture<AuthResult> second = refresh(client, "token-b");
+        awaitCondition("first refresh sent", () -> refreshTokens().size() == 1);
+
+        client.close(1000);
+
+        assertTrue("the refresh in flight fails with the close", errorOf(first) instanceof IOException);
+        assertTrue("the waiting refresh fails with the close", errorOf(second) instanceof IOException);
+        assertEquals("the waiting refresh is never sent", Arrays.asList("token-a"), refreshTokens());
+    }
+
+
+    @Test
+    public void refreshWhileDisconnectedIsFailedOnceByClose() throws Exception {
+        newAuthClient(new Options());
+        AtomicInteger callbacks = new AtomicInteger();
+        CompletableFuture<Throwable> failure = new CompletableFuture<>();
+
+        client.refresh("token-2", (Throwable error, AuthResult result) -> {
+            callbacks.incrementAndGet();
+            failure.complete(error);
+        });
+        client.close(1000);
+
+        assertTrue("close fails the refresh", failure.get(5, TimeUnit.SECONDS) instanceof IOException);
+        assertEquals("the callback runs once", 1, callbacks.get());
+    }
+
+
+    @Test
+    public void refreshDeadlineIsReportedAsTimeoutException() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        Options options = new Options();
+        options.setTimeout(500);
+        newAuthClient(options);
+        connect(client);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+
+        assertTrue("the deadline reports a timeout", errorOf(refresh(client, "token-2")) instanceof TimeoutException);
     }
 
 

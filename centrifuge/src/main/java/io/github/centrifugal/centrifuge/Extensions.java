@@ -1,5 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.regex.Pattern;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
@@ -57,6 +59,19 @@ final class Extensions {
             return NO_MSG_ID;
         }
         return lastMsgId + 1;
+    }
+
+
+    /**
+     * Runs the task on the executor. Once the executor is shut down it rejects the task, and the task
+     * then runs on the calling thread, so a callback which the task delivers still runs exactly once.
+     */
+    static void runOnExecutor(ExecutorService executor, Runnable task) {
+        try {
+            executor.submit(task);
+        } catch (RejectedExecutionException e) {
+            task.run();
+        }
     }
 
 

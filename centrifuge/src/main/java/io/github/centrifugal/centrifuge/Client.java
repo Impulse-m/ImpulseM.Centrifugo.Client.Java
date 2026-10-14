@@ -284,9 +284,14 @@ public class Client {
                 // (e.g. orTimeout/exceptionally re-submits) get queued before
                 // we mark the executor shutdown.
                 Client.this.processDisconnect(DISCONNECTED_DISCONNECT_CALLED, "client closed", false);
-                // processDisconnect returns early when the client is already disconnected, so the
-                // rpc calls which wait for a connection are failed here, before the executor shuts down.
+                // processDisconnect returns early when the client is already disconnected, so the pending
+                // commands (a refresh among them) and the rpc calls which wait for a connection are failed
+                // here, before the executor shuts down.
+                for (CompletableFuture<Protocol.Reply> f : Client.this.futures.values()) {
+                    f.completeExceptionally(new IOException());
+                }
                 Client.this.rpcSession.onTransportLost(false);
+                Client.this.auth.failWaiting();
                 Client.this.setState(ClientState.CLOSED);
                 if (Client.this.ws != null) {
                     Client.this.ws.cancel();
@@ -1638,9 +1643,9 @@ public class Client {
                 cb.onDone(null, replyResult);
             }
         }).orTimeout(this.opts.getTimeout(), TimeUnit.MILLISECONDS).exceptionally(e -> {
-            this.executor.submit(() -> {
+            Extensions.runOnExecutor(this.executor, () -> {
                 Client.this.cleanCommandFuture(cmd);
-                cb.onDone(e, null);
+                cb.onDone(Extensions.unwrapCompletion(e), null);
             });
             return null;
         });

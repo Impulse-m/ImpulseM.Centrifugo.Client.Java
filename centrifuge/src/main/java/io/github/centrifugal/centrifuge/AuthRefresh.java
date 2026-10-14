@@ -1,5 +1,6 @@
 package io.github.centrifugal.centrifuge;
 
+import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.concurrent.ScheduledFuture;
@@ -14,10 +15,28 @@ import okhttp3.WebSocket;
 /**
  * The refreshes of the connection token: the refresh a caller asks for with
  * {@link Client#refresh}, and the timer which refreshes before the token expires. One refresh is
- * in flight at a time, the others wait their turn. The rpc calls wait for the refresh in flight,
- * see {@link RpcSession}. Used on the client's executor thread only.
+ * in flight at a time, the others wait their turn. The rpc calls wait for the refresh command in
+ * flight, see {@link RpcSession}. Used on the client's executor thread only.
+ * <p>
+ * The fetch and retry loop of the timer mirrors {@code Subscription.sendRefresh}. It is kept here,
+ * so that the subscription code stays as it is.
  */
 final class AuthRefresh {
+    // A refresh which waits for the refresh in flight. A requested refresh carries its token and
+    // callback. A timer refresh carries neither: it fetches its token when it starts.
+    private static final class Waiting {
+        final String token;
+        final ResultCallback<AuthResult> callback;
+
+
+        Waiting(String token, ResultCallback<AuthResult> callback) {
+            this.token = token;
+            this.callback = callback;
+        }
+    }
+
+
+
     // A refused transition keeps the connection and its identity, and is reported without a
     // retry. A token which expired is retried by the timer with a fresh token.
     private static final int PERMISSION_DENIED = 103;
@@ -30,7 +49,7 @@ final class AuthRefresh {
     private final Backoff backoff = new Backoff();
     // The refresh in flight is the one which runs now. The refreshes waiting for it run in order.
     private boolean inFlight = false;
-    private final Deque<Runnable> waiting = new ArrayDeque<>();
+    private final Deque<Waiting> waiting = new ArrayDeque<>();
     // The scheduled refresh. The generation is bumped on each cancel, so a timer which fired
     // after its cancel does nothing.
     private ScheduledFuture<?> timer;
@@ -54,7 +73,26 @@ final class AuthRefresh {
 
     /** Refreshes the connection with a token the caller gave. Runs on the executor. */
     void refreshWith(String token, ResultCallback<AuthResult> cb) {
-        run(() -> client.sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> client.getExecutor().submit(() -> finishRequested(token, error, result, cb))));
+        if (inFlight) {
+            waiting.add(new Waiting(token, cb));
+            return;
+        }
+        inFlight = true;
+        startRequested(token, cb);
+    }
+
+
+    /**
+     * Fails the refreshes which wait for the refresh in flight, as the client closes. Runs on the
+     * executor, after the connection is torn down.
+     */
+    void failWaiting() {
+        while (!waiting.isEmpty()) {
+            Waiting next = waiting.poll();
+            if (next.callback != null) {
+                next.callback.onDone(new IOException(), null);
+            }
+        }
     }
 
 
@@ -113,7 +151,12 @@ final class AuthRefresh {
             return;
         }
         timer = null;
-        run(this::fetchAndRefresh);
+        if (inFlight) {
+            waiting.add(new Waiting(null, null));
+            return;
+        }
+        inFlight = true;
+        fetchAndRefresh();
     }
 
 
@@ -147,7 +190,7 @@ final class AuthRefresh {
             complete();
             return;
         }
-        client.sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> client.getExecutor().submit(() -> finishTimer(transport, token, error, result)));
+        client.sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishTimer(transport, token, error, result)));
     }
 
 
@@ -194,14 +237,9 @@ final class AuthRefresh {
     }
 
 
-    // Starts the attempt now, or once the refresh in flight is over.
-    private void run(Runnable attempt) {
-        if (inFlight) {
-            waiting.add(attempt);
-            return;
-        }
-        inFlight = true;
-        attempt.run();
+    // Sends the refresh command with the token the caller gave.
+    private void startRequested(String token, ResultCallback<AuthResult> cb) {
+        client.sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishRequested(token, error, result, cb)));
     }
 
 
@@ -211,7 +249,12 @@ final class AuthRefresh {
         inFlight = false;
         if (!waiting.isEmpty()) {
             inFlight = true;
-            waiting.poll().run();
+            Waiting next = waiting.poll();
+            if (next.callback == null) {
+                fetchAndRefresh();
+            } else {
+                startRequested(next.token, next.callback);
+            }
             return;
         }
         client.flushRpc();
