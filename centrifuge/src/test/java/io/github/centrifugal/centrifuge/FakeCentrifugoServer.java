@@ -176,6 +176,12 @@ public final class FakeCentrifugoServer {
         }
 
         @Override
+        public void onClosing(WebSocket webSocket, int code, String reason) {
+            // Completes the close handshake the way a server does, so a client which closes first is closed.
+            webSocket.close(code, reason);
+        }
+
+        @Override
         public void onMessage(WebSocket webSocket, ByteString bytes) {
             InputStream stream = new ByteArrayInputStream(bytes.toByteArray());
             try {
