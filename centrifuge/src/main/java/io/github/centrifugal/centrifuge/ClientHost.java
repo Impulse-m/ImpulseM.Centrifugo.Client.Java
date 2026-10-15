@@ -123,8 +123,16 @@ final class ClientHost {
     }
 
 
+    /**
+     * Reports a failure of the protocol handling as an error event, wrapped in an {@link UnclassifiedError}. A listener
+     * which throws on the report cannot end the handling which reports, so its failure is printed here.
+     */
     void reportUnclassified(Throwable cause) {
-        Extensions.reportUnclassified(client.listener, client, cause);
+        try {
+            client.listener.onError(client, new ErrorEvent(new UnclassifiedError(cause)));
+        } catch (Throwable failure) {
+            failure.printStackTrace();
+        }
     }
 
 

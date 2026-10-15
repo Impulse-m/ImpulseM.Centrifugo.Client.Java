@@ -126,20 +126,6 @@ final class Extensions {
     }
 
 
-    /**
-     * Reports a failure of the protocol handling to the listener as an error event, wrapped in an
-     * {@link UnclassifiedError}. A listener which throws on the report cannot end the handling which
-     * reports, so its failure is printed here.
-     */
-    static void reportUnclassified(EventListener listener, Client client, Throwable cause) {
-        try {
-            listener.onError(client, new ErrorEvent(new UnclassifiedError(cause)));
-        } catch (Throwable failure) {
-            failure.printStackTrace();
-        }
-    }
-
-
     private Extensions() {
     }
 }
