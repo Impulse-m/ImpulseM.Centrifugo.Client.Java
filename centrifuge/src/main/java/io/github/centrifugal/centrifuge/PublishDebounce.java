@@ -35,7 +35,8 @@ final class PublishDebounce {
             return;
         }
         this.pending = data;
-        cb.onDone(null, new PublishResult());
+        // Runs as its own executor task, so a throwing callback cannot reach the error stage of the publish chain.
+        this.client.getExecutor().submit(() -> cb.onDone(null, new PublishResult()));
     }
 
 
