@@ -120,11 +120,13 @@ final class RpcSession {
 
     /**
      * Cancels the call. A call which was never sent is never sent, and is rejected with CANCELLED
-     * whatever the connection state: nothing reached the server. A sent call on a connection whose
-     * server does not support RPC options, or of a client without an instance, is rejected with
-     * UNSUPPORTED, since the server cannot cancel anything. While the capability is not known, the call
-     * which was not sent is rejected with CANCELLED. A call whose current msg_id was never written, a new
-     * msg_id still queued after a refusal, is rejected with CANCELLED and nothing is sent for that id.
+     * whatever the connection state: nothing reached the server. A sent call of a client without an
+     * instance is rejected with UNSUPPORTED whatever the connection state: its calls are plain, so the
+     * server has no record of them. A sent call on a connected server which does not support RPC options
+     * is rejected with UNSUPPORTED too, since the server cannot cancel anything. While the capability is
+     * not known, a sent tracked call is rejected with CANCELLED at once, and its cancel is kept for the next
+     * connection which confirms RPC options. A call whose current msg_id was never written, a new msg_id still
+     * queued after a refusal, is rejected with CANCELLED and nothing is sent for that id.
      */
     void cancel(RpcCall call) {
         if (call.future.isDone()) {
@@ -136,15 +138,15 @@ final class RpcSession {
             call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
             return;
         }
-        if (client.getState() == ClientState.CONNECTED && !client.hasRpcOptions()) {
-            queue.remove(call);
-            call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel is not supported by the server", false));
-            return;
-        }
-        if (client.getState() == ClientState.CONNECTED && !client.hasInstance()) {
+        if (!client.hasInstance()) {
             // Without an instance the calls are plain: the server has no record of them to cancel.
             queue.remove(call);
             call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel needs the instance option", false));
+            return;
+        }
+        if (client.getState() == ClientState.CONNECTED && !client.hasRpcOptions()) {
+            queue.remove(call);
+            call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel is not supported by the server", false));
             return;
         }
         queue.remove(call);
