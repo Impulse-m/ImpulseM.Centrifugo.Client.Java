@@ -284,7 +284,12 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         serveDedup();
         AtomicBoolean failTheNextFlush = new AtomicBoolean();
         BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
-        Client c = newClientWithFailingCancelSend(reported, failTheNextFlush, new IllegalStateException("transport failed inside the send"), true);
+        Client c = newClientWithFailingSend(
+                reported,
+                failTheNextFlush,
+                new IllegalStateException("transport failed inside the send"),
+                true,
+                true);
         connect(c);
         holdCalls.set(true);
         CompletableFuture<RPCResult> firstFuture = new CompletableFuture<>();
@@ -329,7 +334,12 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         serveDedup();
         AtomicBoolean failTheNextFlush = new AtomicBoolean();
         BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
-        Client c = newClientWithFailingCancelSend(reported, failTheNextFlush, new NoClassDefFoundError("transport linkage failed inside the send"), false);
+        Client c = newClientWithFailingSend(
+                reported,
+                failTheNextFlush,
+                new NoClassDefFoundError("transport linkage failed inside the send"),
+                false,
+                true);
         connect(c);
         holdCalls.set(true);
         c.rpcCall("first", EMPTY_PAYLOAD, into(new CompletableFuture<>()));
@@ -364,16 +374,59 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     }
 
 
-    // A client whose connect listener makes the next send of a cancel fail with the given throwable, when the flag is
-    // set, and whose error listener records what it reports. With throwOnReport the error listener throws after the
+    // An Error from the send of a call fails that call alone: the calls behind it in the flush are still written.
+    @Test
+    public void callWhoseSendFailsWithAnErrorFailsAloneAndTheRestOfTheFlushGoesOut() throws Exception {
+        enableRpcOptions();
+        serveDedup();
+        AtomicBoolean failTheNextFlush = new AtomicBoolean();
+        Client c = newClientWithFailingSend(
+                new LinkedBlockingQueue<Throwable>(),
+                failTheNextFlush,
+                new NoClassDefFoundError("transport linkage failed inside the send"),
+                false,
+                false);
+        connect(c);
+        c.disconnect();
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        CompletableFuture<RPCResult> second = new CompletableFuture<>();
+        CompletableFuture<RPCResult> third = new CompletableFuture<>();
+        c.rpcCall("first", EMPTY_PAYLOAD, into(first));
+        c.rpcCall("second", EMPTY_PAYLOAD, into(second));
+        c.rpcCall("third", EMPTY_PAYLOAD, into(third));
+
+        // The send of the first call fails inside the connect's flush, which writes the calls queued behind it.
+        failTheNextFlush.set(true);
+        c.connect();
+        assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+
+        try {
+            first.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+            fail("the call whose send failed completes with the failure");
+        } catch (ExecutionException e) {
+            assertTrue("the failure is the send's", e.getCause() instanceof IOException);
+            assertTrue("the cause is the transport's Error", e.getCause().getCause() instanceof NoClassDefFoundError);
+        }
+        assertEquals("the second call is answered", "{}", new String(second.get(WAIT_MILLIS, TimeUnit.MILLISECONDS).getData(), StandardCharsets.UTF_8));
+        assertEquals("the third call is answered", "{}", new String(third.get(WAIT_MILLIS, TimeUnit.MILLISECONDS).getData(), StandardCharsets.UTF_8));
+    }
+
+
+    // A client whose connect listener makes the next send of a cancel, or of a call, fail with the given throwable, when the
+    // flag is set, and whose error listener records what it reports. With throwOnReport the error listener throws after the
     // record, and the flush must go on regardless.
-    private Client newClientWithFailingCancelSend(BlockingQueue<Throwable> reported, AtomicBoolean failTheNextFlush, Throwable failure, boolean throwOnReport) {
+    private Client newClientWithFailingSend(
+            BlockingQueue<Throwable> reported,
+            AtomicBoolean failTheNextFlush,
+            Throwable failure,
+            boolean throwOnReport,
+            boolean cancelSend) {
         return newClient(instanceOptions(), new EventListener() {
             @Override
             public void onConnected(Client client, ConnectedEvent event) {
                 connectedSignals.release();
                 if (failTheNextFlush.getAndSet(false)) {
-                    failTheFirstSend(client, failure);
+                    failTheFirstSend(client, failure, cancelSend);
                 }
             }
 
@@ -407,19 +460,19 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     }
 
 
-    // Replaces the transport of the client by one whose first send of a cancel throws, as a transport can fail inside a
-    // send. The cancel is matched by its payload, so the sends of subscribes or connect commands do not take the failure.
-    // That send puts the real transport back, since the replies are matched to the transport the client holds.
+    // Replaces the transport of the client by one whose first send of a cancel, or of a call, throws, as a transport can
+    // fail inside a send. The command is matched by its payload, so the sends of subscribes or connect commands do not
+    // take the failure. That send puts the real transport back, since the replies are matched to the transport the client holds.
     // Coupling: it reads and writes the package-private field Client.ws by name, as no public seam exists for a
     // failing send. A rename of that field fails the callers with an IllegalStateException wrapping NoSuchFieldException.
-    private static void failTheFirstSend(Client c, Throwable failure) {
+    private static void failTheFirstSend(Client c, Throwable failure, boolean cancelSend) {
         try {
             Field field = Client.class.getDeclaredField("ws");
             field.setAccessible(true);
             WebSocket transport = (WebSocket) field.get(c);
             AtomicBoolean failed = new AtomicBoolean();
             InvocationHandler handler = (Object proxy, Method method, Object[] args) -> {
-                if (method.getName().equals("send") && isCancelPayload(args[0]) && !failed.getAndSet(true)) {
+                if (method.getName().equals("send") && isTargetPayload(args[0], cancelSend) && !failed.getAndSet(true)) {
                     field.set(c, transport);
                     throw failure;
                 }
@@ -436,13 +489,14 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     }
 
 
-    // Whether a sent payload is a command which cancels a call. A payload which is not a command is not one.
-    private static boolean isCancelPayload(Object payload) throws IOException {
+    // Whether a sent payload is an rpc command of the kind the send fails on: a cancel, or a call. A payload which is not
+    // a command is neither.
+    private static boolean isTargetPayload(Object payload, boolean cancel) throws IOException {
         if (!(payload instanceof ByteString)) {
             return false;
         }
         Protocol.Command cmd = Protocol.Command.parseDelimitedFrom(new ByteArrayInputStream(((ByteString) payload).toByteArray()));
-        return cmd != null && cmd.hasRpc() && cmd.getRpc().getCancel() != 0;
+        return cmd != null && cmd.hasRpc() && (cmd.getRpc().getCancel() != 0) == cancel;
     }
 
 
