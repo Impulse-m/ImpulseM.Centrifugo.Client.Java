@@ -59,6 +59,8 @@ final class TokenExchangeFlow {
         final Map<String, Protocol.SubscribeResult> heldSubs = new LinkedHashMap<>();
         final Set<String> heldUnsubs = new LinkedHashSet<>();
         ScheduledFuture<?> timer;
+        // The client timeout of the exchange in flight, cancelled when its callback comes.
+        ScheduledFuture<?> exchangeTimeout;
         // Set when the access token was stored for the refresh command, and cleared if that command is lost.
         boolean tokenSet;
 
@@ -217,7 +219,7 @@ final class TokenExchangeFlow {
     private void runExchange(final Bootstrap b, final String refreshToken, final boolean reloaded) {
         final AtomicBoolean called = new AtomicBoolean();
         try {
-            host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> onExchangeTimeout(b, called)), host.timeoutMillis(), TimeUnit.MILLISECONDS);
+            b.exchangeTimeout = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> onExchangeTimeout(b, called)), host.timeoutMillis(), TimeUnit.MILLISECONDS);
             exchange.exchange(new TokenExchangeEvent(host, b.transport, refreshToken), (Throwable err, TokenExchangeResult result) -> {
                 if (called.compareAndSet(false, true)) {
                     host.runOrInline(() -> onExchanged(b, refreshToken, reloaded, err, result));
@@ -244,6 +246,7 @@ final class TokenExchangeFlow {
 
 
     private void onExchanged(Bootstrap b, String refreshToken, boolean reloaded, Throwable err, TokenExchangeResult result) {
+        cancelTimer(b);
         // A result which arrives after its connection went away is dropped, rotation included: it is handled as a
         // reply lost with the connection, and the backend's grace covers the pair.
         if (!isCurrent(b)) {
@@ -415,6 +418,10 @@ final class TokenExchangeFlow {
         if (b.timer != null) {
             b.timer.cancel(false);
             b.timer = null;
+        }
+        if (b.exchangeTimeout != null) {
+            b.exchangeTimeout.cancel(false);
+            b.exchangeTimeout = null;
         }
     }
 
