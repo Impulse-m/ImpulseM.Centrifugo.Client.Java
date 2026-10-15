@@ -6,11 +6,13 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -651,6 +653,34 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         for (Protocol.RPCRequest request : sentRpcRequests()) {
             assertEquals("no cancel is sent", 0, request.getCancel());
         }
+    }
+
+
+    @Test
+    public void aCallbackWhichThrowsOnTheExecutorIsReportedToTheListener() throws Exception {
+        enableRpcOptions();
+        answerRpcs("ok", System::currentTimeMillis);
+        BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
+        EventListener listener = new EventListener() {
+            @Override
+            public void onConnected(Client client, ConnectedEvent event) {
+                connectedSignals.release();
+            }
+
+
+            @Override
+            public void onError(Client client, ErrorEvent event) {
+                reported.add(event.getError());
+            }
+        };
+        Client c = newClient(instanceOptions(), listener);
+        connect(c);
+        c.rpcCall("m", EMPTY_PAYLOAD, (Throwable error, RPCResult result) -> {
+            throw new IllegalStateException("callback failed");
+        });
+
+        Throwable failure = reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertTrue("the failure of the callback is reported", failure instanceof IllegalStateException);
     }
 
 
