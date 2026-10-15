@@ -7,7 +7,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
-import java.util.function.BooleanSupplier;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
@@ -25,17 +24,15 @@ import static org.junit.Assert.fail;
  * latest value. The windows run on a {@link ManualScheduler}, so a test moves the clock instead of
  * waiting for real time.
  */
-public class PublishDebounceTest extends FakeServerTestBase {
+public class PublishDebounceTest extends RpcTestBase {
 
     private static final String CHANNEL = "debounced";
-    private static final String MARKER_CHANNEL = "marker";
     private static final String REFUSED_DATA = "refused";
     private static final int DEBOUNCE_MILLIS = 30;
     // Above Integer.MAX_VALUE, so the window only survives if it is read as unsigned.
     private static final long LARGE_DEBOUNCE_MILLIS = 3_600_000_000L;
     private static final int FAST_RETRY_MIN_MILLIS = 50;
     private static final int FAST_RETRY_MAX_MILLIS = 100;
-    private static final long WAIT_MILLIS = 5000L;
     private static final int PERMISSION_DENIED_CODE = 103;
 
 
@@ -224,19 +221,8 @@ public class PublishDebounceTest extends FakeServerTestBase {
 
     private CompletableFuture<PublishResult> publish(final String data) {
         CompletableFuture<PublishResult> future = new CompletableFuture<PublishResult>();
-        subscription.publish(data.getBytes(StandardCharsets.UTF_8), publishInto(future));
+        subscription.publish(data.getBytes(StandardCharsets.UTF_8), completeInto(future));
         return future;
-    }
-
-
-    private static ResultCallback<PublishResult> publishInto(final CompletableFuture<PublishResult> future) {
-        return (error, result) -> {
-            if (error != null) {
-                future.completeExceptionally(error);
-            } else {
-                future.complete(result);
-            }
-        };
     }
 
 
@@ -253,17 +239,6 @@ public class PublishDebounceTest extends FakeServerTestBase {
     }
 
 
-    /**
-     * Returns once the server has handled every command the client wrote before this call. The
-     * server handles the commands of a connection in order, so the reply to the marker comes after them.
-     */
-    private void syncWithServer() throws Exception {
-        CompletableFuture<PublishResult> marker = new CompletableFuture<PublishResult>();
-        client.publish(MARKER_CHANNEL, EMPTY_PAYLOAD, publishInto(marker));
-        marker.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
-    }
-
-
     /** Moves the clock until the client reconnects after the server closed the connection. */
     private void reconnectOnClock() throws InterruptedException {
         for (int attempt = 0; attempt < 100; attempt++) {
@@ -276,19 +251,4 @@ public class PublishDebounceTest extends FakeServerTestBase {
     }
 
 
-    private static void awaitCondition(final String description, final BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + WAIT_MILLIS;
-        while (!condition.getAsBoolean()) {
-            if (System.currentTimeMillis() > deadline) {
-                fail("timed out waiting for " + description);
-            }
-            Thread.sleep(10L);
-        }
-    }
-
-
-    private void drainExecutor() throws Exception {
-        client.getExecutor().submit(() -> {
-        }).get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
-    }
 }
