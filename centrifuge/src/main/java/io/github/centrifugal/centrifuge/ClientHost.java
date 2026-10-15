@@ -1,5 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 
@@ -79,9 +81,14 @@ final class ClientHost {
     }
 
 
-    /** Sends the command on the current transport. Returns whether the transport took it. */
-    boolean sendCommand(Protocol.Command cmd) {
-        return client.ws.send(ByteString.of(client.serializeCommand(cmd)));
+    /**
+     * Sends the command on the current transport. Returns whether the transport took it. Throws when the
+     * command cannot be encoded, so that only the call of the command fails.
+     */
+    boolean sendCommand(Protocol.Command cmd) throws IOException {
+        ByteArrayOutputStream stream = new ByteArrayOutputStream();
+        cmd.writeDelimitedTo(stream);
+        return client.ws.send(ByteString.of(stream.toByteArray()));
     }
 
 

@@ -210,17 +210,13 @@ final class RpcSession {
             if (call.future.isDone()) {
                 continue;
             }
-            if (call.everSent && !host.hasRpcOptions()) {
+            // A call sent with a msg_id the connection cannot carry is lost. A call which was refused and never
+            // written under its new msg_id goes out plain instead.
+            if (call.everSent && call.wireTracked && !host.hasRpcOptions()) {
                 call.future.completeExceptionally(new IOException());
                 continue;
             }
-            // A call which fails to write fails alone: the calls behind it are still written, and the
-            // connect path which flushes them goes on.
-            try {
-                write(call);
-            } catch (RuntimeException e) {
-                call.future.completeExceptionally(e);
-            }
+            writeOrQueue(call);
         }
     }
 
@@ -361,9 +357,15 @@ final class RpcSession {
 
 
     // Writes the call now when the connection is up and no refresh is in flight, and queues it otherwise.
+    // A call which fails to write fails alone: the calls behind it are still written, and the connect path
+    // which flushes them goes on.
     private void writeOrQueue(RpcCall call) {
         if (host.state() == ClientState.CONNECTED && !host.isRefreshing()) {
-            write(call);
+            try {
+                write(call);
+            } catch (RuntimeException e) {
+                call.future.completeExceptionally(new IOException(e));
+            }
         } else {
             queue.add(call);
         }
@@ -404,7 +406,18 @@ final class RpcSession {
         call.attempt = attempt;
         host.addFuture(id, attempt);
         onWire.put(id, call);
-        if (host.sendCommand(cmd)) {
+        boolean sent;
+        try {
+            sent = host.sendCommand(cmd);
+        } catch (IOException e) {
+            // The command cannot be encoded: nothing is sent, and the call fails alone, as a refused write does not.
+            host.removeFuture(id);
+            onWire.remove(id);
+            pendingAcks.addAll(0, acks);
+            call.future.completeExceptionally(e);
+            return;
+        }
+        if (sent) {
             call.everSent = true;
             call.resendAsNew = false;
             call.wireTracked = tracked;
@@ -475,7 +488,14 @@ final class RpcSession {
         host.addFuture(id, reply);
         CancelCommand command = new CancelCommand(msgId, acks);
         cancelCommands.put(id, command);
-        if (host.sendCommand(cmd)) {
+        boolean sent;
+        try {
+            sent = host.sendCommand(cmd);
+        } catch (IOException e) {
+            // A cancel which cannot be encoded is kept like one the transport refused.
+            sent = false;
+        }
+        if (sent) {
             // The reply is handled on the executor, after this task, so the timer is set before it can come.
             command.timer = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> forgetCancel(id)), host.timeoutMillis(), TimeUnit.MILLISECONDS);
             return true;
