@@ -103,6 +103,17 @@ final class TokenExchangeFlow {
     }
 
 
+    /**
+     * Runs the task on the executor, from any thread. Once the executor is shut down, which is after the
+     * client closed, a late completion runs the task inline on the completing thread instead, so the
+     * callbacks of the exchange still run exactly once. A failure of the task goes to the listener.
+     */
+    static void runOrInline(ClientHost host, Runnable task) {
+        Runnable reported = host.reporting(task);
+        Extensions.submitOrRun(host.executor(), reported, reported);
+    }
+
+
     /** The token getter of the timer refresh: the exchange over the connected socket. */
     ConnectionTokenGetter renewalGetter() {
         return renewalGetter;
@@ -216,7 +227,7 @@ final class TokenExchangeFlow {
     // retry after a re-read of a changed refresh token: it is not retried again.
     private void runExchange(final Bootstrap b, final String refreshToken, final boolean reloaded) {
         try {
-            exchange.exchange(new TokenExchangeEvent(host, b.transport, refreshToken), (Throwable err, TokenExchangeResult result) -> host.runOrInline(() -> onExchanged(b, refreshToken, reloaded, err, result)));
+            exchange.exchange(new TokenExchangeEvent(host, b.transport, refreshToken), (Throwable err, TokenExchangeResult result) -> runOrInline(host, () -> onExchanged(b, refreshToken, reloaded, err, result)));
         } catch (RuntimeException e) {
             onExchanged(b, refreshToken, reloaded, e, null);
         }
@@ -274,7 +285,7 @@ final class TokenExchangeFlow {
         host.storeToken(accessToken);
         Protocol.Command.Builder builder = Protocol.Command.newBuilder()
                 .setRefresh(Protocol.RefreshRequest.newBuilder().setToken(accessToken));
-        writePlain(host, b.transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> host.runOrInline(() -> onRefreshed(b, reply, err)));
+        writePlain(host, b.transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> runOrInline(host, () -> onRefreshed(b, reply, err)));
     }
 
 
@@ -420,7 +431,7 @@ final class TokenExchangeFlow {
 
     private void runRenewal(final WebSocket transport, final TokenCallback cb, final String refreshToken, final boolean reloaded) {
         try {
-            exchange.exchange(new TokenExchangeEvent(host, transport, refreshToken), (Throwable err, TokenExchangeResult result) -> host.runOrInline(() -> onRenewed(transport, cb, refreshToken, reloaded, err, result)));
+            exchange.exchange(new TokenExchangeEvent(host, transport, refreshToken), (Throwable err, TokenExchangeResult result) -> runOrInline(host, () -> onRenewed(transport, cb, refreshToken, reloaded, err, result)));
         } catch (RuntimeException e) {
             onRenewed(transport, cb, refreshToken, reloaded, e, null);
         }
@@ -496,7 +507,7 @@ final class TokenExchangeFlow {
                 .setRpc(Protocol.RPCRequest.newBuilder()
                         .setMethod(method)
                         .setData(com.google.protobuf.ByteString.copyFrom(data)));
-        writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> host.runOrInline(() -> deliverRpc(host, reply, err, cb)));
+        writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> runOrInline(host, () -> deliverRpc(host, reply, err, cb)));
     }
 
 
