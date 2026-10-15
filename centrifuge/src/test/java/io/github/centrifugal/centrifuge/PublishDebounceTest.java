@@ -217,18 +217,7 @@ public class PublishDebounceTest extends RpcTestBase {
                     .build();
         };
         clock = new ManualScheduler();
-        client = new Client(server.url(), new Options(), new EventListener() {
-            @Override
-            public void onConnected(Client c, ConnectedEvent e) {
-                connectedSignals.release();
-            }
-
-
-            @Override
-            public void onDisconnected(Client c, DisconnectedEvent e) {
-                disconnectedSignals.release();
-            }
-        }, FAST_RETRY_MIN_MILLIS, FAST_RETRY_MAX_MILLIS, clock);
+        newClientOnClock(new Options(), clock, FAST_RETRY_MIN_MILLIS, FAST_RETRY_MAX_MILLIS);
         connect(client);
         subscription = client.newSubscription(CHANNEL, new SubscriptionEventListener() {
             @Override
