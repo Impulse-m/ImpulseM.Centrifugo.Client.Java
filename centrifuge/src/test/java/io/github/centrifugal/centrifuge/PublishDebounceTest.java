@@ -7,6 +7,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
@@ -129,7 +130,7 @@ public class PublishDebounceTest extends RpcTestBase {
         awaitPublishedCount(3);
 
         assertEquals(Arrays.asList("1", "2", "3"), published);
-        assertFalse("no window is armed", clock.requestedDelays().contains((long) DEBOUNCE_MILLIS));
+        assertFalse("no window is armed", clock.requestedDelays().contains(0L));
     }
 
 
@@ -166,6 +167,27 @@ public class PublishDebounceTest extends RpcTestBase {
 
         assertEquals(Arrays.asList("1", REFUSED_DATA, "3"), published);
         assertEquals(SubscriptionState.SUBSCRIBED, subscription.getState());
+    }
+
+
+    @Test
+    public void throwingCallbackOfCoalescedPublishRunsOnce() throws Exception {
+        startDebounced(DEBOUNCE_MILLIS);
+
+        assertNoError(publish("1"));
+        awaitPublishedCount(1);
+        final AtomicInteger calls = new AtomicInteger();
+        subscription.publish("2".getBytes(StandardCharsets.UTF_8), new ResultCallback<PublishResult>() {
+            @Override
+            public void onDone(Throwable err, PublishResult res) {
+                calls.incrementAndGet();
+                throw new IllegalStateException("the application callback failed");
+            }
+        });
+        awaitCondition("the coalesced callback ran", () -> calls.get() >= 1);
+        drainExecutor();
+
+        assertEquals("the callback runs once", 1, calls.get());
     }
 
 
