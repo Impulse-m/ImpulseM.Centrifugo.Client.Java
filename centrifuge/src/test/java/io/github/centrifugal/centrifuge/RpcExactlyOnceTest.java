@@ -1129,42 +1129,50 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     }
 
 
-    // A later refusal whose resend would run at or past the deadline is not resent: the error is delivered at once.
+    // A later refusal whose resend would run past the deadline is capped at the deadline: no resend is made
+    // after it, and the deadline rejects the call with a timeout and cancels it.
     @Test
-    public void laterRefusalWhoseResendWouldReachTheDeadlineIsDeliveredAtOnce() throws Exception {
+    public void laterRefusalWhoseResendWouldReachTheDeadlineIsCappedAtTheDeadline() throws Exception {
         enableRpcOptions();
         refuseCalls(2, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
         ManualScheduler clock = new ManualScheduler();
         Client c = newClientOnClock(instanceOptions(), clock);
         connect(c);
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        // The first resend is due at 250 ms, and the second, 500 ms later, is past the deadline at 300 ms.
+        // The first resend is due at 250 ms, and the second, 500 ms later, would be past the deadline at 300 ms.
         c.rpcCall("later", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(300).build(), into(future));
         awaitCondition("the first resend is scheduled", () -> clock.requestedDelays().contains(250L));
         clock.advance(250);
         awaitRequestCount(2);
+        awaitCondition("the second resend waits for the deadline", () -> clock.pendingWithDelay(50L) == 1);
 
-        ReplyError error = replyErrorOf(future);
+        clock.advance(50);
 
-        assertEquals(TEMPORARY, error.getCode());
-        assertEquals("no second resend is made", 2, sentRpcRequests().size());
+        assertTrue("the deadline rejects the call", errorOf(future) instanceof TimeoutException);
+        awaitCondition("the deadline cancels the sent call", () -> sentCancels().size() == 1);
+        assertEquals("no second resend is made", 2, sentRpcRequests().size() - sentCancels().size());
     }
 
 
     @Test
-    public void laterRefusalWhoseDelayWouldReachTheDeadlineIsNotResent() throws Exception {
+    public void laterRefusalWhoseDelayWouldReachTheDeadlineIsCappedAtTheDeadline() throws Exception {
         enableRpcOptions();
         refuseCalls(1, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
         ManualScheduler clock = new ManualScheduler();
         Client c = newClientOnClock(instanceOptions(), clock);
         connect(c);
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        // The deadline is shorter than the 250 ms delay: the refusal is delivered, and nothing is scheduled.
+        // The deadline is shorter than the 250 ms delay: the resend is capped at the remaining deadline, so the
+        // deadline rejects the call with a timeout, and the sent call gets its cancel.
         c.rpcCall("later", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(100).build(), into(future));
-        errorOf(future);
+        awaitCondition("the resend is scheduled at the deadline", () -> clock.pendingWithDelay(100L) == 2);
+        assertFalse("no resend waits for the 250 ms delay", clock.requestedDelays().contains(250L));
 
-        assertFalse("no resend is scheduled", clock.requestedDelays().contains(250L));
-        assertEquals("the call is sent once", 1, sentRpcRequests().size() - sentCancels().size());
+        clock.advance(100);
+
+        assertTrue("the deadline rejects the call", errorOf(future) instanceof TimeoutException);
+        awaitCondition("the deadline cancels the sent call", () -> sentCancels().size() == 1);
+        assertEquals("the call is sent once, and never resent", 1, sentRpcRequests().size() - sentCancels().size());
     }
 
 

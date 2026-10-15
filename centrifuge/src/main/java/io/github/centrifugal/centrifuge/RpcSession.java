@@ -483,12 +483,9 @@ final class RpcSession {
             return true;
         }
         if (Extensions.RPC_RETRY_LATER.equals(signal) && call.laterResends < LATER_RESENDS) {
-            long delayNanos = LATER_BASE_NANOS << call.laterResends;
-            // A resend which would run at or past the deadline is not scheduled: the deadline is not a
-            // time to retransmit, and the error is delivered as it is.
-            if (delayNanos >= remainingNanos) {
-                return false;
-            }
+            // The delay is capped at the remaining deadline. A resend which would run past it waits for the
+            // deadline, which then rejects the call with a timeout and cancels it, as it does for a sent call.
+            long delayNanos = Math.min(LATER_BASE_NANOS << call.laterResends, remainingNanos);
             call.laterResends++;
             scheduleResend(call, delayNanos);
             return true;
