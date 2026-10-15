@@ -22,11 +22,12 @@ import okhttp3.WebSocket;
  * {@link Client#refresh}, and the timer which refreshes before the token expires. One refresh is
  * in flight at a time, the others wait their turn. The rpc calls wait for the refresh command in
  * flight, see {@link RpcSession}. Used on the client's executor thread only, except the inline run of
- * {@link #runOnExecutorOrInline} after the client closed: that run completes the refresh in flight
+ * {@link ClientHost#runOrInline} after the client closed: that run completes the refresh in flight
  * too, so it fails the waiting refreshes and flushes the rpc calls on the completing thread.
  * <p>
  * The fetch and retry loop of the timer mirrors {@code Subscription.sendRefresh}. It is kept here,
- * so that the subscription code stays as it is.
+ * so that the subscription code stays as it is. With a {@link TokenExchange} the timer fetches its
+ * token through the exchange, see {@link TokenExchangeFlow}.
  */
 final class AuthRefresh {
     // A refresh which waits for the refresh in flight. A requested refresh carries its token and the
@@ -68,6 +69,8 @@ final class AuthRefresh {
     private final int retryMinMillis;
     private final int retryMaxMillis;
     private final Backoff backoff = new Backoff();
+    // Null without a token exchange option: the connection token is then fetched by the token getter.
+    private final TokenExchangeFlow flow;
     // The refresh in flight is the one which runs now. The refreshes waiting for it run in order.
     private boolean inFlight = false;
     // A refresh command awaits its reply. The rpc calls wait for it, and for a requested refresh which
@@ -104,6 +107,34 @@ final class AuthRefresh {
         this.host = host;
         this.retryMinMillis = retryMinMillis;
         this.retryMaxMillis = retryMaxMillis;
+        TokenExchange tokenExchange = host.tokenExchange();
+        this.flow = tokenExchange == null ? null : new TokenExchangeFlow(host, tokenExchange);
+    }
+
+
+    /** The connection token getter of a token exchange: the timer fetches its token through the exchange. */
+    ConnectionTokenGetter exchangeTokenGetter() {
+        return flow.renewalGetter();
+    }
+
+
+    /** Called at the start of every connect attempt, before the connect command is built. */
+    void beforeConnect() {
+        if (flow != null) {
+            flow.beforeConnect();
+        }
+    }
+
+
+    /** Called with the connect reply before the connected state. Returns true when a token exchange took it over. */
+    boolean interceptConnect(Protocol.Reply reply) {
+        return flow != null && flow.interceptConnect(reply);
+    }
+
+
+    /** Called for every push. Returns true when the push was held by a token exchange which is connecting. */
+    boolean holdPush(Protocol.Push push) {
+        return flow != null && flow.holdPush(push);
     }
 
 
@@ -178,10 +209,15 @@ final class AuthRefresh {
      * not expire. Replaces the timer scheduled before, so one timer chain runs.
      */
     void scheduleExpiry(boolean expires, int ttl) {
-        if (expires) {
-            scheduleTimer(ttl, TimeUnit.SECONDS);
-        } else {
+        if (flow != null) {
+            flow.observe(host.connectionToken(), expires, ttl);
+        }
+        if (!expires) {
             cancelTimer();
+        } else if (flow != null) {
+            scheduleTimer(flow.renewalDelayMillis(ttl), TimeUnit.MILLISECONDS);
+        } else {
+            scheduleTimer(ttl, TimeUnit.SECONDS);
         }
     }
 
@@ -205,6 +241,9 @@ final class AuthRefresh {
         cancelTimer();
         commandInFlight = false;
         timerSuperseded = false;
+        if (flow != null) {
+            flow.reset();
+        }
     }
 
 
@@ -271,7 +310,7 @@ final class AuthRefresh {
             fetched.completeExceptionally(e);
         }
         fetched.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS)
-                .whenComplete((String token, Throwable err) -> runOnExecutorOrInline(() -> onTokenFetched(transport, generation, Extensions.unwrapCompletion(err), token)));
+                .whenComplete((String token, Throwable err) -> host.runOrInline(() -> onTokenFetched(transport, generation, Extensions.unwrapCompletion(err), token)));
     }
 
 
@@ -306,7 +345,7 @@ final class AuthRefresh {
                 return;
             }
             commandInFlight = true;
-            sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> runOnExecutorOrInline(() -> finishTimer(transport, token, error, result)));
+            sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> host.runOrInline(() -> finishTimer(transport, token, error, result)));
             awaitingCommand = true;
         } finally {
             if (!awaitingCommand) {
@@ -405,7 +444,7 @@ final class AuthRefresh {
         inFlightToken = token;
         inFlightCallbacks = callbacks;
         commandInFlight = true;
-        sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> runOnExecutorOrInline(() -> finishRequested(token, error, result, callbacks)));
+        sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> host.runOrInline(() -> finishRequested(token, error, result, callbacks)));
     }
 
 
@@ -425,7 +464,7 @@ final class AuthRefresh {
         // One stage delivers the outcome, so a callback which throws is never called a second time.
         f.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS).handle((Protocol.Reply reply, Throwable e) -> {
             if (e != null) {
-                runOnExecutorOrInline(() -> {
+                host.runOrInline(() -> {
                     host.cleanCommand(cmd);
                     cb.onDone(Extensions.unwrapCompletion(e), null);
                 });
@@ -447,16 +486,6 @@ final class AuthRefresh {
             // The command could not be sent: the stage above delivers the failure once, as it does a failed reply.
             f.completeExceptionally(e);
         }
-    }
-
-
-    // Runs the task on the executor. Once the executor is shut down, which is after the client closed, a late
-    // completion runs the task inline on the completing thread instead, so the callbacks of the refresh still
-    // run exactly once. The task then only settles the callbacks: the client is closed. A failure of an inline
-    // task goes to the listener.
-    private void runOnExecutorOrInline(Runnable task) {
-        Runnable reported = host.reporting(task);
-        Extensions.submitOrRun(host.executor(), reported, reported);
     }
 
 

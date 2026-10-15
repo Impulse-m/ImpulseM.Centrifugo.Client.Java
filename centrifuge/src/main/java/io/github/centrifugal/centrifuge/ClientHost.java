@@ -52,7 +52,31 @@ final class ClientHost {
 
 
     ConnectionTokenGetter tokenGetter() {
+        if (client.getOpts().getTokenExchange() != null) {
+            return client.auth.exchangeTokenGetter();
+        }
         return client.getOpts().getTokenGetter();
+    }
+
+
+    TokenExchange tokenExchange() {
+        return client.getOpts().getTokenExchange();
+    }
+
+
+    boolean isRefreshRequired() {
+        return client.refreshRequired;
+    }
+
+
+    void setRefreshRequired(boolean refreshRequired) {
+        client.refreshRequired = refreshRequired;
+    }
+
+
+    /** Handles the connect reply once a token exchange completed it: the connected state follows. */
+    void resumeConnect(Protocol.Reply reply) {
+        client.handleConnectReply(reply);
     }
 
 
@@ -165,5 +189,16 @@ final class ClientHost {
                 reportError(failure);
             }
         };
+    }
+
+
+    /**
+     * Runs the task on the executor, from any thread. Once the executor is shut down, which is after the
+     * client closed, a late completion runs the task inline on the completing thread instead, so the
+     * callbacks of the auth flows still run exactly once. A failure of the task goes to the listener.
+     */
+    void runOrInline(Runnable task) {
+        Runnable reported = reporting(task);
+        Extensions.submitOrRun(client.getExecutor(), reported, reported);
     }
 }

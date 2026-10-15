@@ -41,6 +41,21 @@ public class Options {
 
     private ConnectionTokenGetter tokenGetter;
 
+    public TokenExchange getTokenExchange() {
+        return tokenExchange;
+    }
+
+    /**
+     * Lets the client obtain and renew its connection token itself, over the connection, from a refresh token
+     * the application persists. Exclusive with {@link #setTokenGetter}: a client created with both throws
+     * IllegalArgumentException. Default null.
+     */
+    public void setTokenExchange(TokenExchange tokenExchange) {
+        this.tokenExchange = tokenExchange;
+    }
+
+    private TokenExchange tokenExchange;
+
     public String getName() {
         return name;
     }
