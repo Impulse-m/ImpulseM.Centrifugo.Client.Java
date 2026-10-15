@@ -37,6 +37,6 @@ public final class TokenExchangeEvent {
      * @param cb:     called with the reply, or with the failure.
      */
     public void rpc(final String method, final byte[] data, final ResultCallback<RPCResult> cb) {
-        TokenExchangeFlow.runOrInline(host, () -> TokenExchangeFlow.sendRpc(host, transport, method, data, cb));
+        host.runOrInline(() -> TokenExchangeFlow.sendRpc(host, transport, method, data, cb));
     }
 }

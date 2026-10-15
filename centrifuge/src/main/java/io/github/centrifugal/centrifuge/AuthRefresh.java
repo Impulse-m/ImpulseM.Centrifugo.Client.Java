@@ -494,8 +494,7 @@ final class AuthRefresh {
     // run exactly once. The task then only settles the callbacks: the client is closed. A failure of an inline
     // task goes to the listener.
     private void runOnExecutorOrInline(Runnable task) {
-        Runnable reported = host.reporting(task);
-        Extensions.submitOrRun(host.executor(), reported, reported);
+        host.runOrInline(task);
     }
 
 
