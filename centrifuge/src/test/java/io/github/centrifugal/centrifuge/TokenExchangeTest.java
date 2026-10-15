@@ -1033,15 +1033,21 @@ public class TokenExchangeTest extends FakeServerTestBase {
     }
 
 
-    // The delay of the renewal timer: the one of the scheduled delays inside the window.
-    private static long renewalDelay(ManualScheduler clock) {
+    // The delay of the renewal timer: the one of the scheduled delays inside the window. The connected event comes
+    // before the timer is set, so this waits for it.
+    private long renewalDelay(ManualScheduler clock) throws InterruptedException {
+        awaitUntil("renewal timer", () -> renewalDelayIn(clock) != null);
+        return renewalDelayIn(clock);
+    }
+
+
+    private static Long renewalDelayIn(ManualScheduler clock) {
         for (long delay : clock.requestedDelays()) {
             if (delay >= WINDOW_MIN_MILLIS && delay <= WINDOW_MAX_MILLIS) {
                 return delay;
             }
         }
-        fail("no renewal timer inside the window: " + clock.requestedDelays());
-        return 0L;
+        return null;
     }
 
 
