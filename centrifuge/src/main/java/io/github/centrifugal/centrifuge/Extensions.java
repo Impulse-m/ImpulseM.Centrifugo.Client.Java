@@ -64,24 +64,6 @@ final class Extensions {
 
 
     /**
-     * Runs the task on the executor. Once the executor is shut down it rejects the task, and the task
-     * then runs on the calling thread, so a callback which the task delivers still runs exactly once.
-     */
-    static void runOnExecutor(ExecutorService executor, Runnable task) {
-        try {
-            executor.submit(task);
-        } catch (RejectedExecutionException e) {
-            // The task runs once, here. A failure of the task is reported: the caller's stage would not show it.
-            try {
-                task.run();
-            } catch (RuntimeException failure) {
-                failure.printStackTrace();
-            }
-        }
-    }
-
-
-    /**
      * Submits the task to the executor, and drops it once the executor is shut down: the client is
      * closed then, and the state the task would change went with it.
      */

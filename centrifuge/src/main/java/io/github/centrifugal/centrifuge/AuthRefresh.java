@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -20,7 +21,8 @@ import okhttp3.WebSocket;
  * The refreshes of the connection token: the refresh a caller asks for with
  * {@link Client#refresh}, and the timer which refreshes before the token expires. One refresh is
  * in flight at a time, the others wait their turn. The rpc calls wait for the refresh command in
- * flight, see {@link RpcSession}. Used on the client's executor thread only.
+ * flight, see {@link RpcSession}. Used on the client's executor thread only, except the inline run of
+ * {@link #runOnExecutorOrInline} after the client closed, which only settles the callbacks.
  * <p>
  * The fetch and retry loop of the timer mirrors {@code Subscription.sendRefresh}. It is kept here,
  * so that the subscription code stays as it is.
@@ -245,7 +247,7 @@ final class AuthRefresh {
             fetched.completeExceptionally(e);
         }
         fetched.orTimeout(client.getOpts().getTimeout(), TimeUnit.MILLISECONDS)
-                .whenComplete((String token, Throwable err) -> Extensions.runOnExecutor(client.getExecutor(), () -> onTokenFetched(transport, Extensions.unwrapCompletion(err), token)));
+                .whenComplete((String token, Throwable err) -> runOnExecutorOrInline(() -> onTokenFetched(transport, Extensions.unwrapCompletion(err), token)));
     }
 
 
@@ -270,7 +272,7 @@ final class AuthRefresh {
                 return;
             }
             commandInFlight = true;
-            sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishTimer(transport, token, error, result)));
+            sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> runOnExecutorOrInline(() -> finishTimer(transport, token, error, result)));
             awaitingCommand = true;
         } finally {
             if (!awaitingCommand) {
@@ -350,7 +352,7 @@ final class AuthRefresh {
         inFlightToken = token;
         inFlightCallbacks = callbacks;
         commandInFlight = true;
-        sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishRequested(token, error, result, callbacks)));
+        sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> runOnExecutorOrInline(() -> finishRequested(token, error, result, callbacks)));
     }
 
 
@@ -370,7 +372,7 @@ final class AuthRefresh {
         // One stage delivers the outcome, so a callback which throws is never called a second time.
         f.orTimeout(client.getOpts().getTimeout(), TimeUnit.MILLISECONDS).handle((Protocol.Reply reply, Throwable e) -> {
             if (e != null) {
-                Extensions.runOnExecutor(client.getExecutor(), () -> {
+                runOnExecutorOrInline(() -> {
                     client.cleanCommandFuture(cmd);
                     cb.onDone(Extensions.unwrapCompletion(e), null);
                 });
@@ -387,6 +389,23 @@ final class AuthRefresh {
         });
 
         client.enqueueCommandFuture(cmd, f);
+    }
+
+
+    // Runs the task on the executor. Once the executor is shut down, which is after the client closed, a late
+    // completion runs the task inline on the completing thread instead, so the callbacks of the refresh still
+    // run exactly once. The task then only settles the callbacks: the client is closed. A failure of an inline
+    // task goes to the listener.
+    private void runOnExecutorOrInline(Runnable task) {
+        try {
+            client.getExecutor().submit(task);
+        } catch (RejectedExecutionException e) {
+            try {
+                task.run();
+            } catch (RuntimeException failure) {
+                client.reportError(failure);
+            }
+        }
     }
 
 
