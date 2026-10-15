@@ -43,6 +43,8 @@ public class TokenExchangeTest extends FakeServerTestBase {
     private static final int TTL_SECONDS = 10;
     private static final int RETRY_MIN_MILLIS = 50;
     private static final int RETRY_MAX_MILLIS = 100;
+    // The smallest delay of a bootstrap retry: the first backoff step is [min, 2 * min].
+    private static final long BOOTSTRAP_RETRY_MIN_MILLIS = 5000L;
     private static final int CODE_DISCONNECT_UNAUTHORIZED = 1;
     private static final int CODE_PERMISSION_DENIED = 103;
     private static final int CODE_TOKEN_EXPIRED = 109;
@@ -376,6 +378,96 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
 
     @Test
+    public void unansweredBootstrapRefreshClosesTheConnectionBeforeConnected() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+        Storage storage = new Storage("refresh-1");
+        Options options = exchangeOptions(storage);
+        options.setTimeout(200);
+        newClientOnClock(options, clock);
+        client.connect();
+        awaitUntil("refresh sent", () -> refreshTokens().size() == 1);
+        int delaysBefore = clock.requestedDelays().size();
+
+        awaitUntil("timeout reported", () -> !errors.isEmpty());
+        assertTrue(errors.get(0) instanceof TokenError);
+        awaitUntil("reconnect scheduled", () -> clock.requestedDelays().size() > delaysBefore);
+        assertTrue(connected.isEmpty());
+        // The app logs out while the client waits: the next bootstrap finds no refresh token.
+        storage.refreshToken = null;
+        clock.advance(60000);
+
+        awaitUntil("connected", () -> connected.size() == 1);
+        assertTrue(connected.get(0).getUser().isEmpty());
+        assertEquals(Arrays.asList("connect", "rpc:" + METHOD, "refresh", "connect"), kinds());
+        assertEquals(Arrays.asList("refresh-1"), storage.exchanged);
+        assertEquals(Arrays.asList("refresh-2"), storage.stored);
+    }
+
+
+    @Test
+    public void pingDuringBootstrapIsAnsweredWithAPong() throws Exception {
+        server.connectResult = Protocol.ConnectResult.newBuilder()
+                .setClient("fake-client").setVersion("0.0.0").setPing(25).setPong(true).build();
+        answerIdentity(false, 0);
+        StallingStorage storage = new StallingStorage("refresh-1");
+        newClient(exchangeOptions(storage));
+        client.connect();
+        awaitUntil("exchange started", () -> storage.held != null);
+
+        server.sendPing();
+
+        awaitUntil("pong sent", () -> server.received().contains(Protocol.Command.getDefaultInstance()));
+        storage.held.onDone(null, new TokenExchangeResult("access-1", null));
+        awaitUntil("connected", () -> connected.size() == 1);
+    }
+
+
+    @Test
+    public void abandonedBootstrapStartsItsBackoffOverOnTheNextConnect() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        AtomicBoolean failing = new AtomicBoolean(true);
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                if (failing.get()) {
+                    exchanged.add(event.getRefreshToken());
+                    cb.onDone(new IOException("exchange failed"), null);
+                    return;
+                }
+                super.exchange(event, cb);
+            }
+        };
+        Options options = exchangeOptions(storage);
+        options.setTimeout(1000);
+        options.setMinReconnectDelay(RETRY_MIN_MILLIS);
+        options.setMaxReconnectDelay(RETRY_MAX_MILLIS);
+        newClientOnClock(options, clock);
+        client.connect();
+        // Three failed exchanges: the retry after the third one is pending when the connection drops.
+        for (int retry = 1; retry <= 2; retry++) {
+            final int expected = retry;
+            awaitUntil("retry " + retry + " scheduled", () -> bootstrapDelays(clock).size() == expected);
+            clock.advance(60000);
+        }
+        awaitUntil("third retry scheduled", () -> bootstrapDelays(clock).size() == 3);
+        int delaysBefore = clock.requestedDelays().size();
+        server.closeConnection();
+        awaitUntil("reconnect scheduled", () -> clock.requestedDelays().size() > delaysBefore);
+        clock.advance(RETRY_MAX_MILLIS);
+
+        // The first failure of the new bootstrap waits for the first step of the backoff.
+        awaitUntil("fourth retry scheduled", () -> bootstrapDelays(clock).size() == 4);
+        List<Long> delays = bootstrapDelays(clock);
+        assertTrue("retry after an abandoned bootstrap: " + delays.get(3), delays.get(3) <= 2 * BOOTSTRAP_RETRY_MIN_MILLIS);
+    }
+
+
+    @Test
     public void unauthorizedWithAChangedRefreshTokenRetriesOnce() throws Exception {
         answerExchanges("access-1|refresh-2");
         answerIdentity(false, 0);
@@ -444,6 +536,26 @@ public class TokenExchangeTest extends FakeServerTestBase {
         assertEquals(1, errors.size());
         assertEquals(1, connected.size());
         assertTrue(disconnects.isEmpty());
+    }
+
+
+    @Test
+    public void renewalKeepsTheExchangeWhenTheOptionIsClearedAfterConstruction() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        Options options = exchangeOptions(new Storage("refresh-1"));
+        newClientOnClock(options, clock);
+        client.connect();
+        awaitUntil("connected", () -> connected.size() == 1);
+        long delay = renewalDelay(clock);
+
+        options.setTokenExchange(null);
+        clock.advance(delay);
+
+        pumpUntil(clock, "renewed", () -> refreshTokens().size() == 2);
+        assertTrue(errors.isEmpty());
+        assertEquals("access-1", lastRefreshToken());
     }
 
 
@@ -906,6 +1018,18 @@ public class TokenExchangeTest extends FakeServerTestBase {
     private String lastRefreshToken() {
         List<String> tokens = refreshTokens();
         return tokens.isEmpty() ? null : tokens.get(tokens.size() - 1);
+    }
+
+
+    // The delays of the bootstrap retries scheduled so far. The exchange timeouts and the reconnects are shorter.
+    private static List<Long> bootstrapDelays(ManualScheduler clock) {
+        List<Long> delays = new ArrayList<>();
+        for (long delay : clock.requestedDelays()) {
+            if (delay >= BOOTSTRAP_RETRY_MIN_MILLIS) {
+                delays.add(delay);
+            }
+        }
+        return delays;
     }
 
 

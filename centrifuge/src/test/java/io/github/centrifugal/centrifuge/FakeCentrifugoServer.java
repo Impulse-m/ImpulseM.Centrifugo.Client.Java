@@ -274,6 +274,14 @@ public final class FakeCentrifugoServer {
         webSocket.send(ByteString.of(out.toByteArray()));
     }
 
+    /** Send a ping to the active connection: an empty reply, which is a single zero length byte. */
+    public void sendPing() {
+        WebSocket s = currentSocket.get();
+        if (s != null) {
+            s.send(ByteString.of((byte) 0));
+        }
+    }
+
     /** Send a raw reply to the active connection. */
     public void sendReply(Protocol.Reply reply) {
         send(currentSocket.get(), reply);
