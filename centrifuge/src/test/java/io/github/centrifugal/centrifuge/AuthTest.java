@@ -534,6 +534,17 @@ public class AuthTest extends RpcTestBase {
 
 
     @Test
+    public void refreshAfterCloseCallsBackWithAnError() throws Exception {
+        newAuthClient(new Options());
+        client.close(1000);
+
+        CompletableFuture<AuthResult> future = refresh(client, "token-2");
+
+        assertTrue("the callback gets the failure, nothing is thrown", errorOf(future) instanceof IOException);
+    }
+
+
+    @Test
     public void refreshWithTheSameTokenSharesOneCommand() throws Exception {
         server.connectResult = connectResultFor("u1", "authenticated");
         newAuthClient(new Options());

@@ -1550,7 +1550,7 @@ public class Client {
         if (token == null) {
             throw new NullPointerException("token must not be null");
         }
-        this.executor.submit(() -> Client.this.auth.refreshWith(token, cb));
+        Extensions.submitOrRun(this.executor, () -> Client.this.auth.refreshWith(token, cb), () -> cb.onDone(new IOException(), null));
     }
 
     void subRefreshSynchronized(String channel, String token, ResultCallback<Protocol.SubRefreshResult> cb) {
