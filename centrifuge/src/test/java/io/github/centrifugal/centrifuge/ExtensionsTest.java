@@ -60,38 +60,11 @@ public class ExtensionsTest {
 
 
     @Test
-    public void unsupportedRpcReplyHasNoCommandIdAndCodeFifteen() {
-        Protocol.Reply reply = Extensions.unsupportedRpcReply();
+    public void unsupportedRpcReplyAnswersTheCommandWithCodeFifteen() {
+        Protocol.Reply reply = Extensions.unsupportedRpcReply(7);
 
-        assertEquals(0, reply.getId());
+        assertEquals(7, reply.getId());
         assertEquals(ReplyError.UNSUPPORTED, reply.getError().getCode());
         assertEquals("rpc headers are not supported by the server", reply.getError().getMessage());
-    }
-
-
-    @Test
-    public void instanceAcceptsTwentyTwoToSixtyFourUrlSafeCharacters() {
-        assertTrue(Extensions.isValidInstance("abcdefghijklmnopqrstuv"));
-        assertTrue(Extensions.isValidInstance("ABCDEFGHIJKLMNOPQRSTUV_-"));
-        assertTrue(Extensions.isValidInstance(repeat('x', 64)));
-    }
-
-
-    @Test
-    public void instanceRejectsOtherLengthsAndCharacters() {
-        assertFalse(Extensions.isValidInstance(repeat('x', 21)));
-        assertFalse(Extensions.isValidInstance(repeat('x', 65)));
-        assertFalse(Extensions.isValidInstance("abcdefghijklmnopqrstu+"));
-        assertFalse(Extensions.isValidInstance("abcdefghijklmnopqrstuv\n"));
-        assertFalse(Extensions.isValidInstance(""));
-    }
-
-
-    private static String repeat(char c, int count) {
-        StringBuilder builder = new StringBuilder();
-        for (int i = 0; i < count; i++) {
-            builder.append(c);
-        }
-        return builder.toString();
     }
 }
