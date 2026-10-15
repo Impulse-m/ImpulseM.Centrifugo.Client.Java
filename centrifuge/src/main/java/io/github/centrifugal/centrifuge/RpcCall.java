@@ -40,6 +40,8 @@ public final class RpcCall {
     // The msg_id was refused, so the next write carries a new one, which the server has not seen:
     // that write is not a retransmit. Cleared when the write goes out.
     boolean resendAsNew;
+    // The server gave its final answer to the call, a reply which settles the call or a late one, so no cancel is due.
+    boolean answered;
     // Resends so far: after a refused msg_id, and after a temporary refusal.
     int newIdResends;
     int laterResends;

@@ -555,7 +555,7 @@ final class RpcSession {
             forgetAttempt(call);
         }
         if (reply == null) {
-            if (call.wireTracked && Extensions.unwrapCompletion(error) instanceof TimeoutException && !answerQueued(call)) {
+            if (call.wireTracked && !call.answered && Extensions.unwrapCompletion(error) instanceof TimeoutException && !answerQueued(call)) {
                 // The server may still run a sent call, so the deadline cancels it as cancel() does.
                 sendCancel(call.msgId);
             }
@@ -646,16 +646,20 @@ final class RpcSession {
         if (reply != null && reply.getError().getCode() != 0 && call.wireTracked && resend(call, reply.getError())) {
             return;
         }
-        completeCall(call, reply, error);
+        call.answered = reply != null;
+        if (!completeCall(call, reply, error) && reply != null && call.wireTracked) {
+            // The deadline settled the call before this reply came to the executor: the reply is acked as a late one.
+            pendingAcks.add(call.msgId);
+        }
     }
 
 
-    private static void completeCall(RpcCall call, Protocol.Reply reply, Throwable error) {
+    // Settles the call with the reply or the error. Returns false when the call was already done, the deadline first.
+    private static boolean completeCall(RpcCall call, Protocol.Reply reply, Throwable error) {
         if (reply != null) {
-            call.future.complete(reply);
-        } else {
-            call.future.completeExceptionally(error);
+            return call.future.complete(reply);
         }
+        return call.future.completeExceptionally(error);
     }
 
 
