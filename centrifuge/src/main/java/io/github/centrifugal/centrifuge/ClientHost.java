@@ -83,7 +83,8 @@ final class ClientHost {
 
     /**
      * Sends the command on the current transport. Returns whether the transport took it. Throws when the
-     * command cannot be encoded, so that only the call of the command fails.
+     * command cannot be encoded, so that only the call of the command fails. The encoding mirrors
+     * Client.serializeCommand, which swallows the failure: a copy here, so the failure reaches the call.
      */
     boolean sendCommand(Protocol.Command cmd) throws IOException {
         ByteArrayOutputStream stream = new ByteArrayOutputStream();

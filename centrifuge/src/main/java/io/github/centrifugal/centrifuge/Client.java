@@ -15,6 +15,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.X509TrustManager;
@@ -143,7 +144,19 @@ public class Client {
      * @param listener: client event handler.
      */
     public Client(final String endpoint, final Options opts, final EventListener listener) {
-        this(endpoint, opts, listener, AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, Executors.newScheduledThreadPool(1));
+        this(endpoint, opts, listener, AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, createScheduler());
+    }
+
+    // A cancelled timer leaves the queue at once. Otherwise a cancelled rpc deadline keeps its call alive until
+    // its delay ends. The policy is missing below Android API 21, where the cancelled timers stay queued.
+    private static ScheduledExecutorService createScheduler() {
+        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1);
+        try {
+            scheduler.setRemoveOnCancelPolicy(true);
+        } catch (NoSuchMethodError e) {
+            // The policy is not in this platform's runtime: the cancelled timers stay queued until their delay ends.
+        }
+        return scheduler;
     }
 
     // The retry bounds and the scheduler are parameters, so that the tests control the time.
@@ -743,7 +756,7 @@ public class Client {
         this.ws.send(ByteString.of(this.serializeCommand(cmd)));
     }
 
-    byte[] serializeCommand(Protocol.Command cmd) {
+    private byte[] serializeCommand(Protocol.Command cmd) {
         ByteArrayOutputStream stream = new ByteArrayOutputStream();
         try {
             cmd.writeDelimitedTo(stream);
