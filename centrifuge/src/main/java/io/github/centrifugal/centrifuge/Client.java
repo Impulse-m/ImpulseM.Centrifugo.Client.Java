@@ -214,7 +214,14 @@ public class Client {
 
     // The retry bounds of the token refresh and the scheduler of the timers are parameters so that the
     // tests can control the time, see ManualScheduler.
-    Client(final String endpoint, final Options opts, final EventListener listener, final int authRetryMinMillis, final int authRetryMaxMillis, final ScheduledExecutorService scheduler) {
+    Client(
+            final String endpoint,
+            final Options opts,
+            final EventListener listener,
+            final int authRetryMinMillis,
+            final int authRetryMaxMillis,
+            final ScheduledExecutorService scheduler
+    ) {
         this.endpoint = endpoint;
         this.opts = opts;
         this.instance = opts.getInstance();
