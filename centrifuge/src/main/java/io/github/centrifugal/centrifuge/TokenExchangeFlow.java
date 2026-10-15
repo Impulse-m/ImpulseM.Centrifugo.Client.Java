@@ -183,7 +183,10 @@ final class TokenExchangeFlow {
     }
 
 
-    /** The connection is gone: the bootstrap is abandoned and its retry is cancelled. The expiry record is kept. */
+    /**
+     * The connection is gone: the bootstrap is abandoned and its retry is cancelled, and the next bootstrap starts its
+     * backoff again. The expiry record is kept.
+     */
     void reset() {
         if (bootstrap != null) {
             cancelTimer(bootstrap);
@@ -192,6 +195,7 @@ final class TokenExchangeFlow {
             }
             bootstrap = null;
         }
+        bootstrapAttempt = 0;
         anonymousConnect = false;
     }
 
@@ -369,8 +373,10 @@ final class TokenExchangeFlow {
         }
         host.storeToken("");
         if (!(failure instanceof ReplyError)) {
+            // The outcome is unknown: the server may have bound the connection to the access token. The connection is
+            // closed, so the reconnect bootstraps on a socket which carries no identity.
             host.reportError(new TokenError(failure));
-            scheduleBootstrapRetry(b);
+            host.closeTransport();
             return;
         }
         ReplyError replyError = (ReplyError) failure;
