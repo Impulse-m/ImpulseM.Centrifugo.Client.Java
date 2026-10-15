@@ -517,8 +517,9 @@ final class RpcSession {
             // A cancel which cannot be encoded is kept like one the transport refused.
             sent = false;
         } catch (Throwable e) {
-            // The transport failed inside the send, or the send hit a linkage failure. The cancel is kept like a refused one,
-            // and the flush goes on: an Error which ended the flush would leave the calls queued for the connect waiting.
+            // Unlike a call, a cancel has no future to take a failure of the send, so it is kept like a refused one and the
+            // failure is reported. Every Throwable is caught here on purpose: an Error which ended the flush would leave the
+            // calls queued for the connect waiting. The write of a call is not caught this way, its future takes the failure.
             sent = false;
             failure = e;
         }

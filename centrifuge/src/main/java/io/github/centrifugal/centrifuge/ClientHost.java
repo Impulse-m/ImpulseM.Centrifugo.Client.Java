@@ -160,7 +160,9 @@ final class ClientHost {
 
     /**
      * The task which reports a failure of its own to the listener, instead of letting it go: the executor
-     * would drop it, and nothing else would tell the caller.
+     * would drop it, and nothing else would tell the caller. The failure goes to the listener as it was
+     * thrown, not wrapped in an {@link UnclassifiedError} as {@link #reportUnclassified} does: the task runs
+     * the listener's own callbacks, and their exceptions keep their type for the listener.
      */
     Runnable reporting(final Runnable task) {
         return () -> {
