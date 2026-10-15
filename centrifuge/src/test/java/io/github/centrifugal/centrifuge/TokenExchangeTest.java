@@ -16,6 +16,7 @@ import java.util.function.BooleanSupplier;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
+import org.junit.Before;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
@@ -53,6 +54,12 @@ public class TokenExchangeTest extends FakeServerTestBase {
     private final List<Throwable> errors = new CopyOnWriteArrayList<>();
     private final List<DisconnectedEvent> disconnects = new CopyOnWriteArrayList<>();
     private final List<String> order = new CopyOnWriteArrayList<>();
+
+
+    @Before
+    public void answerExchangeCommands() {
+        server.exchangeReplies = true;
+    }
 
 
     // The application's storage and exchange: the refresh token it holds, what it stored, and each refresh token
@@ -281,7 +288,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         answerExchanges("access-2|refresh-3");
         clock.advance(delay - 200);
-        Thread.sleep(100);
+        drainExecutor();
         assertEquals("no renewal before the window", 1, storage.exchanged.size());
         clock.advance(300);
         awaitUntil("renewed", () -> refreshTokens().size() == 2);
@@ -330,6 +337,32 @@ public class TokenExchangeTest extends FakeServerTestBase {
         assertTrue(storage.stored.isEmpty());
         clock.advance(60000);
         assertEquals("no reconnect", 1, kinds().stream().filter("connect"::equals).count());
+    }
+
+
+    @Test
+    public void stalledBootstrapExchangeFailsWithinTheTimeoutAndIsRetried() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        StallingStorage storage = new StallingStorage("refresh-1");
+        ManualScheduler clock = new ManualScheduler();
+        Options options = exchangeOptions(storage);
+        options.setTimeout(1000);
+        newClientOnClock(options, clock);
+        client.connect();
+        awaitUntil("first exchange started", () -> storage.held != null);
+        int delaysBefore = clock.requestedDelays().size();
+
+        clock.advance(options.getTimeout());
+
+        awaitUntil("timeout reported", () -> !errors.isEmpty());
+        assertTrue(errors.get(0) instanceof TokenError);
+        assertTrue(connected.isEmpty());
+        awaitUntil("retry scheduled", () -> clock.requestedDelays().size() == delaysBefore + 1);
+        clock.advance(60000);
+        awaitUntil("connected", () -> connected.size() == 1);
+        assertEquals(Arrays.asList("refresh-1", "refresh-1"), storage.exchanged);
+        assertEquals(Arrays.asList("refresh-2"), storage.stored);
     }
 
 
@@ -490,7 +523,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         client.connect();
 
         awaitUntil("connected", () -> connected.size() == 1);
-        Thread.sleep(100);
+        drainExecutor();
         assertEquals(Arrays.asList("connected"), order);
     }
 
@@ -509,7 +542,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         awaitUntil("second bootstrap", () -> storage.exchanged.size() == 2);
         awaitUntil("connected", () -> connected.size() == 1);
         storage.held.onDone(null, new TokenExchangeResult("access-stale", "refresh-stale"));
-        Thread.sleep(100);
+        drainExecutor();
 
         assertEquals(1, connected.size());
         assertEquals(Arrays.asList("refresh-2"), storage.stored);
@@ -669,7 +702,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.close(5000);
         held.get(0).onDone(null, new TokenExchangeResult("access-late", "refresh-late"));
-        Thread.sleep(100);
+        awaitUntil("late result settled", () -> rpcCalls.get() == 1);
 
         assertEquals(1, rpcCalls.get());
         assertTrue(rpcErrors.get(0) instanceof IOException);
@@ -854,6 +887,13 @@ public class TokenExchangeTest extends FakeServerTestBase {
         }
         fail("no renewal timer inside the window: " + clock.requestedDelays());
         return 0L;
+    }
+
+
+    // Waits until the tasks queued on the client executor so far have run, for a check that nothing else happens.
+    private void drainExecutor() throws Exception {
+        client.getExecutor().submit(() -> {
+        }).get(5, TimeUnit.SECONDS);
     }
 
 
