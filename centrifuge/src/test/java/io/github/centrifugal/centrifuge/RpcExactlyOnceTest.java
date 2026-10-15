@@ -800,6 +800,43 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void aSettledCallFreesItsSlotBeforeTheExecutorDeliversIt() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        Options options = instanceOptions();
+        options.setMaxPendingRpc(2);
+        Client c = newClientOnClock(options, clock);
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        CompletableFuture<RPCResult> second = new CompletableFuture<>();
+        c.rpcCall("a", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(100).build(), into(first));
+        c.rpcCall("b", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(100).build(), into(second));
+        // The executor is busy with a long callback, so the delivery of the two calls waits behind it.
+        CountDownLatch busy = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        c.getExecutor().submit(() -> {
+            busy.countDown();
+            try {
+                release.await(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        busy.await(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+
+        clock.advance(100);
+        CompletableFuture<RPCResult> late = new CompletableFuture<>();
+        try {
+            c.rpcCall("c", EMPTY_PAYLOAD, into(late));
+            assertFalse("the settled calls gave their slots back before the executor delivered them", late.isDone());
+        } finally {
+            release.countDown();
+        }
+
+        assertTrue(errorOf(first) instanceof TimeoutException);
+        assertTrue(errorOf(second) instanceof TimeoutException);
+    }
+
+
+    @Test
     public void legacyCallHoldsItsSlotUntilItSettles() throws Exception {
         server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();
         Options options = instanceOptions();

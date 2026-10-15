@@ -27,7 +27,8 @@ import java8.util.concurrent.CompletableFuture;
  * stays in the queue and is sent again, with retransmit set, after the next connect. A call which
  * the server refused with the retry signal is sent again while its attempts and its deadline last.
  * Replies are acknowledged with the next rpc request, and cancels go out as rpc requests of their
- * own. Used on the client's executor thread only, except {@link #submit}.
+ * own. Used on the client's executor thread only, except {@link #submit} and the release of a
+ * call's slot, which runs on the thread that settles the call.
  */
 final class RpcSession {
     // A cancel command on the wire: the msg_id it cancels, and the acks it carries, which go back to
@@ -78,7 +79,7 @@ final class RpcSession {
     private final MsgIdGenerator msgIds = new MsgIdGenerator();
     // The bound of the calls which are not settled, see submit.
     private final int maxPending;
-    // The slots of the bound taken by the calls which are not settled: taken at submit, given back at delivery.
+    // The slots of the bound taken by the calls which are not settled: taken at submit, given back when the call settles.
     private final AtomicInteger pending = new AtomicInteger();
 
 
@@ -114,7 +115,11 @@ final class RpcSession {
                 throw e;
             }
         }
-        call.future.whenComplete((Protocol.Reply reply, Throwable error) -> finishOnExecutor(call, reply, error));
+        // The slot goes back as the call settles, not when the executor gets to its delivery.
+        call.future.whenComplete((Protocol.Reply reply, Throwable error) -> {
+            release(call);
+            finishOnExecutor(call, reply, error);
+        });
     }
 
 
@@ -274,7 +279,7 @@ final class RpcSession {
         int current = pending.get();
         while (current < maxPending) {
             if (pending.compareAndSet(current, current + 1)) {
-                call.holdsSlot = true;
+                call.holdsSlot.set(true);
                 return true;
             }
             current = pending.get();
@@ -283,10 +288,9 @@ final class RpcSession {
     }
 
 
-    // Gives back the slot the call holds, if it holds one.
+    // Gives back the slot the call holds, if it holds one. Runs on the thread which settles the call, once.
     private void release(RpcCall call) {
-        if (call.holdsSlot) {
-            call.holdsSlot = false;
+        if (call.holdsSlot.compareAndSet(true, false)) {
             pending.decrementAndGet();
         }
     }
@@ -663,7 +667,6 @@ final class RpcSession {
     // Hands the outcome of the call to its callback. Reads no session state, so it is safe once the
     // session is gone with the executor.
     private void deliver(RpcCall call, Protocol.Reply reply, Throwable error) {
-        release(call);
         if (reply == null) {
             call.callback.onDone(Extensions.unwrapCompletion(error), null);
             return;

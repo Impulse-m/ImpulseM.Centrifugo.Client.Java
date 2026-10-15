@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 import java8.util.concurrent.CompletableFuture;
@@ -30,9 +31,9 @@ public final class RpcCall {
     final CompletableFuture<Protocol.Reply> future = new CompletableFuture<>();
     long msgId;
     int commandId;
-    // Holds a slot of the bound on the calls of the client, taken at submit and given back at delivery.
-    // A call refused by the bound holds none.
-    boolean holdsSlot;
+    // Holds a slot of the bound on the calls of the client, taken at submit and given back when the call
+    // settles, on whichever thread settles it. A call refused by the bound holds none.
+    final AtomicBoolean holdsSlot = new AtomicBoolean();
     // Written to a transport at least once.
     boolean everSent;
     // The last write carried msg_id, so the server knows the call and may answer a resend.
