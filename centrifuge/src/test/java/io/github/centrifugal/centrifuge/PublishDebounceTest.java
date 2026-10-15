@@ -249,6 +249,4 @@ public class PublishDebounceTest extends RpcTestBase {
         }
         fail("timed out waiting for the reconnect");
     }
-
-
 }
