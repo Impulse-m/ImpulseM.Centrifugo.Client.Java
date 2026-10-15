@@ -135,13 +135,29 @@ final class ClientHost {
 
     /**
      * Sends the command on the current transport. Returns whether the transport took it. Throws when the
-     * command cannot be encoded, so that only the call of the command fails. The encoding mirrors
-     * Client.serializeCommand, which swallows the failure: a copy here, so the failure reaches the call.
+     * command cannot be encoded, so that only the call of the command fails.
      */
     boolean sendCommand(Protocol.Command cmd) throws IOException {
+        return client.ws.send(ByteString.of(encode(cmd)));
+    }
+
+
+    /** Encodes a command as the client writes it. Throws when the encoding fails. */
+    static byte[] encode(Protocol.Command cmd) throws IOException {
         ByteArrayOutputStream stream = new ByteArrayOutputStream();
         cmd.writeDelimitedTo(stream);
-        return client.ws.send(ByteString.of(stream.toByteArray()));
+        return stream.toByteArray();
+    }
+
+
+    /** Encodes a command as the client writes it. A failure is printed, as the client has always printed it. */
+    static byte[] serialize(Protocol.Command cmd) {
+        try {
+            return encode(cmd);
+        } catch (IOException e) {
+            e.printStackTrace();
+            return new byte[0];
+        }
     }
 
 
