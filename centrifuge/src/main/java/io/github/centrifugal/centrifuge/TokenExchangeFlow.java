@@ -196,6 +196,41 @@ final class TokenExchangeFlow {
     }
 
 
+    /**
+     * Writes a plain command on the transport and completes with its reply. The command carries no message
+     * id, is not retransmitted, and is not held for the connected state. Fails with IOException when the
+     * transport is not the current one, or when it refuses the command. Runs on the executor.
+     */
+    static CompletableFuture<Protocol.Reply> writePlain(final ClientHost host, final WebSocket transport, Protocol.Command.Builder builder) {
+        CompletableFuture<Protocol.Reply> future = new CompletableFuture<>();
+        if (host.transport() != transport) {
+            future.completeExceptionally(new IOException());
+            return future;
+        }
+        final int id = host.nextCommandId();
+        host.addFuture(id, future);
+        try {
+            if (!host.sendCommand(builder.setId(id).build())) {
+                future.completeExceptionally(new IOException());
+            }
+        } catch (IOException e) {
+            future.completeExceptionally(e);
+        }
+        return future.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS)
+                .whenComplete((Protocol.Reply reply, Throwable err) -> host.removeFuture(id));
+    }
+
+
+    /** Sends a plain rpc call over the transport and hands its outcome to the callback. Runs on the executor. */
+    static void sendRpc(final ClientHost host, final WebSocket transport, String method, byte[] data, final ResultCallback<RPCResult> cb) {
+        Protocol.Command.Builder builder = Protocol.Command.newBuilder()
+                .setRpc(Protocol.RPCRequest.newBuilder()
+                        .setMethod(method)
+                        .setData(com.google.protobuf.ByteString.copyFrom(data)));
+        writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> host.runOrInline(() -> deliverRpc(host, reply, err, cb)));
+    }
+
+
     // Starts the exchange of a bootstrap. Returns false when the refresh token is empty: the connect then goes on
     // anonymously. Returns true when the connect waits for the exchange or for a retry of it.
     private boolean startExchange(Bootstrap b) {
@@ -517,41 +552,6 @@ final class TokenExchangeFlow {
             return;
         }
         cb.Done(null, result.getToken());
-    }
-
-
-    /**
-     * Writes a plain command on the transport and completes with its reply. The command carries no message
-     * id, is not retransmitted, and is not held for the connected state. Fails with IOException when the
-     * transport is not the current one, or when it refuses the command. Runs on the executor.
-     */
-    static CompletableFuture<Protocol.Reply> writePlain(final ClientHost host, final WebSocket transport, Protocol.Command.Builder builder) {
-        CompletableFuture<Protocol.Reply> future = new CompletableFuture<>();
-        if (host.transport() != transport) {
-            future.completeExceptionally(new IOException());
-            return future;
-        }
-        final int id = host.nextCommandId();
-        host.addFuture(id, future);
-        try {
-            if (!host.sendCommand(builder.setId(id).build())) {
-                future.completeExceptionally(new IOException());
-            }
-        } catch (IOException e) {
-            future.completeExceptionally(e);
-        }
-        return future.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS)
-                .whenComplete((Protocol.Reply reply, Throwable err) -> host.removeFuture(id));
-    }
-
-
-    /** Sends a plain rpc call over the transport and hands its outcome to the callback. Runs on the executor. */
-    static void sendRpc(final ClientHost host, final WebSocket transport, String method, byte[] data, final ResultCallback<RPCResult> cb) {
-        Protocol.Command.Builder builder = Protocol.Command.newBuilder()
-                .setRpc(Protocol.RPCRequest.newBuilder()
-                        .setMethod(method)
-                        .setData(com.google.protobuf.ByteString.copyFrom(data)));
-        writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> host.runOrInline(() -> deliverRpc(host, reply, err, cb)));
     }
 
 
