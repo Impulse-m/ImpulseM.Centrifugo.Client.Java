@@ -235,13 +235,15 @@ final class TokenExchangeFlow {
     }
 
 
-    // The bootstrap exchange got no callback within the client timeout: the attempt fails and is retried. A callback
+    // The bootstrap exchange got no callback within the client timeout. The connection is closed, as a connect which got
+    // no reply is: the reconnect bootstraps again on a new socket, which a silently dead one would never do. A callback
     // which comes later finds the attempt taken and is ignored.
     private void onExchangeTimeout(Bootstrap b, AtomicBoolean called) {
         if (!isCurrent(b) || !called.compareAndSet(false, true)) {
             return;
         }
-        failBootstrap(b, new TimeoutException("token exchange timed out"));
+        host.reportError(new TokenError(new TimeoutException("token exchange timed out")));
+        host.closeTransport();
     }
 
 

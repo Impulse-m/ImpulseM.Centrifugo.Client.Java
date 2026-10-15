@@ -347,7 +347,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
 
     @Test
-    public void stalledBootstrapExchangeFailsWithinTheTimeoutAndIsRetried() throws Exception {
+    public void stalledBootstrapExchangeFailsWithinTheTimeoutAndReconnects() throws Exception {
         answerExchanges("access-1|refresh-2");
         answerIdentity(false, 0);
         StallingStorage storage = new StallingStorage("refresh-1");
@@ -364,11 +364,12 @@ public class TokenExchangeTest extends FakeServerTestBase {
         awaitUntil("timeout reported", () -> !errors.isEmpty());
         assertTrue(errors.get(0) instanceof TokenError);
         assertTrue(connected.isEmpty());
-        awaitUntil("retry scheduled", () -> clock.requestedDelays().size() == delaysBefore + 1);
+        awaitUntil("reconnect scheduled", () -> clock.requestedDelays().size() == delaysBefore + 1);
         clock.advance(60000);
         awaitUntil("connected", () -> connected.size() == 1);
         assertEquals(Arrays.asList("refresh-1", "refresh-1"), storage.exchanged);
         assertEquals(Arrays.asList("refresh-2"), storage.stored);
+        assertEquals(2, kinds().stream().filter("connect"::equals).count());
     }
 
 
