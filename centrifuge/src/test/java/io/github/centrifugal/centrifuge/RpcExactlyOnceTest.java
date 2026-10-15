@@ -280,6 +280,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         enableRpcOptions();
         serveDedup();
         AtomicBoolean failTheNextFlush = new AtomicBoolean();
+        BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
         Client c = newClient(instanceOptions(), new EventListener() {
             @Override
             public void onConnected(Client client, ConnectedEvent event) {
@@ -293,6 +294,14 @@ public class RpcExactlyOnceTest extends RpcTestBase {
             @Override
             public void onDisconnected(Client client, DisconnectedEvent event) {
                 disconnectedSignals.release();
+            }
+
+
+            @Override
+            public void onError(Client client, ErrorEvent event) {
+                reported.add(event.getError());
+                // A listener which throws on the report must not end the flush.
+                throw new IllegalStateException("listener failed on the report");
             }
         });
         connect(c);
@@ -323,6 +332,9 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         awaitCondition("the kept cancel sent with the next connect", () -> cancelsSent().size() == 2);
         Set<Long> sentCancels = new HashSet<>(cancelsSent());
         assertEquals("both cancels are sent", new HashSet<>(Arrays.asList(firstMsgId, secondMsgId)), sentCancels);
+        Throwable failure = reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertTrue("the failed send is reported", failure instanceof IllegalStateException);
+        assertEquals("the failed send is the transport's", "transport failed inside the send", failure.getMessage());
     }
 
 
@@ -340,6 +352,8 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
     // Replaces the transport of the client by one whose first send throws, as a transport can fail inside a send.
     // That send puts the real transport back, since the replies are matched to the transport the client holds.
+    // Coupling: it reads and writes the package-private field Client.ws by name, as no public seam exists for a
+    // failing send. A rename of that field fails the callers with an IllegalStateException wrapping NoSuchFieldException.
     private static void failTheFirstSend(Client c) {
         try {
             Field field = Client.class.getDeclaredField("ws");

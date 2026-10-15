@@ -510,16 +510,16 @@ final class RpcSession {
         CancelCommand command = new CancelCommand(msgId, acks);
         cancelCommands.put(id, command);
         boolean sent;
+        RuntimeException failure = null;
         try {
             sent = host.sendCommand(cmd);
         } catch (IOException e) {
             // A cancel which cannot be encoded is kept like one the transport refused.
             sent = false;
         } catch (RuntimeException e) {
-            // The transport failed inside the send: the cancel is kept like a refused one, and the failure is reported,
-            // since no call waits for the cancel. The caller goes on with the other cancels and the queued calls.
-            host.reportError(e);
+            // The transport failed inside the send: the cancel is kept like a refused one.
             sent = false;
+            failure = e;
         }
         if (sent) {
             // The reply is handled on the executor, after this task, so the timer is set before it can come.
@@ -529,7 +529,22 @@ final class RpcSession {
         host.removeFuture(id);
         cancelCommands.remove(id);
         pendingAcks.addAll(0, acks);
+        if (failure != null) {
+            // Reported after the rollback, since the listener may throw: the caller goes on with the other cancels and the queued calls.
+            reportCancelFailure(failure);
+        }
         return false;
+    }
+
+
+    // Reports the failure of a cancel's send to the listener. The listener's own failure cannot end the flush
+    // of the connect, so it is printed here, as the executor would otherwise drop it.
+    private void reportCancelFailure(RuntimeException cause) {
+        try {
+            host.reportError(cause);
+        } catch (RuntimeException listenerFailure) {
+            listenerFailure.printStackTrace();
+        }
     }
 
 
