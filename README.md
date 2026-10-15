@@ -191,6 +191,62 @@ The refresh timer runs before the token expires. Its errors follow the upstream 
 | 103 permission denied | reported as an `ErrorEvent`, the connection and its identity are kept, and there is no retry. **Deviation:** upstream disconnects with 103. The server refused the identity change of the token the getter returned, and the same token would be refused again. The server ends the connection at its expiry, and the reconnect fetches a token from the getter, so the identity changes then. An application which needs the change now calls `refresh()` and handles 103. |
 | anything else | the connection is disconnected with the server's code, and does not reconnect (upstream) |
 
+### Token exchange over the connection
+
+Instead of a connection token, the application can hand the client a long-lived refresh token, once, and let the client obtain and renew the short access token itself, over the same socket. The application persists the refresh token and supplies three callbacks through `TokenExchange`: `load` reads it, `store` persists a rotated one, and `exchange` trades it for an access token. `Options.setTokenExchange` turns the feature on; it is exclusive with `setTokenGetter`, and a client created with both throws `IllegalArgumentException`.
+
+```java
+SharedPreferences prefs = context.getSharedPreferences("auth", Context.MODE_PRIVATE);
+
+TokenExchange exchange = new TokenExchange() {
+    @Override
+    public String load() {
+        return prefs.getString("refresh_token", null);
+    }
+
+    @Override
+    public void store(String refreshToken) {
+        prefs.edit().putString("refresh_token", refreshToken).apply();
+    }
+
+    @Override
+    public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+        // Encode the request with your own codec. The rpc goes over the connection the exchange runs on.
+        event.rpc("auth.exchange", encodeRequest(event.getRefreshToken()), (Throwable err, RPCResult result) -> {
+            if (err instanceof ReplyError && isRefusal((ReplyError) err)) {
+                // The issuer refused the refresh token, by the code your backend uses: the session is dead.
+                cb.onDone(new UnauthorizedException(), null);
+                return;
+            }
+            if (err != null) {
+                cb.onDone(err, null);
+                return;
+            }
+            // Decode the reply with your own codec: the access token, and the rotated refresh token if there is one.
+            cb.onDone(null, decodeReply(result.getData()));
+        });
+    }
+};
+
+Options options = new Options();
+options.setTokenExchange(exchange);
+Client client = new Client(endpoint, options, listener);
+client.connect();
+```
+
+The flow: when the connection is anonymous (no token), the client runs the exchange on the new socket before it reports the connection as connected. It then sets the access token as the connection token and sends a `refresh` command with it, which binds the connection to the user. The `connected` event fires once, with that user. Every rotated refresh token goes to `store` before the access token issued with it is used. The client renews the access token over the connected socket at a random moment between 70% and 90% of its TTL, so a fleet which connected together spreads its renewals. Without the option, the refresh timer runs at the full TTL, as before.
+
+Several tabs or processes of one installation can share one refresh token, with no lock in the client. The client reads `load` immediately before each exchange and stores the rotated token immediately after. An exchange which is refused is retried once, with the token read again, when another one rotated the token meanwhile. The backend keeps a short grace for the previous refresh token, so two clients which exchange at the same moment both get the same rotated pair.
+
+| Event | When |
+|---|---|
+| `ConnectedEvent` with an empty user | `load` returned no refresh token: the connection stays anonymous |
+| `ErrorEvent` with `TokenError` | an exchange or `store` failed; the exchange is retried with backoff, or the connection goes on |
+| `ErrorEvent` with `RefreshError` | a renewal refresh was refused; the error table of the timer refresh applies |
+| `DisconnectedEvent` with code 1 (`unauthorized`) | the session is dead: the issuer refused the refresh token again, or `load` returned nothing at renewal. The client does not reconnect |
+
+The server must accept a connection without a token (`client.allow_anonymous_connect_without_token: true`), must allow a refresh which changes the user (`client.rebind.enabled: true`), and the exchange method must be callable by an anonymous connection: a registry entry with `auth_class: anonymous`. The calls of that method carry no connection token, so the issuer authenticates the request by the refresh token alone. The access token is the connection token: the usual `client.token` verification applies, and its `exp` drives the renewal.
+
 ## Client error codes
 
 The client reports the calls it did not send, or cancelled, with the codes of `ReplyError`. They are client-local, and the server never sends them:

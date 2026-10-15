@@ -1,6 +1,9 @@
 Unreleased
 ==========
 
+* Token exchange: `Options.setTokenExchange` lets the client obtain and renew its connection token over the connection, from a refresh token the application persists through `TokenExchange` (`load`, `store`, `exchange`). The anonymous connect is completed by an exchange on the same socket before the connection is reported connected, and every rotated refresh token is stored before its access token is used. Exclusive with `setTokenGetter`: a client created with both throws `IllegalArgumentException`.
+* With a token exchange the connection token is renewed at a random moment between 70% and 90% of its TTL, so connections which started together spread their renewals. Without the option the refresh timer runs at the full TTL, as before.
+* A token exchange reports its failures as `ErrorEvent`: `TokenError` for an exchange or a `store` which failed, `RefreshError` for a renewal refused by the server. A dead session is `DisconnectedEvent` with code 1 (`unauthorized`).
 * Connection identity: `onAuth` reports the user and auth class of the connection on every connect, and when a refresh changes them.
 * `Client.refresh(token, callback)` refreshes the connection token on demand. An error is reported unchanged, and keeps the connection and its identity. At most 32 refreshes are in progress, a refresh beyond that fails with `LIMIT_EXCEEDED`.
 * `Options.setInstance` sets the connection instance, a secret the application supplies. With it, rpc calls on a server which confirms RPC options are exactly-once: each call carries a `msg_id`, is kept across a reconnect and sent again with the retransmit flag. Without an instance calls are plain, as before.
