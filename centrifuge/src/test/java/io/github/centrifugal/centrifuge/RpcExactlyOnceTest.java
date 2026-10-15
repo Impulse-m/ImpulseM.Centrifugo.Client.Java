@@ -289,7 +289,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
             public void onConnected(Client client, ConnectedEvent event) {
                 connectedSignals.release();
                 if (failTheNextFlush.getAndSet(false)) {
-                    failTheFirstSend(client);
+                    failTheFirstSend(client, new IllegalStateException("transport failed inside the send"));
                 }
             }
 
@@ -343,6 +343,69 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     }
 
 
+    // An Error from the send of a cancel is handled as a refused cancel: the cancel is kept, and the flush goes on
+    // with the other cancels and the calls queued for the connect.
+    @Test
+    public void cancelWhoseSendFailsWithAnErrorIsKeptAndTheRestOfTheFlushGoesOut() throws Exception {
+        enableRpcOptions();
+        serveDedup();
+        AtomicBoolean failTheNextFlush = new AtomicBoolean();
+        BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
+        Client c = newClient(instanceOptions(), new EventListener() {
+            @Override
+            public void onConnected(Client client, ConnectedEvent event) {
+                connectedSignals.release();
+                if (failTheNextFlush.getAndSet(false)) {
+                    failTheFirstSend(client, new NoClassDefFoundError("transport linkage failed inside the send"));
+                }
+            }
+
+
+            @Override
+            public void onDisconnected(Client client, DisconnectedEvent event) {
+                disconnectedSignals.release();
+            }
+
+
+            @Override
+            public void onError(Client client, ErrorEvent event) {
+                reported.add(event.getError());
+            }
+        });
+        connect(c);
+        holdCalls.set(true);
+        c.rpcCall("first", EMPTY_PAYLOAD, into(new CompletableFuture<>()));
+        c.rpcCall("second", EMPTY_PAYLOAD, into(new CompletableFuture<>()));
+        c.rpcCall("third", EMPTY_PAYLOAD, into(new CompletableFuture<>()));
+        for (int i = 0; i < 3; i++) {
+            assertTrue("call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
+        }
+        Set<Long> msgIds = new HashSet<>();
+        for (Protocol.RPCRequest request : sentRpcRequests()) {
+            msgIds.add(request.getMsgId());
+        }
+        c.disconnect();
+        holdCalls.set(false);
+        CompletableFuture<RPCResult> queuedFuture = new CompletableFuture<>();
+        c.rpcCall("queued", EMPTY_PAYLOAD, into(queuedFuture));
+
+        failTheNextFlush.set(true);
+        c.connect();
+        assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+
+        RPCResult queued = queuedFuture.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertEquals("the call queued for the connect is answered", "{}", new String(queued.getData(), StandardCharsets.UTF_8));
+        awaitCondition("the two cancels which did not fail are sent with the connect", () -> cancelsSent().size() == 2);
+        Throwable failure = reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertTrue("the failed send is reported", failure instanceof UnclassifiedError);
+        assertTrue("the cause is the transport's Error", ((UnclassifiedError) failure).getError() instanceof NoClassDefFoundError);
+        c.disconnect();
+        connect(c);
+        awaitCondition("the kept cancel sent with the next connect", () -> cancelsSent().size() == 3);
+        assertEquals("every cancel is sent", msgIds, new HashSet<>(cancelsSent()));
+    }
+
+
     // The msg_ids of the cancels the client sent.
     private List<Long> cancelsSent() {
         List<Long> msgIds = new ArrayList<>();
@@ -360,7 +423,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     // That send puts the real transport back, since the replies are matched to the transport the client holds.
     // Coupling: it reads and writes the package-private field Client.ws by name, as no public seam exists for a
     // failing send. A rename of that field fails the callers with an IllegalStateException wrapping NoSuchFieldException.
-    private static void failTheFirstSend(Client c) {
+    private static void failTheFirstSend(Client c, Throwable failure) {
         try {
             Field field = Client.class.getDeclaredField("ws");
             field.setAccessible(true);
@@ -369,7 +432,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
             InvocationHandler handler = (Object proxy, Method method, Object[] args) -> {
                 if (method.getName().equals("send") && isCancelPayload(args[0]) && !failed.getAndSet(true)) {
                     field.set(c, transport);
-                    throw new IllegalStateException("transport failed inside the send");
+                    throw failure;
                 }
                 try {
                     return method.invoke(transport, args);

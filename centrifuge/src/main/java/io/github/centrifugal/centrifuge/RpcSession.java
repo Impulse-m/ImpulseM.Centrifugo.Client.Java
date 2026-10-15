@@ -510,14 +510,15 @@ final class RpcSession {
         CancelCommand command = new CancelCommand(msgId, acks);
         cancelCommands.put(id, command);
         boolean sent;
-        RuntimeException failure = null;
+        Throwable failure = null;
         try {
             sent = host.sendCommand(cmd);
         } catch (IOException e) {
             // A cancel which cannot be encoded is kept like one the transport refused.
             sent = false;
-        } catch (RuntimeException e) {
-            // The transport failed inside the send: the cancel is kept like a refused one.
+        } catch (Throwable e) {
+            // The transport failed inside the send, or the send hit a linkage failure. The cancel is kept like a refused one,
+            // and the flush goes on: an Error which ended the flush would leave the calls queued for the connect waiting.
             sent = false;
             failure = e;
         }
