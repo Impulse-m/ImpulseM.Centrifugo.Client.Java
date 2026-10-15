@@ -246,7 +246,8 @@ final class RpcSession {
      * wait until it drains below the bound. The acks carried by a command which was lost with the
      * transport go back to the pending acks: the server may not have seen them, and a repeated ack
      * is harmless. A call which settled locally and waits for a late reply has no reply to wait for
-     * any more: its wait ends here.
+     * any more: its wait ends here. At a terminal loss a written tracked call keeps its cancel for the
+     * next connection which confirms RPC options, and the pending acks are dropped.
      */
     void onTransportLost(boolean keep) {
         // An answer which the executor has not decided on yet is decided first: a refusal with the retry signal then
@@ -269,6 +270,10 @@ final class RpcSession {
             if (keep && call.wireTracked) {
                 lost.add(call);
             } else {
+                // A written call the client gives up for good keeps its cancel: the server may run it.
+                if (call.wireTracked) {
+                    keepCancel(call.msgId);
+                }
                 call.future.completeExceptionally(new IOException());
             }
         }
@@ -295,6 +300,8 @@ final class RpcSession {
             queue.add(call);
         }
         if (!keep) {
+            // A terminal loss drops the pending acks. The kept cancels are sent later without acks.
+            pendingAcks.clear();
             for (RpcCall call : queue.drain()) {
                 call.future.completeExceptionally(closedError(call));
             }

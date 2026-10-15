@@ -242,6 +242,29 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void writtenCallRejectedByDisconnectForGoodKeepsItsCancelForTheNextConnect() throws Exception {
+        enableRpcOptions();
+        serveDedup();
+        Client c = newClient();
+        connect(c);
+        holdCalls.set(true);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("long", EMPTY_PAYLOAD, into(future));
+        assertTrue("call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
+        long msgId = sentRpcRequests().get(0).getMsgId();
+
+        c.disconnect();
+
+        assertTrue("the written call fails with the transport", errorOf(future) instanceof IOException);
+        connect(c);
+        Protocol.RPCRequest cancel = awaitCancel(msgId);
+        assertEquals(msgId, cancel.getCancel());
+        long calls = sentRpcRequests().stream().filter((Protocol.RPCRequest request) -> request.getCancel() == 0).count();
+        assertEquals("the written call is not sent again", 1, calls);
+    }
+
+
+    @Test
     public void rpcAfterCloseThrowsAndItsCallbackNeverFires() throws Exception {
         Client c = newClient();
         c.close(1000);
