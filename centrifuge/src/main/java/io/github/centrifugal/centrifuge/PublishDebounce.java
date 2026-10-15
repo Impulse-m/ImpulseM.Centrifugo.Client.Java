@@ -28,7 +28,7 @@ final class PublishDebounce {
     }
 
 
-    void publish(final byte[] data, final int intervalMillis, final ResultCallback<PublishResult> cb) {
+    void publish(final byte[] data, final long intervalMillis, final ResultCallback<PublishResult> cb) {
         if (this.timer == null) {
             this.client.publish(this.channel, data, cb);
             this.arm(intervalMillis);
@@ -49,7 +49,7 @@ final class PublishDebounce {
     }
 
 
-    private void arm(final int intervalMillis) {
+    private void arm(final long intervalMillis) {
         final long armed = ++this.generation;
         this.timer = this.client.getScheduler().schedule(
                 () -> this.client.getExecutor().submit(() -> this.fire(armed, intervalMillis)),
@@ -59,7 +59,7 @@ final class PublishDebounce {
     }
 
 
-    private void fire(final long armed, final int intervalMillis) {
+    private void fire(final long armed, final long intervalMillis) {
         if (armed != this.generation) {
             return;
         }

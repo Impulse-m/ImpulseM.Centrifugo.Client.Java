@@ -39,7 +39,7 @@ public class Subscription {
     // so a stale token from an earlier attempt cannot land on a later one.
     private long subscribeEpoch = 0;
     // Publish debounce window in milliseconds the server returned on subscribe, 0 when off.
-    private int publishDebounceMillis = 0;
+    private long publishDebounceMillis = 0;
     // Created on the first debounced publish, so subscriptions without debounce allocate nothing.
     private PublishDebounce publishDebounce;
 
@@ -236,7 +236,7 @@ public class Subscription {
         }
         this.setEpoch(result.getEpoch());
         this.deltaNegotiated = result.getDelta();
-        this.publishDebounceMillis = result.getPublishDebounce();
+        this.publishDebounceMillis = Integer.toUnsignedLong(result.getPublishDebounce());
         // Channel compaction: register the numeric channel ID assigned by the
         // server (0 when not negotiated — also clears a stale ID from a previous
         // subscribe session).

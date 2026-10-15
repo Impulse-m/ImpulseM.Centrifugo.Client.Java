@@ -31,6 +31,8 @@ public class PublishDebounceTest extends FakeServerTestBase {
     private static final String MARKER_CHANNEL = "marker";
     private static final String REFUSED_DATA = "refused";
     private static final int DEBOUNCE_MILLIS = 30;
+    // Above Integer.MAX_VALUE, so the window only survives if it is read as unsigned.
+    private static final long LARGE_DEBOUNCE_MILLIS = 3_600_000_000L;
     private static final int FAST_RETRY_MIN_MILLIS = 50;
     private static final int FAST_RETRY_MAX_MILLIS = 100;
     private static final long WAIT_MILLIS = 5000L;
@@ -135,6 +137,20 @@ public class PublishDebounceTest extends FakeServerTestBase {
 
 
     @Test
+    public void windowAboveSignedIntRangeIsHonoured() throws Exception {
+        startDebounced(LARGE_DEBOUNCE_MILLIS);
+
+        assertNoError(publish("1"));
+        awaitPublishedCount(1);
+        assertNoError(publish("2"));
+        syncWithServer();
+
+        assertEquals(Arrays.asList("1"), published);
+        assertTrue("the window is the full server value", clock.requestedDelays().contains(LARGE_DEBOUNCE_MILLIS));
+    }
+
+
+    @Test
     public void timerDrivenPublishRefusedByServerDoesNotStopTheNextWindow() throws Exception {
         startDebounced(DEBOUNCE_MILLIS);
 
@@ -157,9 +173,10 @@ public class PublishDebounceTest extends FakeServerTestBase {
 
 
     /** Connects a client on the manual clock and subscribes to the debounced channel. */
-    private void startDebounced(final int debounceMillis) throws Exception {
+    private void startDebounced(final long debounceMillis) throws Exception {
         server.onSubscribe = (channel, req) -> Protocol.SubscribeResult.newBuilder()
-                .setPublishDebounce(debounceMillis)
+                // The wire field is uint32, which the generated Java setter takes as the same int bits.
+                .setPublishDebounce((int) debounceMillis)
                 .build();
         server.onCommand = cmd -> {
             if (!cmd.hasPublish()) {
