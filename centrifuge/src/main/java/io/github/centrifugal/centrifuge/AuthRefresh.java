@@ -97,7 +97,7 @@ final class AuthRefresh {
 
     /**
      * Refreshes the connection with a token the caller gave. Runs on the executor. A refresh with the
-     * token of the last pending refresh call shares its command, otherwise it waits its turn. A refresh
+     * token of a pending refresh call shares its command, otherwise it waits its turn. A refresh
      * beyond the bound of the refresh calls in progress is refused at once with LIMIT_EXCEEDED.
      */
     void refreshWith(String token, ResultCallback<AuthResult> cb) {
@@ -418,14 +418,14 @@ final class AuthRefresh {
     }
 
 
-    // The callbacks of the last requested refresh which is pending, when it has the token: a queued
-    // one, or else the one in flight. Null when the token starts a refresh of its own.
+    // The callbacks of a requested refresh which is pending with the token: the newest queued one with it,
+    // or else the one in flight. Null when the token starts a refresh of its own.
     private List<ResultCallback<AuthResult>> pendingCallbacksWith(String token) {
         Iterator<Waiting> queued = waiting.descendingIterator();
         while (queued.hasNext()) {
             Waiting entry = queued.next();
-            if (entry.token != null) {
-                return entry.token.equals(token) ? entry.callbacks : null;
+            if (entry.token != null && entry.token.equals(token)) {
+                return entry.callbacks;
             }
         }
         if (inFlightToken != null && inFlightToken.equals(token)) {

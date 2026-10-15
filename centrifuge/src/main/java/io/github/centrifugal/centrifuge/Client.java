@@ -1643,7 +1643,7 @@ public class Client {
      * refresh timer is rescheduled from the new TTL. An error leaves the connection and its
      * identity as they were. Calls to {@link #rpc} issued while the refresh is in flight are sent
      * after its reply, so they run under the new identity. Refresh commands are sent one after
-     * another, in call order. A refresh with the same token as the last refresh still pending shares
+     * another, in call order. A refresh with the same token as a refresh still pending shares
      * its command and its callback; a refresh with another token waits for it. At most 32 refresh calls
      * are in progress: a refresh beyond that calls back with {@link ReplyError#LIMIT_EXCEEDED}. A refresh
      * made while the client is not connected sets the token the next connect sends; when the server

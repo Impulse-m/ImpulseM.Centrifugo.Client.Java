@@ -431,6 +431,31 @@ public class AuthTest extends RpcTestBase {
 
 
     @Test
+    public void refreshWithTheTokenInFlightSharesItPastAQueuedOtherToken() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        newAuthClient(new Options());
+        connect(client);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+
+        CompletableFuture<AuthResult> first = refresh(client, "token-a");
+        CompletableFuture<AuthResult> queued = refresh(client, "token-b");
+        CompletableFuture<AuthResult> shared = refresh(client, "token-a");
+        awaitCondition("first refresh sent", () -> refreshTokens().size() == 1);
+        syncWithServer();
+        assertEquals(Arrays.asList("token-a"), refreshTokens());
+
+        server.releaseDeferredCommands();
+        awaitCondition("second refresh sent", () -> refreshTokens().size() == 2);
+        server.releaseDeferredCommands();
+
+        first.get(5, TimeUnit.SECONDS);
+        queued.get(5, TimeUnit.SECONDS);
+        shared.get(5, TimeUnit.SECONDS);
+        assertEquals("the third call shares the command in flight: one command per token", Arrays.asList("token-a", "token-b"), refreshTokens());
+    }
+
+
+    @Test
     public void aThrowingCallbackDoesNotStopTheOthersSharingItsRefresh() throws Exception {
         server.connectResult = connectResultFor("u1", "authenticated");
         newAuthClient(new Options());
