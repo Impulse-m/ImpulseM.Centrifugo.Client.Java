@@ -268,7 +268,7 @@ final class AuthRefresh {
                 return;
             }
             commandInFlight = true;
-            client.refreshSynchronized(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishTimer(transport, token, error, result)));
+            sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishTimer(transport, token, error, result)));
             awaitingCommand = true;
         } finally {
             if (!awaitingCommand) {
@@ -348,7 +348,43 @@ final class AuthRefresh {
         inFlightToken = token;
         inFlightCallbacks = callbacks;
         commandInFlight = true;
-        client.refreshSynchronized(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishRequested(token, error, result, callbacks)));
+        sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> Extensions.runOnExecutor(client.getExecutor(), () -> finishRequested(token, error, result, callbacks)));
+    }
+
+
+    // Sends the refresh command with the token and hands its outcome to the callback. The command gets the
+    // client timeout as its reply deadline; the callback is called once, with the error or the result.
+    private void sendRefreshCommand(String token, ResultCallback<Protocol.RefreshResult> cb) {
+        Protocol.RefreshRequest req = Protocol.RefreshRequest.newBuilder()
+                .setToken(token)
+                .build();
+
+        Protocol.Command cmd = Protocol.Command.newBuilder()
+                .setId(client.nextCommandId())
+                .setRefresh(req)
+                .build();
+
+        CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
+        // One stage delivers the outcome, so a callback which throws is never called a second time.
+        f.orTimeout(client.getOpts().getTimeout(), TimeUnit.MILLISECONDS).handle((Protocol.Reply reply, Throwable e) -> {
+            if (e != null) {
+                Extensions.runOnExecutor(client.getExecutor(), () -> {
+                    client.cleanCommandFuture(cmd);
+                    cb.onDone(Extensions.unwrapCompletion(e), null);
+                });
+                return null;
+            }
+            client.cleanCommandFuture(cmd);
+            if (reply.getError().getCode() != 0) {
+                cb.onDone(client.getReplyError(reply), null);
+            } else {
+                Protocol.RefreshResult replyResult = reply.getRefresh();
+                cb.onDone(null, replyResult);
+            }
+            return null;
+        });
+
+        client.enqueueCommandFuture(cmd, f);
     }
 
 

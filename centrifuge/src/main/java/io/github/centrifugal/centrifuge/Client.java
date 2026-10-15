@@ -1355,7 +1355,7 @@ public class Client {
         }
     }
 
-    private void enqueueCommandFuture(Protocol.Command cmd, CompletableFuture<Protocol.Reply> f) {
+    void enqueueCommandFuture(Protocol.Command cmd, CompletableFuture<Protocol.Reply> f) {
         this.futures.put(cmd.getId(), f);
         if (this.getState() != ClientState.CONNECTED) {
             this.connectCommands.put(cmd.getId(), cmd);
@@ -1378,7 +1378,7 @@ public class Client {
         );
     }
 
-    private void cleanCommandFuture(Protocol.Command cmd) {
+    void cleanCommandFuture(Protocol.Command cmd) {
         this.futures.remove(cmd.getId());
         if (this.connectCommands.get(cmd.getId()) != null) {
             this.connectCommands.remove(cmd.getId());
@@ -1658,39 +1658,6 @@ public class Client {
             throw new NullPointerException("token must not be null");
         }
         this.executor.submit(() -> Client.this.auth.refreshWith(token, cb));
-    }
-
-    void refreshSynchronized(String token, ResultCallback<Protocol.RefreshResult> cb) {
-        Protocol.RefreshRequest req = Protocol.RefreshRequest.newBuilder()
-                .setToken(token)
-                .build();
-
-        Protocol.Command cmd = Protocol.Command.newBuilder()
-                .setId(this.getNextId())
-                .setRefresh(req)
-                .build();
-
-        CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
-        // One stage delivers the outcome, so a callback which throws is never called a second time.
-        f.orTimeout(this.opts.getTimeout(), TimeUnit.MILLISECONDS).handle((Protocol.Reply reply, Throwable e) -> {
-            if (e != null) {
-                Extensions.runOnExecutor(this.executor, () -> {
-                    Client.this.cleanCommandFuture(cmd);
-                    cb.onDone(Extensions.unwrapCompletion(e), null);
-                });
-                return null;
-            }
-            this.cleanCommandFuture(cmd);
-            if (reply.getError().getCode() != 0) {
-                cb.onDone(getReplyError(reply), null);
-            } else {
-                Protocol.RefreshResult replyResult = reply.getRefresh();
-                cb.onDone(null, replyResult);
-            }
-            return null;
-        });
-
-        this.enqueueCommandFuture(cmd, f);
     }
 
     void subRefreshSynchronized(String channel, String token, ResultCallback<Protocol.SubRefreshResult> cb) {
