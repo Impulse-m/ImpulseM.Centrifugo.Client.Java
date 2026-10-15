@@ -477,6 +477,32 @@ public class AuthTest extends RpcTestBase {
 
 
     @Test
+    public void timerTokenFetchedWhileDisconnectedIsTheTokenOfTheNextConnect() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        ManualScheduler clock = new ManualScheduler();
+        List<TokenCallback> fetches = new CopyOnWriteArrayList<>();
+        Options options = recordingTokenOptions(fetches);
+        options.setMinReconnectDelay(1);
+        options.setMaxReconnectDelay(1);
+        newAuthClientOnClock(options, clock);
+        connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+        clock.advance(1000);
+        awaitCondition("timer fetch started", () -> fetches.size() == 1);
+
+        int scheduled = clock.requestedDelays().size();
+        server.closeConnection();
+        awaitCondition("the reconnect is scheduled", () -> clock.requestedDelays().size() > scheduled);
+        fetches.get(0).Done(null, "token-next");
+        awaitCondition("the token of the fetch is kept for the next connect", () -> "token-next".equals(client.token));
+
+        clock.advance(2);
+        awaitCondition("reconnected", () -> client.getState() == ClientState.CONNECTED);
+        assertEquals("token-next", lastConnectRequest().getToken());
+    }
+
+
+    @Test
     public void refreshWithTheSameTokenSharesOneCommand() throws Exception {
         server.connectResult = connectResultFor("u1", "authenticated");
         newAuthClient(new Options());

@@ -89,6 +89,8 @@ final class AuthRefresh {
     // was dropped behind a refused refresh. A refused refresh then arms the retry, since the connection would
     // otherwise have no timer. Cleared when a token is accepted or the retry is armed.
     private boolean timerSuperseded = false;
+    // Moves on with each refresh() call accepted and each token accepted. A timer token fetched under an older value is superseded.
+    private long refreshGeneration = 0;
     // Identity the server last reported for the connection, see applyAuth. Used on the executor thread only.
     private String currentUser = "";
     private String currentAuthClass = "";
@@ -123,6 +125,7 @@ final class AuthRefresh {
             return;
         }
         requestedInProgress++;
+        refreshGeneration++;
         if (host.state() != ClientState.CONNECTED) {
             keepTokenForConnect(token);
         }
@@ -244,6 +247,7 @@ final class AuthRefresh {
 
     private void fetchAndRefresh() {
         WebSocket transport = host.transport();
+        final long generation = refreshGeneration;
         if (host.state() != ClientState.CONNECTED) {
             complete(false);
             return;
@@ -263,15 +267,19 @@ final class AuthRefresh {
             fetched.completeExceptionally(e);
         }
         fetched.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS)
-                .whenComplete((String token, Throwable err) -> runOnExecutorOrInline(() -> onTokenFetched(transport, Extensions.unwrapCompletion(err), token)));
+                .whenComplete((String token, Throwable err) -> runOnExecutorOrInline(() -> onTokenFetched(transport, generation, Extensions.unwrapCompletion(err), token)));
     }
 
 
-    private void onTokenFetched(WebSocket transport, Throwable err, String token) {
+    private void onTokenFetched(WebSocket transport, long generation, Throwable err, String token) {
         // The refresh in flight is completed here, unless a refresh command goes out: its callback completes it.
         boolean awaitingCommand = false;
         try {
-            if (transport != host.transport() || host.state() != ClientState.CONNECTED) {
+            if (transport != host.transport() || host.state() == ClientState.CLOSED) {
+                return;
+            }
+            if (host.state() != ClientState.CONNECTED) {
+                keepTimerTokenForConnect(err, token, generation);
                 return;
             }
             // A refresh() which started during the fetch waits behind it. This token is superseded: it is not sent,
@@ -323,6 +331,7 @@ final class AuthRefresh {
             if (error == null) {
                 host.storeToken(token);
                 timerSuperseded = false;
+                refreshGeneration++;
                 scheduleExpiry(result.getExpires(), result.getTtl());
                 applyAuth(result.getUser(), result.getAuthClass(), false);
                 return;
@@ -366,6 +375,7 @@ final class AuthRefresh {
             host.storeToken(token);
             connectTokenStored = false;
             timerSuperseded = false;
+            refreshGeneration++;
             if (host.state() == ClientState.CONNECTED) {
                 scheduleExpiry(result.getExpires(), result.getTtl());
             }
@@ -483,6 +493,20 @@ final class AuthRefresh {
             return inFlightCallbacks;
         }
         return null;
+    }
+
+
+    // A timer token fetched while the connection is down, on the connection of the fetch, is the token of the
+    // next connect, unless a refresh() call or an accepted token superseded it since the fetch started.
+    private void keepTimerTokenForConnect(Throwable err, String token, long generation) {
+        if (err != null || generation != refreshGeneration) {
+            return;
+        }
+        if (token == null || token.isEmpty()) {
+            host.failUnauthorized();
+            return;
+        }
+        host.storeToken(token);
     }
 
 
