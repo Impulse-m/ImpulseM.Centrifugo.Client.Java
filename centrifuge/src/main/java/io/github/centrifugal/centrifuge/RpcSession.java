@@ -28,7 +28,8 @@ import java8.util.concurrent.CompletableFuture;
  * the server refused with the retry signal is sent again while its attempts and its deadline last.
  * Replies are acknowledged with the next rpc request, and cancels go out as rpc requests of their
  * own. Used on the client's executor thread only, except {@link #submit} and the release of a
- * call's slot, which runs on the thread that settles the call.
+ * call's slot, which runs on the thread that settles the call. Once the executor is closed, a call
+ * which settles runs its delivery inline on that thread: the delivery reads no session state.
  */
 final class RpcSession {
     // A cancel command on the wire: the msg_id it cancels, and the acks it carries, which go back to
@@ -434,13 +435,13 @@ final class RpcSession {
                 .setRpc(req)
                 .build();
         CompletableFuture<Protocol.Reply> reply = new CompletableFuture<>();
-        reply.whenComplete((Protocol.Reply answer, Throwable error) -> forgetCancelOnExecutor(id));
+        reply.whenComplete((Protocol.Reply answer, Throwable error) -> Extensions.submitOrIgnore(client.getExecutor(), () -> forgetCancel(id)));
         client.addFuture(id, reply);
         CancelCommand command = new CancelCommand(msgId, acks);
         cancelCommands.put(id, command);
         if (client.sendCommand(cmd)) {
             // The reply is handled on the executor, after this task, so the timer is set before it can come.
-            command.timer = client.getScheduler().schedule(() -> forgetCancelOnExecutor(id), client.getOpts().getTimeout(), TimeUnit.MILLISECONDS);
+            command.timer = client.getScheduler().schedule(() -> Extensions.submitOrIgnore(client.getExecutor(), () -> forgetCancel(id)), client.getOpts().getTimeout(), TimeUnit.MILLISECONDS);
             return true;
         }
         client.removeFuture(id);
@@ -450,13 +451,8 @@ final class RpcSession {
     }
 
 
-    // Ends the wait for the reply of a cancel command, from its reply or its timeout. Runs on the
-    // executor. A closed executor has forgotten the cancel with the connection.
-    private void forgetCancelOnExecutor(int id) {
-        Extensions.submitOrIgnore(client.getExecutor(), () -> forgetCancel(id));
-    }
-
-
+    // Ends the wait for the reply of a cancel command, from its reply or its timeout. Runs on the executor,
+    // and is dropped once the executor is closed: the cancel was forgotten with the connection then.
     private void forgetCancel(int id) {
         client.removeFuture(id);
         CancelCommand command = cancelCommands.remove(id);
@@ -470,6 +466,15 @@ final class RpcSession {
         List<Long> acks = new ArrayList<>(pendingAcks);
         pendingAcks.clear();
         return acks;
+    }
+
+
+    // Acks a call whose reply was received, success or error, with the next rpc request. Only a tracked call has a
+    // msg_id the server keeps a record of.
+    private void acknowledge(RpcCall call) {
+        if (call.wireTracked) {
+            pendingAcks.add(call.msgId);
+        }
     }
 
 
@@ -560,8 +565,8 @@ final class RpcSession {
                 // The server may still run a sent call, so the deadline cancels it as cancel() does.
                 sendCancel(call.msgId);
             }
-        } else if (call.wireTracked) {
-            pendingAcks.add(call.msgId);
+        } else {
+            acknowledge(call);
         }
         deliver(call, reply, error);
     }
@@ -634,8 +639,8 @@ final class RpcSession {
             return;
         }
         if (call.future.isDone()) {
-            if (reply != null && call.wireTracked) {
-                pendingAcks.add(call.msgId);
+            if (reply != null) {
+                acknowledge(call);
             }
             stopLate(call);
             forgetAttempt(call);
@@ -648,9 +653,9 @@ final class RpcSession {
             return;
         }
         call.answered = reply != null;
-        if (!completeCall(call, reply, error) && reply != null && call.wireTracked) {
-            // The deadline settled the call before this reply came to the executor: the reply is acked as a late one.
-            pendingAcks.add(call.msgId);
+        // A reply which the deadline settled before it came to the executor is acked as a late one.
+        if (!completeCall(call, reply, error) && reply != null) {
+            acknowledge(call);
         }
     }
 
