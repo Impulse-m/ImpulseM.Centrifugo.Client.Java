@@ -72,6 +72,14 @@ final class TokenExchangeFlow {
     }
 
 
+    // A renewal exchange. Its callback is called once: by the exchange, or by the deadline when the exchange is late.
+    private static final class Renewal {
+        final AtomicBoolean called = new AtomicBoolean();
+        // The client timeout of the exchange, cancelled when its callback comes.
+        ScheduledFuture<?> deadline;
+    }
+
+
     private final ClientHost host;
     private final TokenExchange exchange;
     private final ConnectionTokenGetter renewalGetter;
@@ -299,10 +307,7 @@ final class TokenExchangeFlow {
             storeAbandonedRotation(result, refreshToken);
             return;
         }
-        // A refresh(token) call made since the exchange started holds the newest refresh token: it is not overwritten.
-        if (generation == host.refreshGeneration()) {
-            storeRotation(result, refreshToken);
-        }
+        storeRotationSince(result, refreshToken, generation);
         if (err instanceof UnauthorizedException) {
             reloadAfterRefusal(b, refreshToken, reloaded);
             return;
@@ -489,6 +494,17 @@ final class TokenExchangeFlow {
     }
 
 
+    // The rotation of an exchange started at the given refresh generation. A refresh(token) call since then holds a newer
+    // refresh token, so the rotation is stored only while the application still holds the one the exchange used.
+    private void storeRotationSince(TokenExchangeResult result, String refreshToken, long generation) {
+        if (generation == host.refreshGeneration()) {
+            storeRotation(result, refreshToken);
+        } else {
+            storeAbandonedRotation(result, refreshToken);
+        }
+    }
+
+
     // Hands a rotated refresh token to the application, before the access token of the result is used. A failure
     // is reported and the exchange goes on: the issuer already consumed the pair.
     private void storeRotation(TokenExchangeResult result, String refreshToken) {
@@ -530,6 +546,7 @@ final class TokenExchangeFlow {
     // The connection token of the timer refresh: an exchange over the connected socket. Runs on the executor.
     private void renew(TokenCallback cb) {
         WebSocket transport = host.transport();
+        final long generation = host.refreshGeneration();
         String refreshToken;
         try {
             refreshToken = exchange.load();
@@ -541,21 +558,26 @@ final class TokenExchangeFlow {
             cb.Done(new UnauthorizedException(), null);
             return;
         }
-        runRenewal(transport, cb, refreshToken, false);
+        runRenewal(transport, cb, refreshToken, false, generation);
     }
 
 
-    private void runRenewal(final WebSocket transport, final TokenCallback cb, final String refreshToken, final boolean reloaded) {
-        final AtomicBoolean called = new AtomicBoolean();
+    // Runs one renewal exchange. The client timeout is its deadline: a result which comes after it is not delivered to the
+    // callback, its rotation is stored as an abandoned one's, see storeAbandonedRotation.
+    private void runRenewal(final WebSocket transport, final TokenCallback cb, final String refreshToken, final boolean reloaded, final long generation) {
+        final Renewal renewal = new Renewal();
         try {
+            renewal.deadline = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> onRenewalTimeout(cb, renewal)), host.timeoutMillis(), TimeUnit.MILLISECONDS);
             exchange.exchange(new TokenExchangeEvent(host, transport, refreshToken), (Throwable err, TokenExchangeResult result) -> {
-                if (called.compareAndSet(false, true)) {
-                    host.runOrInline(() -> onRenewed(transport, cb, refreshToken, reloaded, err, result));
+                if (renewal.called.compareAndSet(false, true)) {
+                    host.runOrInline(() -> onRenewed(renewal, transport, cb, refreshToken, reloaded, generation, err, result));
+                } else {
+                    host.runOrInline(() -> storeAbandonedRotation(result, refreshToken));
                 }
             });
         } catch (RuntimeException e) {
-            if (called.compareAndSet(false, true)) {
-                onRenewed(transport, cb, refreshToken, reloaded, e, null);
+            if (renewal.called.compareAndSet(false, true)) {
+                onRenewed(renewal, transport, cb, refreshToken, reloaded, generation, e, null);
             } else {
                 host.reportError(new TokenError(e));
             }
@@ -563,14 +585,25 @@ final class TokenExchangeFlow {
     }
 
 
-    private void onRenewed(WebSocket transport, TokenCallback cb, String refreshToken, boolean reloaded, Throwable err, TokenExchangeResult result) {
+    // The deadline of a renewal exchange came first: the callback fails, and the late result is not delivered.
+    private void onRenewalTimeout(TokenCallback cb, Renewal renewal) {
+        if (renewal.called.compareAndSet(false, true)) {
+            cb.Done(new TimeoutException("token exchange timed out"), null);
+        }
+    }
+
+
+    private void onRenewed(Renewal renewal, WebSocket transport, TokenCallback cb, String refreshToken, boolean reloaded, long generation, Throwable err, TokenExchangeResult result) {
+        if (renewal.deadline != null) {
+            renewal.deadline.cancel(false);
+        }
         // The renewal result of a connection which went away is not used, but its rotation is stored as the bootstrap's is.
         if (transport != host.transport() || host.state() != ClientState.CONNECTED) {
             storeAbandonedRotation(result, refreshToken);
             cb.Done(new IOException("connection lost"), null);
             return;
         }
-        storeRotation(result, refreshToken);
+        storeRotationSince(result, refreshToken, generation);
         if (err instanceof UnauthorizedException) {
             if (reloaded) {
                 cb.Done(err, null);
@@ -587,7 +620,7 @@ final class TokenExchangeFlow {
                 cb.Done(new UnauthorizedException(), null);
                 return;
             }
-            runRenewal(transport, cb, again, true);
+            runRenewal(transport, cb, again, true, generation);
             return;
         }
         if (err != null) {

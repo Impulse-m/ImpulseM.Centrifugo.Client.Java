@@ -27,6 +27,7 @@ import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -118,19 +119,27 @@ public class TokenExchangeTest extends FakeServerTestBase {
     }
 
 
-    // An exchange whose callback the test completes itself, after the connection changed.
+    // An exchange whose callback the test completes itself: the one numbered stallOn (1 is the first exchange, the
+    // bootstrap's), after the connection or the timer changed.
     private static final class StallingStorage extends Storage {
         volatile ResultCallback<TokenExchangeResult> held;
+        private final int stallOn;
 
 
         StallingStorage(String refreshToken) {
+            this(refreshToken, 1);
+        }
+
+
+        StallingStorage(String refreshToken, int stallOn) {
             super(refreshToken);
+            this.stallOn = stallOn;
         }
 
 
         @Override
         public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
-            if (held == null) {
+            if (held == null && exchanged.size() == stallOn - 1) {
                 exchanged.add(event.getRefreshToken());
                 held = cb;
                 return;
@@ -722,6 +731,88 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
 
     @Test
+    public void renewalLateAfterItsTimeoutIsStoredWhileTheAppHoldsTheUsedToken() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        StallingStorage storage = new StallingStorage("refresh-1", 2);
+        ManualScheduler clock = new ManualScheduler();
+        Options options = exchangeOptions(storage);
+        options.setTimeout(1000);
+        newClientOnClock(options, clock);
+        client.connect();
+        awaitUntil("connected", () -> connected.size() == 1);
+        clock.advance(renewalDelay(clock));
+        awaitUntil("renewal exchange started", () -> storage.held != null);
+
+        clock.advance(options.getTimeout());
+        awaitUntil("timeout reported", () -> !errors.isEmpty());
+        storage.held.onDone(null, new TokenExchangeResult("access-2", "refresh-3"));
+        drainExecutor();
+
+        assertEquals(Arrays.asList("refresh-2", "refresh-3"), storage.stored);
+        assertEquals("access-1", lastRefreshToken());
+        assertEquals(1, connected.size());
+        assertTrue(errors.get(0) instanceof TokenError);
+        assertEquals(1, errors.size());
+    }
+
+
+    @Test
+    public void renewalLateAfterItsTimeoutIsNotStoredAfterLogout() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        StallingStorage storage = new StallingStorage("refresh-1", 2);
+        ManualScheduler clock = new ManualScheduler();
+        Options options = exchangeOptions(storage);
+        options.setTimeout(1000);
+        newClientOnClock(options, clock);
+        client.connect();
+        awaitUntil("connected", () -> connected.size() == 1);
+        clock.advance(renewalDelay(clock));
+        awaitUntil("renewal exchange started", () -> storage.held != null);
+
+        clock.advance(options.getTimeout());
+        awaitUntil("timeout reported", () -> !errors.isEmpty());
+        // The app logs out while the connection stays up: the storage is cleared, and the late rotation must not return to it.
+        storage.refreshToken = null;
+        storage.held.onDone(null, new TokenExchangeResult("access-2", "refresh-3"));
+        drainExecutor();
+
+        assertEquals(Arrays.asList("refresh-2"), storage.stored);
+        assertNull(storage.load());
+        assertEquals(1, connected.size());
+        assertEquals(1, errors.size());
+    }
+
+
+    @Test
+    public void renewalRotationDoesNotOverwriteATokenSetDuringTheExchange() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        StallingStorage storage = new StallingStorage("refresh-1", 2);
+        ManualScheduler clock = new ManualScheduler();
+        newClientOnClock(exchangeOptions(storage), clock);
+        client.connect();
+        awaitUntil("connected", () -> connected.size() == 1);
+        clock.advance(renewalDelay(clock));
+        awaitUntil("renewal exchange started", () -> storage.held != null);
+
+        // The app logs in as another user while the renewal runs: it stores that user's refresh token, and refreshes with its access token.
+        storage.refreshToken = "login-refresh";
+        client.refresh("login-token", (Throwable err, AuthResult result) -> {
+        });
+        drainExecutor();
+        storage.held.onDone(null, new TokenExchangeResult("access-2", "refresh-3"));
+
+        awaitUntil("login refresh sent", () -> refreshTokens().contains("login-token"));
+        drainExecutor();
+        assertEquals("login-refresh", storage.load());
+        assertEquals(Arrays.asList("refresh-2"), storage.stored);
+        assertTrue(errors.isEmpty());
+    }
+
+
+    @Test
     public void rotationOfABootstrapDoesNotOverwriteATokenSetDuringTheExchange() throws Exception {
         answerExchanges("access-1|refresh-2");
         answerIdentity(false, 0);
@@ -741,6 +832,27 @@ public class TokenExchangeTest extends FakeServerTestBase {
         assertTrue(storage.stored.isEmpty());
         assertEquals("login-refresh", storage.load());
         assertTrue(errors.isEmpty());
+    }
+
+
+    @Test
+    public void bootstrapRotationIsStoredWhileTheAppHoldsTheUsedTokenAfterARefreshCall() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        StallingStorage storage = new StallingStorage("refresh-1");
+        newClient(exchangeOptions(storage));
+        client.connect();
+        awaitUntil("exchange started", () -> storage.held != null);
+
+        // The app refreshes with a login token but stores no refresh token: the storage still holds the used one.
+        client.refresh("login-token", (Throwable err, AuthResult result) -> {
+        });
+        drainExecutor();
+        storage.held.onDone(null, new TokenExchangeResult("access-1", "refresh-2"));
+
+        awaitUntil("connected", () -> connected.size() == 1);
+        assertEquals(Arrays.asList("refresh-2"), storage.stored);
+        assertEquals("refresh-2", storage.load());
     }
 
 
