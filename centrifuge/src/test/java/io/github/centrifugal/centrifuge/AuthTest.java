@@ -476,9 +476,11 @@ public class AuthTest extends RpcTestBase {
 
         client.close(0L);
 
+        awaitCondition("the close completes its teardown", () -> client.getState() == ClientState.CLOSED);
         assertTrue("the in-flight refresh fails with the close", errorOf(inFlight) instanceof IOException);
         assertTrue("the waiting refresh which shares the throwing callback fails too", errorOf(shared) instanceof IOException);
         assertEquals(1, thrower.get());
+        awaitCondition("the callback failure is reported", () -> errorEvents.stream().anyMatch((ErrorEvent e) -> e.getError() instanceof IllegalStateException));
     }
 
 

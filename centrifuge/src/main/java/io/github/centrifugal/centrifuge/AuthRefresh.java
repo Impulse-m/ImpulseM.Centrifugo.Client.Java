@@ -128,7 +128,7 @@ final class AuthRefresh {
     /**
      * Fails the refreshes which wait for the refresh in flight, as the client closes. Runs on the
      * executor, after the connection is torn down. Every waiting refresh is failed even when a callback
-     * throws; the first failure is rethrown then.
+     * throws, and the first such failure is reported to the listener: the close goes on either way.
      */
     void failWaiting() {
         Throwable failure = null;
@@ -143,7 +143,9 @@ final class AuthRefresh {
                 failure = thrown;
             }
         }
-        rethrow(failure);
+        if (failure != null) {
+            client.reportError(failure);
+        }
     }
 
 
