@@ -48,7 +48,7 @@ public class Options {
     /**
      * Lets the client obtain and renew its connection token itself, over the connection, from a refresh token
      * the application persists. Exclusive with {@link #setTokenGetter}: a client created with both throws
-     * IllegalArgumentException. Default null.
+     * IllegalArgumentException. Read when the client is created: set it before that, not after. Default null.
      */
     public void setTokenExchange(TokenExchange tokenExchange) {
         this.tokenExchange = tokenExchange;

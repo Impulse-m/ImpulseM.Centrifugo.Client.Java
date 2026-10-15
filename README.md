@@ -238,11 +238,14 @@ The flow: when the connection is anonymous (no token), the client runs the excha
 
 Several tabs or processes of one installation can share one refresh token, with no lock in the client. The client reads `load` immediately before each exchange and stores the rotated token immediately after. An exchange which is refused is retried once, with the token read again, when another one rotated the token meanwhile. The backend keeps a short grace for the previous refresh token, so two clients which exchange at the same moment both get the same rotated pair.
 
+Ordering rule: a `refresh(token)` call made while the anonymous connection is still completing its exchange is sent after the connected state, and the `store` of that exchange has already written the exchanged refresh token. Store the refresh token of such a login only after `connected` has fired, or the rotated one written by the exchange overwrites it.
+
 | Event | When |
 |---|---|
 | `ConnectedEvent` with an empty user | `load` returned no refresh token: the connection stays anonymous |
 | `ErrorEvent` with `TokenError` | an exchange or `store` failed; the exchange is retried with backoff, or the connection goes on |
 | `ErrorEvent` with `RefreshError` | a renewal refresh was refused; the error table of the timer refresh applies |
+| `ErrorEvent` with `ReplyError` | a bootstrap refresh was refused with a temporary error, an error below 100 or 109: the exchange is retried with backoff |
 | `DisconnectedEvent` with code 1 (`unauthorized`) | the session is dead: the issuer refused the refresh token again, or `load` returned nothing at renewal. The client does not reconnect |
 
 The server must accept a connection without a token (`client.allow_anonymous_connect_without_token: true`), must allow a refresh which changes the user (`client.rebind.enabled: true`), and the exchange method must be callable by an anonymous connection: a registry entry with `auth_class: anonymous`. The calls of that method carry no connection token, so the issuer authenticates the request by the refresh token alone. The access token is the connection token: the usual `client.token` verification applies, and its `exp` drives the renewal.
