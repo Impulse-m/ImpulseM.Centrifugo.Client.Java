@@ -238,8 +238,6 @@ The flow: when the connection is anonymous (no token), the client runs the excha
 
 Several tabs or processes of one installation can share one refresh token, with no lock in the client. The client reads `load` immediately before each exchange and stores the rotated token immediately after. An exchange which is refused is retried once, with the token read again, when another one rotated the token meanwhile. The backend keeps a short grace for the previous refresh token, so two clients which exchange at the same moment both get the same rotated pair.
 
-Ordering rule: a `refresh(token)` call made while the anonymous connection is still completing its exchange is sent after the connected state, and the `store` of that exchange has already written the exchanged refresh token. Store the refresh token of such a login only after `connected` has fired, or the rotated one written by the exchange overwrites it.
-
 | Event | When |
 |---|---|
 | `ConnectedEvent` with an empty user | `load` returned no refresh token: the connection stays anonymous |
