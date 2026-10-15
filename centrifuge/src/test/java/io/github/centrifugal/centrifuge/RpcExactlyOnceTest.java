@@ -284,29 +284,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         serveDedup();
         AtomicBoolean failTheNextFlush = new AtomicBoolean();
         BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
-        Client c = newClient(instanceOptions(), new EventListener() {
-            @Override
-            public void onConnected(Client client, ConnectedEvent event) {
-                connectedSignals.release();
-                if (failTheNextFlush.getAndSet(false)) {
-                    failTheFirstSend(client, new IllegalStateException("transport failed inside the send"));
-                }
-            }
-
-
-            @Override
-            public void onDisconnected(Client client, DisconnectedEvent event) {
-                disconnectedSignals.release();
-            }
-
-
-            @Override
-            public void onError(Client client, ErrorEvent event) {
-                reported.add(event.getError());
-                // A listener which throws on the report must not end the flush.
-                throw new IllegalStateException("listener failed on the report");
-            }
-        });
+        Client c = newClientWithFailingCancelSend(reported, failTheNextFlush, new IllegalStateException("transport failed inside the send"), true);
         connect(c);
         holdCalls.set(true);
         CompletableFuture<RPCResult> firstFuture = new CompletableFuture<>();
@@ -351,27 +329,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         serveDedup();
         AtomicBoolean failTheNextFlush = new AtomicBoolean();
         BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
-        Client c = newClient(instanceOptions(), new EventListener() {
-            @Override
-            public void onConnected(Client client, ConnectedEvent event) {
-                connectedSignals.release();
-                if (failTheNextFlush.getAndSet(false)) {
-                    failTheFirstSend(client, new NoClassDefFoundError("transport linkage failed inside the send"));
-                }
-            }
-
-
-            @Override
-            public void onDisconnected(Client client, DisconnectedEvent event) {
-                disconnectedSignals.release();
-            }
-
-
-            @Override
-            public void onError(Client client, ErrorEvent event) {
-                reported.add(event.getError());
-            }
-        });
+        Client c = newClientWithFailingCancelSend(reported, failTheNextFlush, new NoClassDefFoundError("transport linkage failed inside the send"), false);
         connect(c);
         holdCalls.set(true);
         c.rpcCall("first", EMPTY_PAYLOAD, into(new CompletableFuture<>()));
@@ -403,6 +361,37 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         connect(c);
         awaitCondition("the kept cancel sent with the next connect", () -> cancelsSent().size() == 3);
         assertEquals("every cancel is sent", msgIds, new HashSet<>(cancelsSent()));
+    }
+
+
+    // A client whose connect listener makes the next send of a cancel fail with the given throwable, when the flag is
+    // set, and whose error listener records what it reports. With throwOnReport the error listener throws after the
+    // record, and the flush must go on regardless.
+    private Client newClientWithFailingCancelSend(BlockingQueue<Throwable> reported, AtomicBoolean failTheNextFlush, Throwable failure, boolean throwOnReport) {
+        return newClient(instanceOptions(), new EventListener() {
+            @Override
+            public void onConnected(Client client, ConnectedEvent event) {
+                connectedSignals.release();
+                if (failTheNextFlush.getAndSet(false)) {
+                    failTheFirstSend(client, failure);
+                }
+            }
+
+
+            @Override
+            public void onDisconnected(Client client, DisconnectedEvent event) {
+                disconnectedSignals.release();
+            }
+
+
+            @Override
+            public void onError(Client client, ErrorEvent event) {
+                reported.add(event.getError());
+                if (throwOnReport) {
+                    throw new IllegalStateException("listener failed on the report");
+                }
+            }
+        });
     }
 
 
@@ -453,7 +442,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
             return false;
         }
         Protocol.Command cmd = Protocol.Command.parseDelimitedFrom(new ByteArrayInputStream(((ByteString) payload).toByteArray()));
-        return cmd.hasRpc() && cmd.getRpc().getCancel() != 0;
+        return cmd != null && cmd.hasRpc() && cmd.getRpc().getCancel() != 0;
     }
 
 
