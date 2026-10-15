@@ -104,16 +104,8 @@ final class Extensions {
 
 
     /**
-     * The reply of a call the client did not send: the server would have answered it with
-     * {@link ReplyError#UNSUPPORTED}. Completes the call's future like any other reply.
-     */
-    static Protocol.Reply unsupportedRpcReply(int id) {
-        return unsupportedRpcReply().toBuilder().setId(id).build();
-    }
-
-
-    /**
      * The reply of a call the client did not send, with no command id: the call's own future takes it.
+     * The server would have answered it with {@link ReplyError#UNSUPPORTED}.
      */
     static Protocol.Reply unsupportedRpcReply() {
         return Protocol.Reply.newBuilder()
