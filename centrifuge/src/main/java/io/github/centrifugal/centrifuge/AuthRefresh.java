@@ -78,6 +78,10 @@ final class AuthRefresh {
     // after its cancel does nothing.
     private ScheduledFuture<?> timer;
     private long timerGeneration = 0;
+    // A timer refresh was superseded by a refresh() call which waited behind its fetch, or a queued timer refresh
+    // was dropped behind a refused refresh. A refused refresh then arms the retry, since the connection would
+    // otherwise have no timer. Cleared when a token is accepted or the retry is armed.
+    private boolean timerSuperseded = false;
     // Identity the server last reported for the connection, see applyAuth. Used on the executor thread only.
     private String currentUser = "";
     private String currentAuthClass = "";
@@ -186,6 +190,7 @@ final class AuthRefresh {
     void onDisconnect() {
         cancelTimer();
         commandInFlight = false;
+        timerSuperseded = false;
     }
 
 
@@ -233,7 +238,7 @@ final class AuthRefresh {
     private void fetchAndRefresh() {
         WebSocket transport = client.transport();
         if (client.getState() != ClientState.CONNECTED) {
-            complete();
+            complete(false);
             return;
         }
         // The getter may never answer, so the fetch is bounded by the client timeout. A late answer is ignored.
@@ -262,6 +267,12 @@ final class AuthRefresh {
             if (transport != client.transport() || client.getState() != ClientState.CONNECTED) {
                 return;
             }
+            // A refresh() which started during the fetch waits behind it. This token is superseded: it is not sent,
+            // and not fetched again. The waiting refresh runs when this fetch completes.
+            if (hasRequestWaiting()) {
+                timerSuperseded = true;
+                return;
+            }
             if (err != null) {
                 if (err instanceof UnauthorizedException) {
                     client.failUnauthorized();
@@ -280,9 +291,20 @@ final class AuthRefresh {
             awaitingCommand = true;
         } finally {
             if (!awaitingCommand) {
-                complete();
+                complete(false);
             }
         }
+    }
+
+
+    // Whether a refresh() call waits for the refresh in flight. A queued timer refresh does not count.
+    private boolean hasRequestWaiting() {
+        for (Waiting entry : waiting) {
+            if (entry.token != null) {
+                return true;
+            }
+        }
+        return false;
     }
 
 
@@ -293,6 +315,7 @@ final class AuthRefresh {
             }
             if (error == null) {
                 client.storeToken(token);
+                timerSuperseded = false;
                 scheduleExpiry(result.getExpires(), result.getTtl());
                 applyAuth(result.getUser(), result.getAuthClass(), false);
                 return;
@@ -303,7 +326,7 @@ final class AuthRefresh {
                 settleTimerError(error);
             }
         } finally {
-            complete();
+            complete(false);
         }
     }
 
@@ -335,6 +358,7 @@ final class AuthRefresh {
             }
             client.storeToken(token);
             connectTokenStored = false;
+            timerSuperseded = false;
             if (client.getState() == ClientState.CONNECTED) {
                 scheduleExpiry(result.getExpires(), result.getTtl());
             }
@@ -349,7 +373,7 @@ final class AuthRefresh {
                 rethrow(deliverAll(callbacks, null, authResult));
             }
         } finally {
-            complete();
+            complete(error != null);
         }
     }
 
@@ -497,8 +521,10 @@ final class AuthRefresh {
 
     // The refresh in flight is over. While the connection is down the waiting refreshes fail with it, since
     // nothing is sent while disconnected and the timer does not run. Otherwise the next waiting refresh
-    // starts, and without one the rpc calls held for the refresh are written.
-    private void complete() {
+    // starts. A queued timer refresh behind a refused refresh is not fetched at once: the retry is armed
+    // instead, as for a superseded timer. A timer fetch does not hold the rpc calls, so they are written
+    // before it starts; without a refresh to start, the rpc calls held for the refresh are written too.
+    private void complete(boolean refused) {
         inFlight = false;
         commandInFlight = false;
         if (client.getState() != ClientState.CONNECTED) {
@@ -515,13 +541,23 @@ final class AuthRefresh {
             if (next.token == null && next.generation != timerGeneration) {
                 continue;
             }
-            inFlight = true;
-            if (next.token == null) {
-                fetchAndRefresh();
-            } else {
+            if (next.token != null) {
+                inFlight = true;
                 startRequested(next.token, next.callbacks);
+                return;
             }
+            if (refused) {
+                timerSuperseded = true;
+                continue;
+            }
+            inFlight = true;
+            client.flushRpc();
+            fetchAndRefresh();
             return;
+        }
+        if (refused && timerSuperseded) {
+            timerSuperseded = false;
+            scheduleRetry();
         }
         client.flushRpc();
     }

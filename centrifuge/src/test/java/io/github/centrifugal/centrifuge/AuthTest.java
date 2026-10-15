@@ -6,6 +6,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -393,7 +394,7 @@ public class AuthTest extends RpcTestBase {
 
         refreshFuture.get(5, TimeUnit.SECONDS);
         rpcFuture.get(5, TimeUnit.SECONDS);
-        assertEquals(Arrays.asList("token-timer", "token-2"), refreshTokens());
+        assertEquals("the superseded timer token is not sent", Arrays.asList("token-2"), refreshTokens());
         int refreshAt = -1;
         int rpcAt = -1;
         List<Protocol.Command> received = server.received();
@@ -406,6 +407,72 @@ public class AuthTest extends RpcTestBase {
             }
         }
         assertTrue("the rpc is sent after the refresh", refreshAt >= 0 && rpcAt > refreshAt);
+    }
+
+
+    @Test
+    public void refusedRefreshBehindATimerFetchArmsTheRetryInsteadOfFetchingAtOnce() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        ManualScheduler clock = new ManualScheduler();
+        List<TokenCallback> fetches = new CopyOnWriteArrayList<>();
+        newAuthClientOnClock(recordingTokenOptions(fetches), clock);
+        connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+        clock.advance(1000);
+        awaitCondition("timer fetch started", () -> fetches.size() == 1);
+        refuseRefreshes();
+        CompletableFuture<AuthResult> refreshFuture = refresh(client, "token-2");
+
+        fetches.get(0).Done(null, "token-timer");
+
+        assertEquals(PERMISSION_DENIED, ((ReplyError) errorOf(refreshFuture)).getCode());
+        syncWithServer();
+        assertEquals("the superseded timer is not fetched again at once", 1, fetches.size());
+        assertEquals(Arrays.asList("token-2"), refreshTokens());
+        clock.advance(100);
+        awaitCondition("the retry fetches once, after the retry delay", () -> fetches.size() == 2);
+    }
+
+
+    @Test
+    public void rpcIsWrittenWhenARefusedRefreshHandsOverToTheTimerRetry() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        ManualScheduler clock = new ManualScheduler();
+        List<TokenCallback> fetches = new CopyOnWriteArrayList<>();
+        newAuthClientOnClock(recordingTokenOptions(fetches), clock);
+        connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+        // The refusal waits for the latch, so the refresh stays in flight while the timer fires and the rpc is queued.
+        final CountDownLatch answer = new CountDownLatch(1);
+        server.onCommand = (Protocol.Command cmd) -> {
+            if (!cmd.hasRefresh()) {
+                return null;
+            }
+            try {
+                answer.await(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return Protocol.Reply.newBuilder()
+                    .setId(cmd.getId())
+                    .setError(Protocol.Error.newBuilder().setCode(PERMISSION_DENIED).setMessage("denied"))
+                    .build();
+        };
+        CompletableFuture<AuthResult> refreshFuture = refresh(client, "token-2");
+        awaitCondition("refresh sent", () -> lastRefreshToken() != null);
+        clock.advance(1000);
+        drainExecutor();
+        client.rpc("method", EMPTY_PAYLOAD, into(new CompletableFuture<RPCResult>()));
+        drainExecutor();
+        assertEquals("the rpc waits for the refresh in flight", 0, sentRpcRequests().size());
+
+        answer.countDown();
+
+        assertEquals(PERMISSION_DENIED, ((ReplyError) errorOf(refreshFuture)).getCode());
+        awaitCondition("the rpc is written without waiting for a token fetch", () -> sentRpcRequests().size() == 1);
+        assertTrue("the retry is still pending", fetches.isEmpty());
+        clock.advance(100);
+        awaitCondition("the retry fetches", () -> fetches.size() == 1);
     }
 
 
@@ -427,6 +494,33 @@ public class AuthTest extends RpcTestBase {
         first.get(5, TimeUnit.SECONDS);
         second.get(5, TimeUnit.SECONDS);
         assertEquals("one command for both calls", Arrays.asList("token-a"), refreshTokens());
+    }
+
+
+    @Test
+    public void sharedRefreshCallsCountTowardTheBoundAndEachGetTheResult() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        newAuthClient(new Options());
+        connect(client);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+        List<CompletableFuture<AuthResult>> shared = new ArrayList<>();
+        for (int i = 0; i < 32; i++) {
+            shared.add(refresh(client, "token-a"));
+        }
+
+        CompletableFuture<AuthResult> refused = refresh(client, "token-a");
+
+        assertEquals(LIMIT_EXCEEDED, ((ReplyError) errorOf(refused)).getCode());
+        awaitCondition("refresh sent", () -> refreshTokens().size() == 1);
+        syncWithServer();
+        assertEquals("the 32 calls share one command", Arrays.asList("token-a"), refreshTokens());
+
+        server.releaseDeferredCommands();
+
+        for (CompletableFuture<AuthResult> call : shared) {
+            assertNotNull("every shared call gets the result", call.get(5, TimeUnit.SECONDS));
+        }
+        assertEquals("one command for every call", Arrays.asList("token-a"), refreshTokens());
     }
 
 
@@ -992,6 +1086,20 @@ public class AuthTest extends RpcTestBase {
             public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
                 fetchTimes.add(System.nanoTime());
                 cb.Done(null, "token-timer");
+            }
+        });
+        return options;
+    }
+
+
+    // A token getter which keeps the callback of each call, to answer it later from the test.
+    private static Options recordingTokenOptions(final List<TokenCallback> fetches) {
+        Options options = new Options();
+        options.setToken("token-initial");
+        options.setTokenGetter(new ConnectionTokenGetter() {
+            @Override
+            public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
+                fetches.add(cb);
             }
         });
         return options;
