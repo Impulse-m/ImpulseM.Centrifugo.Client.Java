@@ -850,7 +850,8 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         RPCResult result = queued.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
         assertEquals("ok", new String(result.getData(), StandardCharsets.UTF_8));
         Throwable failure = reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
-        assertTrue("the failure of the listener is reported", failure instanceof IllegalStateException);
+        assertTrue("the failure of the listener is reported", failure instanceof UnclassifiedError);
+        assertTrue("the listener's exception is its cause", ((UnclassifiedError) failure).getError() instanceof IllegalStateException);
     }
 
 

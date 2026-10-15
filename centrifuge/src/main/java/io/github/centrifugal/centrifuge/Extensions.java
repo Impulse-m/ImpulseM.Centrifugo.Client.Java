@@ -126,6 +126,20 @@ final class Extensions {
     }
 
 
+    /**
+     * Calls the listener's onConnected. A listener which throws is reported as an error event, and the
+     * handshake goes on, so the calls queued for the connect and the expiry of the connection are not lost.
+     */
+    static void notifyConnected(EventListener listener, Client client, ConnectedEvent event) {
+        try {
+            listener.onConnected(client, event);
+        } catch (Throwable e) {
+            // Throwable as the other callbacks of the protocol handling, so an Error is reported as well.
+            listener.onError(client, new ErrorEvent(new UnclassifiedError(e)));
+        }
+    }
+
+
     private Extensions() {
     }
 }
