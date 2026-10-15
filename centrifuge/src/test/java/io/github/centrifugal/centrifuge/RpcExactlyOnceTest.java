@@ -9,7 +9,6 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -291,17 +290,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
                 true,
                 true);
         connect(c);
-        holdCalls.set(true);
-        CompletableFuture<RPCResult> firstFuture = new CompletableFuture<>();
-        CompletableFuture<RPCResult> secondFuture = new CompletableFuture<>();
-        c.rpcCall("first", EMPTY_PAYLOAD, into(firstFuture));
-        c.rpcCall("second", EMPTY_PAYLOAD, into(secondFuture));
-        assertTrue("first call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
-        assertTrue("second call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
-        long firstMsgId = sentRpcRequests().get(0).getMsgId();
-        long secondMsgId = sentRpcRequests().get(1).getMsgId();
-        c.disconnect();
-        holdCalls.set(false);
+        Set<Long> msgIds = new HashSet<>(sendHeldCallsAndDisconnect(c, 2));
         CompletableFuture<RPCResult> queuedFuture = new CompletableFuture<>();
         c.rpcCall("queued", EMPTY_PAYLOAD, into(queuedFuture));
 
@@ -316,8 +305,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         c.disconnect();
         connect(c);
         awaitCondition("the kept cancel sent with the next connect", () -> cancelsSent().size() == 2);
-        Set<Long> sentCancels = new HashSet<>(cancelsSent());
-        assertEquals("both cancels are sent", new HashSet<>(Arrays.asList(firstMsgId, secondMsgId)), sentCancels);
+        assertEquals("both cancels are sent", msgIds, new HashSet<>(cancelsSent()));
         Throwable failure = reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
         assertTrue("the failed send is reported", failure instanceof UnclassifiedError);
         Throwable cause = ((UnclassifiedError) failure).getError();
@@ -341,19 +329,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
                 false,
                 true);
         connect(c);
-        holdCalls.set(true);
-        c.rpcCall("first", EMPTY_PAYLOAD, into(new CompletableFuture<>()));
-        c.rpcCall("second", EMPTY_PAYLOAD, into(new CompletableFuture<>()));
-        c.rpcCall("third", EMPTY_PAYLOAD, into(new CompletableFuture<>()));
-        for (int i = 0; i < 3; i++) {
-            assertTrue("call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
-        }
-        Set<Long> msgIds = new HashSet<>();
-        for (Protocol.RPCRequest request : sentRpcRequests()) {
-            msgIds.add(request.getMsgId());
-        }
-        c.disconnect();
-        holdCalls.set(false);
+        Set<Long> msgIds = new HashSet<>(sendHeldCallsAndDisconnect(c, 3));
         CompletableFuture<RPCResult> queuedFuture = new CompletableFuture<>();
         c.rpcCall("queued", EMPTY_PAYLOAD, into(queuedFuture));
 
@@ -421,10 +397,11 @@ public class RpcExactlyOnceTest extends RpcTestBase {
             Throwable failure,
             boolean throwOnReport,
             boolean cancelSend) {
+        EventListener signalling = signallingListener();
         return newClient(instanceOptions(), new EventListener() {
             @Override
             public void onConnected(Client client, ConnectedEvent event) {
-                connectedSignals.release();
+                signalling.onConnected(client, event);
                 if (failTheNextFlush.getAndSet(false)) {
                     failTheFirstSend(client, failure, cancelSend);
                 }
@@ -433,7 +410,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
             @Override
             public void onDisconnected(Client client, DisconnectedEvent event) {
-                disconnectedSignals.release();
+                signalling.onDisconnected(client, event);
             }
 
 
@@ -445,6 +422,25 @@ public class RpcExactlyOnceTest extends RpcTestBase {
                 }
             }
         });
+    }
+
+
+    // Sends the calls which the server holds, waits until they arrive, and disconnects. Returns the msg_ids of the calls.
+    private List<Long> sendHeldCallsAndDisconnect(Client c, int count) throws Exception {
+        holdCalls.set(true);
+        for (int i = 0; i < count; i++) {
+            c.rpcCall("held", EMPTY_PAYLOAD, into(new CompletableFuture<RPCResult>()));
+        }
+        for (int i = 0; i < count; i++) {
+            assertTrue("call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
+        }
+        List<Long> msgIds = new ArrayList<>();
+        for (Protocol.RPCRequest request : sentRpcRequests()) {
+            msgIds.add(request.getMsgId());
+        }
+        c.disconnect();
+        holdCalls.set(false);
+        return msgIds;
     }
 
 
