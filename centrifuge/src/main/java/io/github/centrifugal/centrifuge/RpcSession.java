@@ -78,6 +78,9 @@ final class RpcSession {
     private final List<Long> pendingCancels = new ArrayList<>();
     // The cancel commands which wait for their reply, by the id of the command: the msg_id each one cancels.
     private final Map<Integer, CancelCommand> cancelCommands = new TreeMap<>();
+    // The failures of the cancel sends which the transport threw, reported once the caller has written its commands.
+    // Null while there are none, so a connection without a failure allocates nothing.
+    private List<Throwable> cancelFailures;
     private final MsgIdGenerator msgIds = new MsgIdGenerator();
     // The bound of the calls which are not settled, see submit.
     private final int maxPending;
@@ -224,6 +227,7 @@ final class RpcSession {
             }
             writeOrQueue(call);
         }
+        reportCancelFailures();
     }
 
 
@@ -477,6 +481,21 @@ final class RpcSession {
         if (host.state() != ClientState.CONNECTED || !host.hasRpcOptions() || !writeCancel(msgId)) {
             keepCancel(msgId);
         }
+        reportCancelFailures();
+    }
+
+
+    // Reports the failures of the cancel sends, once the caller has written its commands: a listener may call rpcCall
+    // or disconnect, and neither may overtake the commands the caller has yet to write.
+    private void reportCancelFailures() {
+        if (cancelFailures == null) {
+            return;
+        }
+        List<Throwable> failures = cancelFailures;
+        cancelFailures = null;
+        for (Throwable failure : failures) {
+            host.reportUnclassified(failure);
+        }
     }
 
 
@@ -533,8 +552,10 @@ final class RpcSession {
         cancelCommands.remove(id);
         pendingAcks.addAll(0, acks);
         if (failure != null) {
-            // Reported after the rollback, since the listener may throw: the caller goes on with the other cancels and the queued calls.
-            host.reportUnclassified(failure);
+            if (cancelFailures == null) {
+                cancelFailures = new ArrayList<>();
+            }
+            cancelFailures.add(failure);
         }
         return false;
     }
