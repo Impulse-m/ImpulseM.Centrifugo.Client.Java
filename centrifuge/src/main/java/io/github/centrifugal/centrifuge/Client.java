@@ -5,12 +5,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -35,7 +33,7 @@ import okhttp3.WebSocketListener;
 import okio.ByteString;
 
 public class Client {
-    private WebSocket ws;
+    WebSocket ws;
     private OkHttpClient httpClient;
     // Whether httpClient was built from scratch (no user-supplied base client),
     // meaning its Dispatcher and ConnectionPool are ours to dispose. Recorded
@@ -45,16 +43,15 @@ public class Client {
     private final String endpoint;
     private final Options opts;
     // The instance of the connection, read from the options when the client is created.
-    private final String instance;
-    private String token;
+    final String instance;
+    String token;
     private com.google.protobuf.ByteString data;
-    private final EventListener listener;
-    private final Map<Integer, CompletableFuture<Protocol.Reply>> futures = new ConcurrentHashMap<>();
+    final EventListener listener;
+    final Map<Integer, CompletableFuture<Protocol.Reply>> futures = new ConcurrentHashMap<>();
     private final Map<Integer, Protocol.Command> connectCommands = new ConcurrentHashMap<>();
     private final Map<Integer, Protocol.Command> connectAsyncCommands = new ConcurrentHashMap<>();
-    // The exactly-once rpc calls, and the refreshes of the connection token.
-    private final RpcSession rpcSession;
-    private final AuthRefresh auth;
+    final RpcSession rpcSession;
+    final AuthRefresh auth;
 
     private volatile ClientState state = ClientState.DISCONNECTED;
     private final Map<String, Subscription> subs = new ConcurrentHashMap<>();
@@ -76,7 +73,7 @@ public class Client {
     private int reconnectAttempts = 0;
     private boolean refreshRequired = false;
     // Confirmed by the connect reply of the current transport, cleared when it closes.
-    private volatile boolean rpcOptionsSupported = false;
+    volatile boolean rpcOptionsSupported = false;
     // Server clock minus local clock, from the last reply that carried a server time.
     private volatile long serverTimeOffset = 0;
 
@@ -90,61 +87,6 @@ public class Client {
 
     ScheduledExecutorService getScheduler() {
         return scheduler;
-    }
-
-    // The helpers below serve RpcSession and AuthRefresh, which run on the executor thread.
-
-    WebSocket transport() {
-        return this.ws;
-    }
-
-    int nextCommandId() {
-        return this.getNextId();
-    }
-
-    boolean hasRpcOptions() {
-        return this.rpcOptionsSupported;
-    }
-
-    boolean hasInstance() {
-        return !this.instance.isEmpty();
-    }
-
-    boolean isRefreshing() {
-        return this.auth.isInFlight();
-    }
-
-    void flushRpc() {
-        this.rpcSession.flush();
-    }
-
-    void storeToken(String token) {
-        this.token = token;
-    }
-
-    String getConnectionToken() {
-        return this.token;
-    }
-
-    void reportError(Throwable cause) {
-        this.listener.onError(this, new ErrorEvent(cause));
-    }
-
-    void reportAuth(AuthEvent event) {
-        this.listener.onAuth(this, event);
-    }
-
-    void addFuture(int id, CompletableFuture<Protocol.Reply> future) {
-        this.futures.put(id, future);
-    }
-
-    void removeFuture(int id) {
-        this.futures.remove(id);
-    }
-
-    // Sends the command on the current transport. Returns whether the transport took it.
-    boolean sendCommand(Protocol.Command cmd) {
-        return this.ws.send(ByteString.of(this.serializeCommand(cmd)));
     }
 
     private static final int NORMAL_CLOSURE_STATUS = 1000;
@@ -181,14 +123,6 @@ public class Client {
     // impossible (only sent when SUBSCRIPTION_FLAG_REJECT_UNRECOVERED was requested).
     static final int ERROR_CODE_UNRECOVERABLE_POSITION = 112;
 
-    // Server error code of an expired connection token: the connect and the timer refresh retry it
-    // with a fresh token.
-    static final int ERROR_CODE_TOKEN_EXPIRED = 109;
-
-    // Bounds of the retry delay after a failed token fetch or refresh, in milliseconds.
-    static final int AUTH_RETRY_MIN_MILLIS = 10000;
-    static final int AUTH_RETRY_MAX_MILLIS = 20000;
-
     // Server-sent "state invalidated" codes. The server determines that the
     // client's cached state and/or token are no longer valid and asks the client
     // to drop them and re-sync.
@@ -209,11 +143,10 @@ public class Client {
      * @param listener: client event handler.
      */
     public Client(final String endpoint, final Options opts, final EventListener listener) {
-        this(endpoint, opts, listener, AUTH_RETRY_MIN_MILLIS, AUTH_RETRY_MAX_MILLIS, Executors.newScheduledThreadPool(1));
+        this(endpoint, opts, listener, AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, Executors.newScheduledThreadPool(1));
     }
 
-    // The retry bounds of the token refresh and the scheduler of the timers are parameters so that the
-    // tests can control the time, see ManualScheduler.
+    // The retry bounds and the scheduler are parameters, so that the tests control the time.
     Client(
             final String endpoint,
             final Options opts,
@@ -228,8 +161,9 @@ public class Client {
         this.listener = listener;
         this.scheduler = scheduler;
         this.backoff = new Backoff();
-        this.rpcSession = new RpcSession(this, opts.getMaxPendingRpc());
-        this.auth = new AuthRefresh(this, authRetryMinMillis, authRetryMaxMillis);
+        ClientHost host = new ClientHost(this);
+        this.rpcSession = new RpcSession(host, opts.getMaxPendingRpc());
+        this.auth = new AuthRefresh(host, authRetryMinMillis, authRetryMaxMillis);
         this.token = opts.getToken();
         if (opts.getData() != null) {
             this.data = com.google.protobuf.ByteString.copyFrom(opts.getData());
@@ -262,7 +196,7 @@ public class Client {
 
     private int _id = 0;
 
-    private int getNextId() {
+    int getNextId() {
         return ++_id;
     }
 
@@ -318,7 +252,8 @@ public class Client {
                 // (e.g. orTimeout/exceptionally re-submits) get queued before
                 // we mark the executor shutdown.
                 Client.this.processDisconnect(DISCONNECTED_DISCONNECT_CALLED, "client closed", false);
-                Client.this.failPendingOnClose();
+                Client.this.rpcSession.failOnClose(Client.this.futures.values());
+                Client.this.auth.failWaiting();
                 Client.this.setState(ClientState.CLOSED);
                 if (Client.this.ws != null) {
                     Client.this.ws.cancel();
@@ -343,13 +278,6 @@ public class Client {
             return this.executor.awaitTermination(awaitMilliseconds, TimeUnit.MILLISECONDS);
         }
         return false;
-    }
-
-    // Fails the pending commands (a refresh among them) and the rpc calls which wait for a connection.
-    // processDisconnect returns early when the client is already disconnected, so close calls this too.
-    private void failPendingOnClose() {
-        this.rpcSession.failOnClose(this.futures.values());
-        this.auth.failWaiting();
     }
 
     void processDisconnect(int code, String reason, Boolean shouldReconnect) {
@@ -416,7 +344,6 @@ public class Client {
             }
         }
 
-        // rpc calls with a msg_id are kept for a resend when the client reconnects; the rest fail.
         this.rpcSession.onTransportLost(Boolean.TRUE.equals(shouldReconnect));
         for (CompletableFuture<Protocol.Reply> f : this.futures.values()) {
             f.completeExceptionally(new IOException());
@@ -814,7 +741,7 @@ public class Client {
         this.ws.send(ByteString.of(this.serializeCommand(cmd)));
     }
 
-    private byte[] serializeCommand(Protocol.Command cmd) {
+    byte[] serializeCommand(Protocol.Command cmd) {
         ByteArrayOutputStream stream = new ByteArrayOutputStream();
         try {
             cmd.writeDelimitedTo(stream);
@@ -962,7 +889,7 @@ public class Client {
         }
         if (reply.getError().getCode() != 0) {
             this.handleConnectionError(this.getReplyError(reply));
-            if (reply.getError().getCode() == ERROR_CODE_TOKEN_EXPIRED) {
+            if (reply.getError().getCode() == 109) { // Token expired.
                 this.refreshRequired = true;
                 this.ws.close(NORMAL_CLOSURE_STATUS, "");
             } else if (reply.getError().getTemporary()) {
@@ -1043,7 +970,7 @@ public class Client {
 
         for (Map.Entry<Integer, Protocol.Command> entry : this.connectCommands.entrySet()) {
             Protocol.Command cmd = entry.getValue();
-            boolean sent = this.sendCommand(cmd);
+            boolean sent = this.ws.send(ByteString.of(this.serializeCommand(cmd)));
             if (!sent) {
                 CompletableFuture<Protocol.Reply> f = this.futures.get(cmd.getId());
                 if (f != null) {
@@ -1053,7 +980,7 @@ public class Client {
         }
 
         this.connectCommands.clear();
-        this.flushRpc();
+        this.rpcSession.flush();
 
         for (Map.Entry<Integer, Protocol.Command> entry : this.connectAsyncCommands.entrySet()) {
             Protocol.Command cmd = entry.getValue();
@@ -1074,11 +1001,6 @@ public class Client {
         this.pingTask = this.scheduler.schedule(Client.this::waitServerPing, this.pingInterval + this.opts.getMaxServerPingDelay(), TimeUnit.MILLISECONDS);
 
         this.auth.scheduleExpiry(result.getExpires(), result.getTtl());
-    }
-
-    // The refresh timer fired. AuthRefresh fetches a token and refreshes with it, on the executor.
-    void sendRefresh(long generation) {
-        Extensions.submitOrIgnore(this.executor, () -> this.auth.onTimer(generation));
     }
 
     private void sendConnect() {
@@ -1367,7 +1289,8 @@ public class Client {
         if (this.getState() != ClientState.CONNECTED) {
             this.connectCommands.put(cmd.getId(), cmd);
         } else {
-            if (!this.sendCommand(cmd)) {
+            boolean sent = this.ws.send(ByteString.of(this.serializeCommand(cmd)));
+            if (!sent) {
                 f.completeExceptionally(new IOException());
             }
         }
@@ -1421,46 +1344,19 @@ public class Client {
         this.rpcCall(method, data, options, cb);
     }
 
-    /**
-     * Send RPC with method to server and get the call back, to cancel it with
-     * {@link RpcCall#cancel()}. Same as {@link #rpc(String, byte[], ResultCallback)}.
-     *
-     * @param method: of RPC call.
-     * @param data:   a custom payload for RPC call.
-     * @param cb:     will be called as soon as rpc response received or error happened.
-     * @return the call.
-     */
+    /** Same as {@link #rpc(String, byte[], ResultCallback)}, and returns the call, which can be cancelled. */
     public RpcCall rpcCall(String method, byte[] data, ResultCallback<RPCResult> cb) {
         return this.rpcCall(method, data, null, cb);
     }
 
     /**
-     * Send RPC with method and per-call options to server and get the call back, to cancel it
-     * with {@link RpcCall#cancel()}. Same as {@link #rpc(String, byte[], RpcOptions, ResultCallback)}.
-     * With a server which confirms RPC options and an instance set with {@link Options#setInstance},
-     * a call which is not answered is kept across a reconnect and sent again with the same msg_id,
-     * so the server runs it once. Otherwise the call is plain and a call lost with its transport fails.
+     * Same as {@link #rpc(String, byte[], RpcOptions, ResultCallback)}, and returns the call. With an instance
+     * (see {@link Options#setInstance}) and a server which confirms RPC options, the call is kept across a reconnect.
      *
-     * @param method:  of RPC call.
-     * @param data:    a custom payload for RPC call.
-     * @param options: per-call options, null for a plain call.
-     * @param cb:      will be called as soon as rpc response received or error happened.
-     * @return the call.
      * @throws NullPointerException when the method or the data is null.
      */
     public RpcCall rpcCall(String method, byte[] data, RpcOptions options, ResultCallback<RPCResult> cb) {
-        Objects.requireNonNull(method, "method");
-        Objects.requireNonNull(data, "data");
-        Map<String, String> headers = options != null ? options.getHeaders() : Collections.<String, String>emptyMap();
-        long timeout = options != null && options.getTimeout() > 0 ? options.getTimeout() : this.opts.getTimeout();
-        RpcCall call = new RpcCall(this, method, data, headers, timeout, cb);
-        this.rpcSession.submit(call);
-        return call;
-    }
-
-    // Executor already shut down: close completed the call.
-    void cancelRpc(RpcCall call) {
-        Extensions.submitOrIgnore(this.executor, () -> Client.this.rpcSession.cancel(call));
+        return this.rpcSession.call(method, data, options, cb);
     }
 
     /**
@@ -1645,17 +1541,7 @@ public class Client {
     }
 
     /**
-     * Refresh the connection with a new token now, without waiting for the server to ask for one.
-     * On success the callback gets the identity the server reports after the refresh, and the
-     * refresh timer is rescheduled from the new TTL. An error leaves the connection and its
-     * identity as they were. Calls to {@link #rpc} issued while the refresh is in flight are sent
-     * after its reply, so they run under the new identity. Refresh commands are sent one after
-     * another, in call order. A refresh with the same token as a refresh still pending shares
-     * its command and its callback; a refresh with another token waits for it. At most 32 refresh calls
-     * are in progress: a refresh beyond that calls back with {@link ReplyError#LIMIT_EXCEEDED}. A refresh
-     * made while the client is not connected sets the token the next connect sends; when the server
-     * refuses it, the previous token is restored. A refresh which a dropped connection interrupts, or
-     * which waits behind one, calls back with an IOException; the token it set stays for the next connect.
+     * Refreshes the connection with a new token now, see {@link ReplyError#LIMIT_EXCEEDED} for the bound of 32 calls in progress.
      *
      * @param token: new connection token, must not be null.
      * @param cb:    will be called when the refresh reply is received or an error happened.

@@ -112,7 +112,7 @@ abstract class RpcTestBase extends FakeServerTestBase {
      * moves the clock with {@link ManualScheduler#advance}. The client is not connected yet.
      */
     protected Client newClientOnClock(Options options, ManualScheduler clock) {
-        client = new Client(server.url(), options, signallingListener(), Client.AUTH_RETRY_MIN_MILLIS, Client.AUTH_RETRY_MAX_MILLIS, clock);
+        client = new Client(server.url(), options, signallingListener(), AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, clock);
         return client;
     }
 

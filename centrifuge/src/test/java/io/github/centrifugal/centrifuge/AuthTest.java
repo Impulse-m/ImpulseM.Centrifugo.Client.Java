@@ -1005,7 +1005,7 @@ public class AuthTest extends RpcTestBase {
 
 
     private void newAuthClient(Options options) {
-        newAuthClient(options, Client.AUTH_RETRY_MIN_MILLIS, Client.AUTH_RETRY_MAX_MILLIS);
+        newAuthClient(options, AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS);
     }
 
 

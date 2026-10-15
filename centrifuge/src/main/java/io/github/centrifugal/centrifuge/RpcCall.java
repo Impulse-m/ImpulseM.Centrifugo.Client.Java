@@ -17,7 +17,7 @@ import java8.util.concurrent.CompletableFuture;
  * {@link ReplyError#CANCELLED}.
  */
 public final class RpcCall {
-    private final Client client;
+    private final RpcSession session;
     final String method;
     final byte[] data;
     final Map<String, String> headers;
@@ -63,14 +63,14 @@ public final class RpcCall {
 
 
     RpcCall(
-            Client client,
+            RpcSession session,
             String method,
             byte[] data,
             Map<String, String> headers,
             long timeout,
             ResultCallback<RPCResult> callback
     ) {
-        this.client = client;
+        this.session = session;
         this.method = method;
         this.data = data;
         this.headers = headers;
@@ -95,7 +95,7 @@ public final class RpcCall {
         if (future.isDone()) {
             return;
         }
-        this.client.cancelRpc(this);
+        this.session.requestCancel(this);
     }
 
 

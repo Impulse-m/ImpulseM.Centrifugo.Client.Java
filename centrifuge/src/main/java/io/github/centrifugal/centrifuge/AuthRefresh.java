@@ -48,13 +48,20 @@ final class AuthRefresh {
     // retry. A token which expired is retried by the timer with a fresh token.
     private static final int PERMISSION_DENIED = 103;
 
+    // Server error code of an expired connection token: the timer refresh retries it with a fresh token.
+    static final int ERROR_CODE_TOKEN_EXPIRED = 109;
+
+    // Bounds of the retry delay after a failed token fetch or refresh, in milliseconds.
+    static final int RETRY_MIN_MILLIS = 10000;
+    static final int RETRY_MAX_MILLIS = 20000;
+
     // Error codes below this one are client errors, which the timer retries with a fresh token.
     private static final int SERVER_ERROR_CODE_MIN = 100;
 
     // The refresh() calls in progress, the one in flight and the ones which wait for it, are bounded by this.
     private static final int MAX_IN_PROGRESS = 32;
 
-    private final Client client;
+    private final ClientHost host;
     // The bounds of the retry delay after a failed token fetch or refresh, in milliseconds.
     private final int retryMinMillis;
     private final int retryMaxMillis;
@@ -87,8 +94,8 @@ final class AuthRefresh {
     private String currentAuthClass = "";
 
 
-    AuthRefresh(Client client, int retryMinMillis, int retryMaxMillis) {
-        this.client = client;
+    AuthRefresh(ClientHost host, int retryMinMillis, int retryMaxMillis) {
+        this.host = host;
         this.retryMinMillis = retryMinMillis;
         this.retryMaxMillis = retryMaxMillis;
     }
@@ -107,7 +114,7 @@ final class AuthRefresh {
      */
     void refreshWith(String token, ResultCallback<AuthResult> cb) {
         // Closed: nothing will send the command, so the refresh fails now, as an rpc call does in RpcSession.start.
-        if (client.getState() == ClientState.CLOSED) {
+        if (host.state() == ClientState.CLOSED) {
             cb.onDone(new IOException(), null);
             return;
         }
@@ -116,7 +123,7 @@ final class AuthRefresh {
             return;
         }
         requestedInProgress++;
-        if (client.getState() != ClientState.CONNECTED) {
+        if (host.state() != ClientState.CONNECTED) {
             keepTokenForConnect(token);
         }
         List<ResultCallback<AuthResult>> shared = pendingCallbacksWith(token);
@@ -154,7 +161,7 @@ final class AuthRefresh {
             }
         }
         if (failure != null) {
-            client.reportError(failure);
+            host.reportError(failure);
         }
     }
 
@@ -203,7 +210,7 @@ final class AuthRefresh {
         this.currentUser = user;
         this.currentAuthClass = authClass;
         if (always || changed) {
-            client.reportAuth(new AuthEvent(user, authClass));
+            host.reportAuth(new AuthEvent(user, authClass));
         }
     }
 
@@ -211,7 +218,7 @@ final class AuthRefresh {
     private void scheduleTimer(long delay, TimeUnit unit) {
         cancelTimer();
         final long generation = timerGeneration;
-        timer = client.getScheduler().schedule(() -> client.sendRefresh(generation), delay, unit);
+        timer = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> onTimer(generation)), delay, unit);
     }
 
 
@@ -222,7 +229,7 @@ final class AuthRefresh {
 
     // The timer fired: fetch a token and refresh with it, under the single-flight gate.
     void onTimer(long generation) {
-        if (generation != timerGeneration || client.getOpts().getTokenGetter() == null) {
+        if (generation != timerGeneration || host.tokenGetter() == null) {
             return;
         }
         timer = null;
@@ -236,8 +243,8 @@ final class AuthRefresh {
 
 
     private void fetchAndRefresh() {
-        WebSocket transport = client.transport();
-        if (client.getState() != ClientState.CONNECTED) {
+        WebSocket transport = host.transport();
+        if (host.state() != ClientState.CONNECTED) {
             complete(false);
             return;
         }
@@ -245,7 +252,7 @@ final class AuthRefresh {
         // A getter which throws fails the fetch as an error does, so the refresh still completes.
         CompletableFuture<String> fetched = new CompletableFuture<>();
         try {
-            client.getOpts().getTokenGetter().getConnectionToken(new ConnectionTokenEvent(), (Throwable err, String token) -> {
+            host.tokenGetter().getConnectionToken(new ConnectionTokenEvent(), (Throwable err, String token) -> {
                 if (err != null) {
                     fetched.completeExceptionally(err);
                 } else {
@@ -255,7 +262,7 @@ final class AuthRefresh {
         } catch (RuntimeException | Error e) {
             fetched.completeExceptionally(e);
         }
-        fetched.orTimeout(client.getOpts().getTimeout(), TimeUnit.MILLISECONDS)
+        fetched.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS)
                 .whenComplete((String token, Throwable err) -> runOnExecutorOrInline(() -> onTokenFetched(transport, Extensions.unwrapCompletion(err), token)));
     }
 
@@ -264,7 +271,7 @@ final class AuthRefresh {
         // The refresh in flight is completed here, unless a refresh command goes out: its callback completes it.
         boolean awaitingCommand = false;
         try {
-            if (transport != client.transport() || client.getState() != ClientState.CONNECTED) {
+            if (transport != host.transport() || host.state() != ClientState.CONNECTED) {
                 return;
             }
             // A refresh() which started during the fetch waits behind it. This token is superseded: it is not sent,
@@ -275,15 +282,15 @@ final class AuthRefresh {
             }
             if (err != null) {
                 if (err instanceof UnauthorizedException) {
-                    client.failUnauthorized();
+                    host.failUnauthorized();
                 } else {
                     scheduleRetry();
-                    client.reportError(new TokenError(err));
+                    host.reportError(new TokenError(err));
                 }
                 return;
             }
             if (token == null || token.equals("")) {
-                client.failUnauthorized();
+                host.failUnauthorized();
                 return;
             }
             commandInFlight = true;
@@ -310,18 +317,18 @@ final class AuthRefresh {
 
     private void finishTimer(WebSocket transport, String token, Throwable error, Protocol.RefreshResult result) {
         try {
-            if (transport != client.transport() || client.getState() != ClientState.CONNECTED) {
+            if (transport != host.transport() || host.state() != ClientState.CONNECTED) {
                 return;
             }
             if (error == null) {
-                client.storeToken(token);
+                host.storeToken(token);
                 timerSuperseded = false;
                 scheduleExpiry(result.getExpires(), result.getTtl());
                 applyAuth(result.getUser(), result.getAuthClass(), false);
                 return;
             }
             try {
-                client.reportError(new RefreshError(error));
+                host.reportError(new RefreshError(error));
             } finally {
                 settleTimerError(error);
             }
@@ -338,10 +345,10 @@ final class AuthRefresh {
             return;
         }
         ReplyError replyError = (ReplyError) error;
-        if (replyError.isTemporary() || replyError.getCode() < SERVER_ERROR_CODE_MIN || replyError.getCode() == Client.ERROR_CODE_TOKEN_EXPIRED) {
+        if (replyError.isTemporary() || replyError.getCode() < SERVER_ERROR_CODE_MIN || replyError.getCode() == ERROR_CODE_TOKEN_EXPIRED) {
             scheduleRetry();
         } else if (replyError.getCode() != PERMISSION_DENIED) {
-            client.processDisconnect(replyError.getCode(), replyError.getMessage(), false);
+            host.disconnect(replyError.getCode(), replyError.getMessage());
         }
     }
 
@@ -356,17 +363,17 @@ final class AuthRefresh {
                 rethrow(deliverAll(callbacks, error, null));
                 return;
             }
-            client.storeToken(token);
+            host.storeToken(token);
             connectTokenStored = false;
             timerSuperseded = false;
-            if (client.getState() == ClientState.CONNECTED) {
+            if (host.state() == ClientState.CONNECTED) {
                 scheduleExpiry(result.getExpires(), result.getTtl());
             }
             AuthResult authResult = new AuthResult(result.getUser(), result.getAuthClass(), result.getExpires(), result.getTtl());
             try {
                 // The identity is reported for a connected client only, as the expiry is scheduled for one. A connect
                 // reports the identity again, so nothing is lost when the client is not connected.
-                if (client.getState() == ClientState.CONNECTED) {
+                if (host.state() == ClientState.CONNECTED) {
                     applyAuth(result.getUser(), result.getAuthClass(), false);
                 }
             } finally {
@@ -396,23 +403,23 @@ final class AuthRefresh {
                 .build();
 
         Protocol.Command cmd = Protocol.Command.newBuilder()
-                .setId(client.nextCommandId())
+                .setId(host.nextCommandId())
                 .setRefresh(req)
                 .build();
 
         CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
         // One stage delivers the outcome, so a callback which throws is never called a second time.
-        f.orTimeout(client.getOpts().getTimeout(), TimeUnit.MILLISECONDS).handle((Protocol.Reply reply, Throwable e) -> {
+        f.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS).handle((Protocol.Reply reply, Throwable e) -> {
             if (e != null) {
                 runOnExecutorOrInline(() -> {
-                    client.cleanCommandFuture(cmd);
+                    host.cleanCommand(cmd);
                     cb.onDone(Extensions.unwrapCompletion(e), null);
                 });
                 return null;
             }
-            client.cleanCommandFuture(cmd);
+            host.cleanCommand(cmd);
             if (reply.getError().getCode() != 0) {
-                cb.onDone(client.getReplyError(reply), null);
+                cb.onDone(host.replyError(reply), null);
             } else {
                 Protocol.RefreshResult replyResult = reply.getRefresh();
                 cb.onDone(null, replyResult);
@@ -420,7 +427,7 @@ final class AuthRefresh {
             return null;
         });
 
-        client.enqueueCommandFuture(cmd, f);
+        host.enqueueCommand(cmd, f);
     }
 
 
@@ -429,14 +436,8 @@ final class AuthRefresh {
     // run exactly once. The task then only settles the callbacks: the client is closed. A failure of an inline
     // task goes to the listener.
     private void runOnExecutorOrInline(Runnable task) {
-        Runnable reported = () -> {
-            try {
-                task.run();
-            } catch (RuntimeException failure) {
-                client.reportError(failure);
-            }
-        };
-        Extensions.submitOrRun(client.getExecutor(), reported, reported);
+        Runnable reported = host.reporting(task);
+        Extensions.submitOrRun(host.executor(), reported, reported);
     }
 
 
@@ -488,10 +489,10 @@ final class AuthRefresh {
     // A refresh made while the connection is down sets the token the next connect sends.
     private void keepTokenForConnect(String token) {
         if (!connectTokenStored) {
-            tokenBeforeConnect = client.getConnectionToken();
+            tokenBeforeConnect = host.connectionToken();
             connectTokenStored = true;
         }
-        client.storeToken(token);
+        host.storeToken(token);
     }
 
 
@@ -513,7 +514,7 @@ final class AuthRefresh {
     // Puts back the token the connection had before a refresh made while it was down.
     private void restoreConnectToken() {
         if (connectTokenStored) {
-            client.storeToken(tokenBeforeConnect);
+            host.storeToken(tokenBeforeConnect);
             connectTokenStored = false;
         }
     }
@@ -527,11 +528,11 @@ final class AuthRefresh {
     private void complete(boolean refused) {
         inFlight = false;
         commandInFlight = false;
-        if (client.getState() != ClientState.CONNECTED) {
+        if (host.state() != ClientState.CONNECTED) {
             try {
                 failWaiting();
             } finally {
-                client.flushRpc();
+                host.flushRpc();
             }
             return;
         }
@@ -551,7 +552,7 @@ final class AuthRefresh {
                 continue;
             }
             inFlight = true;
-            client.flushRpc();
+            host.flushRpc();
             fetchAndRefresh();
             return;
         }
@@ -559,6 +560,6 @@ final class AuthRefresh {
             timerSuperseded = false;
             scheduleRetry();
         }
-        client.flushRpc();
+        host.flushRpc();
     }
 }

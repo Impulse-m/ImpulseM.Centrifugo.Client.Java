@@ -8,6 +8,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.RejectedExecutionException;
@@ -62,7 +63,7 @@ final class RpcSession {
     private static final int LATER_RESENDS = 3;
     private static final long LATER_BASE_NANOS = TimeUnit.MILLISECONDS.toNanos(250L);
 
-    private final Client client;
+    private final ClientHost host;
     // Calls which wait for the connection or for a refresh, and calls lost with their transport.
     private final RpcQueue queue;
     // Calls written to the current transport, by the id of their command.
@@ -84,10 +85,32 @@ final class RpcSession {
     private final AtomicInteger pending = new AtomicInteger();
 
 
-    RpcSession(Client client, int maxPending) {
-        this.client = client;
+    RpcSession(ClientHost host, int maxPending) {
+        this.host = host;
         this.queue = new RpcQueue();
         this.maxPending = maxPending;
+    }
+
+
+    /**
+     * Creates the call and submits it. The arguments are checked on the caller's thread.
+     *
+     * @throws NullPointerException when the method or the data is null.
+     */
+    RpcCall call(String method, byte[] data, RpcOptions options, ResultCallback<RPCResult> cb) {
+        Objects.requireNonNull(method, "method");
+        Objects.requireNonNull(data, "data");
+        Map<String, String> headers = options != null ? options.getHeaders() : Collections.<String, String>emptyMap();
+        long timeout = options != null && options.getTimeout() > 0 ? options.getTimeout() : host.timeoutMillis();
+        RpcCall call = new RpcCall(this, method, data, headers, timeout, cb);
+        submit(call);
+        return call;
+    }
+
+
+    // Runs the cancel of the call on the executor. Once the executor is closed, the close has completed the call.
+    void requestCancel(RpcCall call) {
+        Extensions.submitOrIgnore(host.executor(), () -> cancel(call));
     }
 
 
@@ -108,8 +131,8 @@ final class RpcSession {
                 // The deadline is a timer of the client, so the clock of the client drives it. The scheduler and the
                 // executor reject the call once the client is closed. Nothing is registered then, so the deadline
                 // cannot fire later and call back on another thread.
-                call.deadlineTask = client.getScheduler().schedule(() -> call.future.completeExceptionally(new TimeoutException()), call.timeout, TimeUnit.MILLISECONDS);
-                client.getExecutor().submit(() -> start(call));
+                call.deadlineTask = host.scheduler().schedule(() -> call.future.completeExceptionally(new TimeoutException()), call.timeout, TimeUnit.MILLISECONDS);
+                host.executor().submit(() -> start(call));
             } catch (RejectedExecutionException e) {
                 cancelDeadline(call);
                 release(call);
@@ -144,13 +167,13 @@ final class RpcSession {
             call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
             return;
         }
-        if (!client.hasInstance()) {
+        if (!host.hasInstance()) {
             // Without an instance the calls are plain: the server has no record of them to cancel.
             queue.remove(call);
             call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel needs the instance option", false));
             return;
         }
-        if (client.getState() == ClientState.CONNECTED && !client.hasRpcOptions()) {
+        if (host.state() == ClientState.CONNECTED && !host.hasRpcOptions()) {
             queue.remove(call);
             call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel is not supported by the server", false));
             return;
@@ -169,17 +192,17 @@ final class RpcSession {
      * is in flight: the pending cancels first, then the calls in resend order.
      */
     void flush() {
-        if (client.getState() != ClientState.CONNECTED || client.isRefreshing()) {
+        if (host.state() != ClientState.CONNECTED || host.isRefreshing()) {
             return;
         }
-        if (!client.hasRpcOptions()) {
+        if (!host.hasRpcOptions()) {
             // A server without RPC options keeps no record of the calls, so there is nothing to cancel.
             pendingCancels.clear();
         }
         List<Long> cancels = new ArrayList<>(pendingCancels);
         pendingCancels.clear();
         for (long msgId : cancels) {
-            if (client.hasRpcOptions() && !writeCancel(msgId)) {
+            if (host.hasRpcOptions() && !writeCancel(msgId)) {
                 keepCancel(msgId);
             }
         }
@@ -187,7 +210,7 @@ final class RpcSession {
             if (call.future.isDone()) {
                 continue;
             }
-            if (call.everSent && !client.hasRpcOptions()) {
+            if (call.everSent && !host.hasRpcOptions()) {
                 call.future.completeExceptionally(new IOException());
                 continue;
             }
@@ -234,7 +257,7 @@ final class RpcSession {
         List<RpcCall> lost = new ArrayList<>();
         for (Map.Entry<Integer, RpcCall> entry : onWire.entrySet()) {
             RpcCall call = entry.getValue();
-            client.removeFuture(entry.getKey());
+            host.removeFuture(entry.getKey());
             stopLate(call);
             pendingAcks.addAll(0, call.carriedAcks);
             call.carriedAcks = Collections.emptyList();
@@ -250,7 +273,7 @@ final class RpcSession {
         onWire.clear();
         // A cancel which got no reply is kept for the next connection which confirms RPC options.
         for (Map.Entry<Integer, CancelCommand> entry : cancelCommands.entrySet()) {
-            client.removeFuture(entry.getKey());
+            host.removeFuture(entry.getKey());
             entry.getValue().stopTimer();
             keepCancel(entry.getValue().msgId);
             pendingAcks.addAll(0, entry.getValue().acks);
@@ -280,7 +303,7 @@ final class RpcSession {
     // The error of a call which the client gives up for good. A tracked call whose msg_id was never written
     // is cancelled: nothing reached the server. Any other call was written, so its connection is gone.
     private Throwable closedError(RpcCall call) {
-        if (client.hasInstance() && (!call.everSent || call.resendAsNew)) {
+        if (host.hasInstance() && (!call.everSent || call.resendAsNew)) {
             return new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false);
         }
         return new IOException();
@@ -291,7 +314,7 @@ final class RpcSession {
     // taken, and a refused call takes none: only the accepted calls hold slots. A client without an instance
     // has no bound.
     private boolean reserve(RpcCall call) {
-        if (!client.hasInstance()) {
+        if (!host.hasInstance()) {
             return true;
         }
         int current = pending.get();
@@ -318,7 +341,7 @@ final class RpcSession {
     // the session state went with the executor, so only the callback of the call runs, on the
     // calling thread, exactly once.
     private void finishOnExecutor(RpcCall call, Protocol.Reply reply, Throwable error) {
-        Extensions.submitOrRun(client.getExecutor(), () -> finish(call, reply, error), () -> deliverReporting(call, reply, error));
+        Extensions.submitOrRun(host.executor(), () -> finish(call, reply, error), () -> deliverReporting(call, reply, error));
     }
 
 
@@ -329,7 +352,7 @@ final class RpcSession {
             return;
         }
         // A call submitted before close but started after it: nothing will ever write it, so it fails now.
-        if (client.getState() == ClientState.CLOSED) {
+        if (host.state() == ClientState.CLOSED) {
             call.future.completeExceptionally(closedError(call));
             return;
         }
@@ -339,7 +362,7 @@ final class RpcSession {
 
     // Writes the call now when the connection is up and no refresh is in flight, and queues it otherwise.
     private void writeOrQueue(RpcCall call) {
-        if (client.getState() == ClientState.CONNECTED && !client.isRefreshing()) {
+        if (host.state() == ClientState.CONNECTED && !host.isRefreshing()) {
             write(call);
         } else {
             queue.add(call);
@@ -353,21 +376,21 @@ final class RpcSession {
     // which was not sent takes a new msg_id on each attempt, since nothing reached the server. A call
     // which was sent keeps its msg_id, and is marked as a resend.
     private void write(RpcCall call) {
-        boolean supported = client.hasRpcOptions();
+        boolean supported = host.hasRpcOptions();
         if (!supported && !call.headers.isEmpty()) {
             call.future.complete(Extensions.unsupportedRpcReply());
             return;
         }
-        boolean tracked = supported && client.hasInstance();
+        boolean tracked = supported && host.hasInstance();
         if (tracked && !call.everSent) {
             try {
-                call.msgId = msgIds.next(client.serverTimeMillis());
+                call.msgId = msgIds.next(host.serverTimeMillis());
             } catch (IllegalStateException e) {
                 call.future.completeExceptionally(e);
                 return;
             }
         }
-        int id = client.nextCommandId();
+        int id = host.nextCommandId();
         call.commandId = id;
         List<Long> acks = tracked ? takeAcks() : Collections.<Long>emptyList();
         Protocol.Command cmd = Protocol.Command.newBuilder()
@@ -379,16 +402,16 @@ final class RpcSession {
         CompletableFuture<Protocol.Reply> attempt = new CompletableFuture<>();
         attempt.whenComplete((Protocol.Reply reply, Throwable error) -> settleAttempt(call, reply, error));
         call.attempt = attempt;
-        client.addFuture(id, attempt);
+        host.addFuture(id, attempt);
         onWire.put(id, call);
-        if (client.sendCommand(cmd)) {
+        if (host.sendCommand(cmd)) {
             call.everSent = true;
             call.resendAsNew = false;
             call.wireTracked = tracked;
             call.carriedAcks = acks;
             return;
         }
-        client.removeFuture(id);
+        host.removeFuture(id);
         onWire.remove(id);
         pendingAcks.addAll(0, acks);
         if (!tracked) {
@@ -416,7 +439,7 @@ final class RpcSession {
     // Sends the cancel of a msg_id now when the connection can carry it, and keeps it for the next
     // connection which confirms RPC options otherwise.
     private void sendCancel(long msgId) {
-        if (client.getState() != ClientState.CONNECTED || !client.hasRpcOptions() || !writeCancel(msgId)) {
+        if (host.state() != ClientState.CONNECTED || !host.hasRpcOptions() || !writeCancel(msgId)) {
             keepCancel(msgId);
         }
     }
@@ -442,22 +465,22 @@ final class RpcSession {
                 .setCancel(msgId)
                 .addAllAck(acks)
                 .build();
-        int id = client.nextCommandId();
+        int id = host.nextCommandId();
         Protocol.Command cmd = Protocol.Command.newBuilder()
                 .setId(id)
                 .setRpc(req)
                 .build();
         CompletableFuture<Protocol.Reply> reply = new CompletableFuture<>();
-        reply.whenComplete((Protocol.Reply answer, Throwable error) -> Extensions.submitOrIgnore(client.getExecutor(), () -> forgetCancel(id)));
-        client.addFuture(id, reply);
+        reply.whenComplete((Protocol.Reply answer, Throwable error) -> Extensions.submitOrIgnore(host.executor(), () -> forgetCancel(id)));
+        host.addFuture(id, reply);
         CancelCommand command = new CancelCommand(msgId, acks);
         cancelCommands.put(id, command);
-        if (client.sendCommand(cmd)) {
+        if (host.sendCommand(cmd)) {
             // The reply is handled on the executor, after this task, so the timer is set before it can come.
-            command.timer = client.getScheduler().schedule(() -> Extensions.submitOrIgnore(client.getExecutor(), () -> forgetCancel(id)), client.getOpts().getTimeout(), TimeUnit.MILLISECONDS);
+            command.timer = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> forgetCancel(id)), host.timeoutMillis(), TimeUnit.MILLISECONDS);
             return true;
         }
-        client.removeFuture(id);
+        host.removeFuture(id);
         cancelCommands.remove(id);
         pendingAcks.addAll(0, acks);
         return false;
@@ -467,7 +490,7 @@ final class RpcSession {
     // Ends the wait for the reply of a cancel command, from its reply or its timeout. Runs on the executor,
     // and is dropped once the executor is closed: the cancel was forgotten with the connection then.
     private void forgetCancel(int id) {
-        client.removeFuture(id);
+        host.removeFuture(id);
         CancelCommand command = cancelCommands.remove(id);
         if (command != null) {
             command.stopTimer();
@@ -526,9 +549,9 @@ final class RpcSession {
     // of the refusal first, the reply's own time, which the clock offset already covers. The refused
     // msg_id was never recorded by the server, so it is not acked.
     private void resendWithNewId(RpcCall call, long replyTimeMillis) {
-        msgIds.resync(replyTimeMillis > 0L ? replyTimeMillis : client.serverTimeMillis());
+        msgIds.resync(replyTimeMillis > 0L ? replyTimeMillis : host.serverTimeMillis());
         try {
-            call.msgId = msgIds.next(client.serverTimeMillis());
+            call.msgId = msgIds.next(host.serverTimeMillis());
         } catch (IllegalStateException e) {
             call.future.completeExceptionally(e);
             return;
@@ -545,7 +568,7 @@ final class RpcSession {
         resendWaiting.add(call);
         call.resendGeneration++;
         final int generation = call.resendGeneration;
-        call.resendTask = client.getScheduler().schedule(() -> Extensions.submitOrIgnore(client.getExecutor(), () -> resendLater(call, generation)), delayNanos, TimeUnit.NANOSECONDS);
+        call.resendTask = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> resendLater(call, generation)), delayNanos, TimeUnit.NANOSECONDS);
     }
 
 
@@ -602,7 +625,7 @@ final class RpcSession {
     // Forgets the attempt of the call: its future and its entry on the wire.
     private void forgetAttempt(RpcCall call) {
         if (call.commandId != 0) {
-            client.removeFuture(call.commandId);
+            host.removeFuture(call.commandId);
             onWire.remove(call.commandId);
         }
     }
@@ -611,7 +634,7 @@ final class RpcSession {
     // Keeps the attempt of a call which settled locally, so that a late reply is acked. The attempt is
     // forgotten one call timeout later, or with the transport.
     private void keepLate(RpcCall call) {
-        call.lateTask = client.getScheduler().schedule(() -> Extensions.submitOrIgnore(client.getExecutor(), () -> forgetLate(call)), call.timeout, TimeUnit.MILLISECONDS);
+        call.lateTask = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> forgetLate(call)), call.timeout, TimeUnit.MILLISECONDS);
     }
 
 
@@ -642,7 +665,7 @@ final class RpcSession {
     // Runs when the transport settles the attempt of the call. The decision is taken on the executor,
     // and a closed executor completes the call directly.
     private void settleAttempt(RpcCall call, Protocol.Reply reply, Throwable error) {
-        Extensions.submitOrRun(client.getExecutor(), () -> finishAttempt(call, reply, error), () -> completeCall(call, reply, error));
+        Extensions.submitOrRun(host.executor(), () -> finishAttempt(call, reply, error), () -> completeCall(call, reply, error));
     }
 
 
@@ -662,7 +685,7 @@ final class RpcSession {
             forgetAttempt(call);
             return;
         }
-        client.removeFuture(call.commandId);
+        host.removeFuture(call.commandId);
         onWire.remove(call.commandId);
         call.attempt = null;
         if (reply != null && reply.getError().getCode() != 0 && call.wireTracked && resend(call, reply)) {
@@ -688,11 +711,7 @@ final class RpcSession {
     // Hands the outcome to the callback. A callback which throws is reported to the listener: the executor would
     // drop the failure of the task, and nothing else would tell the caller of the call.
     private void deliverReporting(RpcCall call, Protocol.Reply reply, Throwable error) {
-        try {
-            deliver(call, reply, error);
-        } catch (RuntimeException failure) {
-            client.reportError(failure);
-        }
+        host.reporting(() -> deliver(call, reply, error)).run();
     }
 
 
@@ -704,7 +723,7 @@ final class RpcSession {
             return;
         }
         if (reply.getError().getCode() != 0) {
-            call.callback.onDone(client.getReplyError(reply), null);
+            call.callback.onDone(host.replyError(reply), null);
             return;
         }
         Protocol.RPCResult rpcResult = reply.getRpc();
