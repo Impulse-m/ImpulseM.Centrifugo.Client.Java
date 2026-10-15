@@ -90,7 +90,7 @@ public class Client {
         return scheduler;
     }
 
-    private static final int NORMAL_CLOSURE_STATUS = 1000;
+    static final int NORMAL_CLOSURE_STATUS = 1000;
     private static final int MESSAGE_SIZE_LIMIT_EXCEEDED_STATUS = 1009;
 
     static final int DISCONNECTED_DISCONNECT_CALLED = 0;
@@ -918,6 +918,9 @@ public class Client {
         }
         Protocol.ConnectResult result = reply.getConnect();
         this.rpcOptionsSupported = Extensions.hasFlag(result.getFlag(), Extensions.RPC_OPTIONS_FLAG);
+        // Set before a token exchange may hold the connect: the server pings this connection from now on.
+        this.pingInterval = result.getPing() * 1000;
+        this.sendPong = result.getPong();
         if (this.auth.interceptConnect(reply)) {
             return;
         }
@@ -929,8 +932,6 @@ public class Client {
         this.setState(ClientState.CONNECTED);
         this.listener.onConnected(this, event);
         this.auth.applyAuth(result.getUser(), result.getAuthClass(), true);
-        this.pingInterval = result.getPing() * 1000;
-        this.sendPong = result.getPong();
 
         synchronized (this.subs) {
             for (Map.Entry<String, Subscription> entry : this.subs.entrySet()) {

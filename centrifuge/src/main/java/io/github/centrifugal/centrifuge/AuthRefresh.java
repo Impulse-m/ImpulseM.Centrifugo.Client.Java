@@ -112,6 +112,12 @@ final class AuthRefresh {
     }
 
 
+    /** Whether the client was created with a token exchange. */
+    boolean hasFlow() {
+        return flow != null;
+    }
+
+
     /** The connection token getter of a token exchange: the timer fetches its token through the exchange. */
     ConnectionTokenGetter exchangeTokenGetter() {
         return flow.renewalGetter();

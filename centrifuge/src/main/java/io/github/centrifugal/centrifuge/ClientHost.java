@@ -18,9 +18,6 @@ import okio.ByteString;
  * client's executor thread, except where a method says otherwise.
  */
 final class ClientHost {
-    // The close code of a normal closure, as the client sends it.
-    private static final int NORMAL_CLOSURE_STATUS = 1000;
-
     private final Client client;
 
 
@@ -54,8 +51,9 @@ final class ClientHost {
     }
 
 
+    /** The flow is built when the client is created, so the getter follows it rather than the option, which may change later. */
     ConnectionTokenGetter tokenGetter() {
-        if (client.getOpts().getTokenExchange() != null) {
+        if (client.auth.hasFlow()) {
             return client.auth.exchangeTokenGetter();
         }
         return client.getOpts().getTokenGetter();
@@ -90,7 +88,7 @@ final class ClientHost {
 
     /** Closes the transport normally, as the client closes a connect which got no reply. */
     void closeTransport() {
-        transport().close(NORMAL_CLOSURE_STATUS, "");
+        transport().close(Client.NORMAL_CLOSURE_STATUS, "");
     }
 
 
