@@ -1,7 +1,6 @@
 package io.github.centrifugal.centrifuge;
 
-import java.util.concurrent.ThreadLocalRandom;
-import java.util.function.IntUnaryOperator;
+import java.util.Random;
 
 
 /**
@@ -25,7 +24,8 @@ final class MsgIdGenerator {
     // A lane is below this bound, so a second holds at least 2^19 msg_ids from its lane on.
     private static final int LANE_BOUND = 1 << 19;
 
-    private final IntUnaryOperator laneSource;
+    // Draws the lanes. It is a parameter so that the tests pick the lanes.
+    private final Random random;
     // The last msg_id issued is lastSeconds and lastSeq.
     private long lastSeconds = 0L;
     private long lastSeq = 0L;
@@ -33,13 +33,12 @@ final class MsgIdGenerator {
 
 
     MsgIdGenerator() {
-        this((int bound) -> ThreadLocalRandom.current().nextInt(bound));
+        this(new Random());
     }
 
 
-    // The lane source returns a value in [0, bound). It is a parameter so that the tests pick the lanes.
-    MsgIdGenerator(IntUnaryOperator laneSource) {
-        this.laneSource = laneSource;
+    MsgIdGenerator(Random random) {
+        this.random = random;
         this.lane = drawLane();
     }
 
@@ -89,6 +88,6 @@ final class MsgIdGenerator {
 
 
     private long drawLane() {
-        return laneSource.applyAsInt(LANE_BOUND);
+        return random.nextInt(LANE_BOUND);
     }
 }

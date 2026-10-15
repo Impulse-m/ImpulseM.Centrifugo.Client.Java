@@ -173,7 +173,7 @@ The server scopes the records of a client by a connection instance, which the ap
 ```java
 byte[] bytes = new byte[16];
 new java.security.SecureRandom().nextBytes(bytes);
-String instance = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+String instance = String.format("%032x", new java.math.BigInteger(1, bytes));
 // persist the value in the application's own storage, then:
 options.setInstance(instance);
 ```

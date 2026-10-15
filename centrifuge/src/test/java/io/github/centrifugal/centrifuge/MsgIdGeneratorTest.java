@@ -1,8 +1,8 @@
 package io.github.centrifugal.centrifuge;
 
 import java.util.HashSet;
+import java.util.Random;
 import java.util.Set;
-import java.util.function.IntUnaryOperator;
 
 import org.junit.Test;
 
@@ -167,9 +167,14 @@ public class MsgIdGeneratorTest {
     }
 
 
-    // A lane source which returns the values in order, one per draw.
-    private static IntUnaryOperator lanes(final int... values) {
+    // A random source which returns the values in order, one per draw of a lane.
+    private static Random lanes(final int... values) {
         final int[] index = {0};
-        return (int bound) -> values[index[0]++];
+        return new Random() {
+            @Override
+            public int nextInt(int bound) {
+                return values[index[0]++];
+            }
+        };
     }
 }
