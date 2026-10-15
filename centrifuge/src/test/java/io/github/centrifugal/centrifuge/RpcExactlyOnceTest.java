@@ -473,6 +473,30 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void deadlineOfASentCallFiresOnTheClientClockAndCancelsIt() throws Exception {
+        enableRpcOptions();
+        Options options = instanceOptions();
+        options.setTimeout(300);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();
+        ManualScheduler clock = new ManualScheduler();
+        Client c = newClientOnClock(options, clock);
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("slow", EMPTY_PAYLOAD, into(future));
+        awaitRequestCount(1);
+        long msgId = sentRpcRequests().get(0).getMsgId();
+        assertTrue("the deadline is a timer of the client", clock.requestedDelays().contains(300L));
+
+        clock.advance(299);
+        assertFalse("not yet at the deadline", future.isDone());
+        clock.advance(1);
+
+        assertTrue("the deadline gives a timeout", errorOf(future) instanceof TimeoutException);
+        awaitCancel(msgId);
+    }
+
+
+    @Test
     public void legacyServerGetsPlainCallsAndRejectsHeaders() throws Exception {
         answerRpcs("ok");
         Client c = newClient();
@@ -1074,8 +1098,8 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         enableRpcOptions();
         AtomicInteger seen = new AtomicInteger();
         AtomicLong serverTime = new AtomicLong(System.currentTimeMillis());
-        // The first call is refused for now. The resend waits on the manual clock, which the test moves only
-        // after the deadline. The deadline itself is real time: the call timeout has no clock seam.
+        // The first call is refused for now. Its resend is sent at 250 ms, and the server holds it without an
+        // answer, so the deadline at 1000 ms finds the resend on the wire and cancels it.
         server.onCommand = (Protocol.Command cmd) -> {
             if (!cmd.hasRpc() || cmd.getRpc().getCancel() != 0) {
                 return null;
@@ -1085,20 +1109,45 @@ public class RpcExactlyOnceTest extends RpcTestBase {
             }
             return null;
         };
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && cmd.getRpc().getCancel() == 0;
         ManualScheduler clock = new ManualScheduler();
         Client c = newClientOnClock(instanceOptions(), clock);
         connect(c);
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        // A deadline of a second leaves the refusal time to arrive before the 250 ms delay would reach it.
         c.rpcCall("slow", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(1000).build(), into(future));
         awaitCondition("the resend is scheduled", () -> clock.requestedDelays().contains(250L));
         long msgId = sentRpcRequests().get(0).getMsgId();
 
+        clock.advance(250);
+        awaitRequestCount(2);
+        clock.advance(750);
+
         assertTrue(errorOf(future) instanceof TimeoutException);
         assertEquals(msgId, awaitCancel(msgId).getCancel());
+        assertEquals("the resend keeps the msg_id", msgId, sentRpcRequests().get(1).getMsgId());
+        assertTrue("the resend is a retransmit", sentRpcRequests().get(1).getRetransmit());
+    }
+
+
+    // A later refusal whose resend would run at or past the deadline is not resent: the error is delivered at once.
+    @Test
+    public void laterRefusalWhoseResendWouldReachTheDeadlineIsDeliveredAtOnce() throws Exception {
+        enableRpcOptions();
+        refuseCalls(2, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
+        ManualScheduler clock = new ManualScheduler();
+        Client c = newClientOnClock(instanceOptions(), clock);
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        // The first resend is due at 250 ms, and the second, 500 ms later, is past the deadline at 300 ms.
+        c.rpcCall("later", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(300).build(), into(future));
+        awaitCondition("the first resend is scheduled", () -> clock.requestedDelays().contains(250L));
         clock.advance(250);
-        syncWithServer();
-        assertEquals("no resend is sent once the deadline has passed", 1, sentRpcRequests().size() - sentCancels().size());
+        awaitRequestCount(2);
+
+        ReplyError error = replyErrorOf(future);
+
+        assertEquals(TEMPORARY, error.getCode());
+        assertEquals("no second resend is made", 2, sentRpcRequests().size());
     }
 
 

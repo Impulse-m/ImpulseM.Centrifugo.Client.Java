@@ -43,6 +43,9 @@ public final class RpcCall {
     // Resends so far: after a refused msg_id, and after a temporary refusal.
     int newIdResends;
     int laterResends;
+    // The deadline of the call, a timer of the client which completes the future with a TimeoutException.
+    // Cancelled once the call is finished on the executor.
+    ScheduledFuture<?> deadlineTask;
     // The attempt on the wire: its future completes with the answer of the transport, and the executor
     // clears the field once it has decided on the answer.
     CompletableFuture<Protocol.Reply> attempt;
@@ -92,8 +95,12 @@ public final class RpcCall {
     }
 
 
-    // The time left until the deadline, in nanoseconds. Zero or less when the deadline has passed.
+    // The time left until the deadline, in nanoseconds. Zero or less when the deadline has passed. The deadline
+    // timer gives it, so the resends and the deadline run on one clock.
     long remainingNanos() {
+        if (deadlineTask != null) {
+            return deadlineTask.getDelay(TimeUnit.NANOSECONDS);
+        }
         return deadlineNanos - System.nanoTime();
     }
 }

@@ -103,16 +103,18 @@ final class RpcSession {
             call.future.completeExceptionally(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls are pending", false));
         } else {
             try {
-                // The executor rejects the call once the client is closed. Nothing is registered then, so
-                // the deadline cannot fire later and call back on another thread.
+                // The deadline is a timer of the client, so the clock of the client drives it. The scheduler and the
+                // executor reject the call once the client is closed. Nothing is registered then, so the deadline
+                // cannot fire later and call back on another thread.
+                call.deadlineTask = client.getScheduler().schedule(() -> call.future.completeExceptionally(new TimeoutException()), call.timeout, TimeUnit.MILLISECONDS);
                 client.getExecutor().submit(() -> start(call));
             } catch (RejectedExecutionException e) {
+                cancelDeadline(call);
                 release(call);
                 throw e;
             }
         }
-        call.future.orTimeout(call.timeout, TimeUnit.MILLISECONDS)
-                .whenComplete((Protocol.Reply reply, Throwable error) -> finishOnExecutor(call, reply, error));
+        call.future.whenComplete((Protocol.Reply reply, Throwable error) -> finishOnExecutor(call, reply, error));
     }
 
 
@@ -543,6 +545,7 @@ final class RpcSession {
     private void finish(RpcCall call, Protocol.Reply reply, Throwable error) {
         queue.remove(call);
         stopResend(call);
+        cancelDeadline(call);
         if (reply == null && call.wireTracked && onWire.get(call.commandId) == call) {
             // Settled locally while its attempt is on the wire: a late reply is still acked for one call timeout.
             keepLate(call);
@@ -587,6 +590,15 @@ final class RpcSession {
     private void forgetLate(RpcCall call) {
         call.lateTask = null;
         forgetAttempt(call);
+    }
+
+
+    // Cancels the deadline timer of the call, if it is still set.
+    private static void cancelDeadline(RpcCall call) {
+        if (call.deadlineTask != null) {
+            call.deadlineTask.cancel(false);
+            call.deadlineTask = null;
+        }
     }
 
 
