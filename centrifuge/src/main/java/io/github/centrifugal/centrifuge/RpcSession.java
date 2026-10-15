@@ -224,6 +224,13 @@ final class RpcSession {
      * any more: its wait ends here.
      */
     void onTransportLost(boolean keep) {
+        // An answer which the executor has not decided on yet is decided first: a refusal with the retry signal then
+        // resends the call here, and the call is not kept with the msg_id it was refused with.
+        for (RpcCall call : new ArrayList<>(onWire.values())) {
+            if (answerQueued(call)) {
+                finishAttempt(call, call.attempt.getNow(null), null);
+            }
+        }
         List<RpcCall> lost = new ArrayList<>();
         for (Map.Entry<Integer, RpcCall> entry : onWire.entrySet()) {
             RpcCall call = entry.getValue();

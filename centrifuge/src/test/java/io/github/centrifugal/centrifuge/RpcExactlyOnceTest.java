@@ -10,6 +10,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -964,6 +965,42 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     }
 
 
+    // The refusal is answered and the transport is lost, both queued behind the gate. The executor then runs the
+    // reply first, and the loss second: the answer to the attempt comes after the loss in the queue.
+    @Test
+    public void refusalAnsweredBeforeTheTransportLossIsResentWithANewMsgId() throws Exception {
+        enableRpcOptions();
+        final AtomicBoolean holdFirst = new AtomicBoolean(true);
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && cmd.getRpc().getCancel() == 0 && holdFirst.getAndSet(false);
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("m", EMPTY_PAYLOAD, into(future));
+        awaitRequestCount(1);
+        Protocol.Command held = null;
+        for (Protocol.Command cmd : server.received()) {
+            if (cmd.hasRpc() && cmd.getRpc().getCancel() == 0) {
+                held = cmd;
+            }
+        }
+        final Protocol.Reply refused = refusal(held, MSG_ID_INVALID, Extensions.RPC_RETRY_NEW_MSG_ID, System.currentTimeMillis());
+        final CountDownLatch gate = new CountDownLatch(1);
+        c.getExecutor().submit(() -> awaitLatch(gate));
+        Future<?> answered = c.getExecutor().submit(() -> processReply(c, refused));
+        Future<?> lost = c.getExecutor().submit(() -> c.processDisconnect(1000, "bye", true));
+        gate.countDown();
+        answered.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        lost.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        server.closeConnection();
+
+        future.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        List<Protocol.RPCRequest> requests = sentRpcRequests();
+        assertEquals(2, requests.size());
+        assertNotEquals("the refused msg_id is replaced", requests.get(0).getMsgId(), requests.get(1).getMsgId());
+        assertFalse("the new msg_id is not a retransmit", requests.get(1).getRetransmit());
+    }
+
+
     @Test
     public void callAfterAMsgIdRefusalUsesTheCorrectedTimePart() throws Exception {
         enableRpcOptions();
@@ -1462,6 +1499,25 @@ public class RpcExactlyOnceTest extends RpcTestBase {
                 .setTime(serverTime)
                 .setError(error)
                 .build();
+    }
+
+
+    // Delivers the reply to the client as its transport does, on the executor.
+    private static void processReply(Client c, Protocol.Reply reply) {
+        try {
+            c.processReply(reply);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+
+    private static void awaitLatch(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
 

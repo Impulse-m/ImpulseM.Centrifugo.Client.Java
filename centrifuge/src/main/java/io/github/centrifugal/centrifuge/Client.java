@@ -1151,7 +1151,7 @@ public class Client {
         }
     }
 
-    private void processReply(Protocol.Reply reply) throws Exception {
+    void processReply(Protocol.Reply reply) throws Exception {
         this.observeServerTime(reply);
         if (reply.getId() > 0) {
             CompletableFuture<Protocol.Reply> cf = this.futures.get(reply.getId());
