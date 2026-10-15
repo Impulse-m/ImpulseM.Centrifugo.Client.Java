@@ -1,6 +1,8 @@
 Unreleased
 ==========
 
+* Publish debouncing: when the server returns `publish_debounce` in the subscribe result, `Subscription.publish` sends the first value at once and coalesces the rest of the window into the latest one; pending data is dropped on unsubscribe and disconnect.
+* The README documents publish debouncing, channel compaction (negotiated automatically) and delta without positioning.
 * Connection identity: `onAuth` reports the user and auth class of the connection on every connect, and when a refresh changes them.
 * `Client.refresh(token, callback)` refreshes the connection token on demand. An error is reported unchanged, and keeps the connection and its identity. At most 32 refreshes are in progress, a refresh beyond that fails with `LIMIT_EXCEEDED`.
 * `Options.setInstance` sets the connection instance, a secret the application supplies. With it, rpc calls on a server which confirms RPC options are exactly-once: each call carries a `msg_id`, is kept across a reconnect and sent again with the retransmit flag. Without an instance calls are plain, as before.

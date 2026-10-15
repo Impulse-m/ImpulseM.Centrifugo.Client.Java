@@ -90,6 +90,14 @@ To use with Android don't forget to set INTERNET permission to `AndroidManifest.
 
 When a mobile application goes to the background there are OS-specific limitations for established persistent connections - which can be silently closed shortly. Thus in most cases you need to disconnect from a server when app moves to the background and connect again when app goes to the foreground.
 
+## Subscription bandwidth
+
+**Publish debouncing.** When the server returns a publish debounce window in the subscribe result, `Subscription.publish` coalesces rapid publishes. The first publish is sent at once and starts a window of that length. Publishes inside the window replace the pending value and complete at once with an empty result. When the window ends with a pending value, the latest one is sent and a new window starts; a window which ends with nothing pending is closed. The window is off unless the server sets it. Debouncing is fire-and-forget: pending data is dropped on `unsubscribe()` and on disconnect, and an error of a publish sent when the window ends is not reported to the application.
+
+**Channel compaction.** The client always offers channel compaction on subscribe. When the server allows it, the subscribe result carries a numeric channel id, and publication, join and leave pushes carry that id instead of the channel name. It is negotiated automatically and needs no option.
+
+**Delta without positioning.** `SubscriptionOptions.setDelta` asks for delta compression. A subscription without positioning or recovery gets delta too, when the server keeps the latest publication of each channel: the first publication after subscribe is full, and each later one is a patch against the previous publication the client received.
+
 ## RPC options
 
 `rpc` has an overload that takes `RpcOptions`. Headers set in the options are sent with that one call only:
