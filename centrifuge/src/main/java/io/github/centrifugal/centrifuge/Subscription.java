@@ -38,6 +38,10 @@ public class Subscription {
     // callbacks capture the epoch at issue time and bail if it has moved on,
     // so a stale token from an earlier attempt cannot land on a later one.
     private long subscribeEpoch = 0;
+    // Publish debounce window in milliseconds the server returned on subscribe, 0 when off.
+    private int publishDebounceMillis = 0;
+    // Created on the first debounced publish, so subscriptions without debounce allocate nothing.
+    private PublishDebounce publishDebounce;
 
     Subscription(final Client client, final String channel, final SubscriptionEventListener listener, final SubscriptionOptions options) {
         this.client = client;
@@ -179,6 +183,7 @@ public class Subscription {
     }
 
     void moveToSubscribing(int code, String reason) {
+        this.cancelPublishDebounce();
         if (this.getState() == SubscriptionState.SUBSCRIBING) {
             this.clearSubscribingState();
             return;
@@ -231,6 +236,7 @@ public class Subscription {
         }
         this.setEpoch(result.getEpoch());
         this.deltaNegotiated = result.getDelta();
+        this.publishDebounceMillis = result.getPublishDebounce();
         // Channel compaction: register the numeric channel ID assigned by the
         // server (0 when not negotiated — also clears a stale ID from a previous
         // subscribe session).
@@ -454,6 +460,7 @@ public class Subscription {
             this.clearSubscribingState();
         }
         this.setState(SubscriptionState.UNSUBSCRIBED);
+        this.cancelPublishDebounce();
         // Channel compaction ID is no longer valid once unsubscribed.
         this.setPushId(0);
         if (sendUnsubscribe) {
@@ -505,7 +512,11 @@ public class Subscription {
                 return;
             }
             this.futures.remove(uuid);
-            this.client.publish(this.getChannel(), data, cb);
+            if (this.publishDebounceMillis > 0) {
+                this.getPublishDebounce().publish(data, this.publishDebounceMillis, cb);
+            } else {
+                this.client.publish(this.getChannel(), data, cb);
+            }
         }).orTimeout(this.client.getOpts().getTimeout(), TimeUnit.MILLISECONDS).exceptionally(e -> {
             Subscription.this.futures.remove(uuid);
             cb.onDone(e, null);
@@ -513,6 +524,19 @@ public class Subscription {
         });
         if (this.getState() == SubscriptionState.SUBSCRIBED) {
             f.complete(null);
+        }
+    }
+
+    private PublishDebounce getPublishDebounce() {
+        if (this.publishDebounce == null) {
+            this.publishDebounce = new PublishDebounce(this.client, this.getChannel());
+        }
+        return this.publishDebounce;
+    }
+
+    private void cancelPublishDebounce() {
+        if (this.publishDebounce != null) {
+            this.publishDebounce.cancel();
         }
     }
 
@@ -629,6 +653,7 @@ public class Subscription {
         this.offset = 0;
         this.epoch = "_";
         this.prevData = null;
+        this.cancelPublishDebounce();
         this.setPushId(0);
     }
 }
