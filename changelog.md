@@ -15,7 +15,6 @@ Unreleased
 * A timer refresh token whose fetch is superseded by a `refresh()` call is not sent. A token fetched while disconnected, on the connection it was for, is the token of the next connect.
 * An rpc call with a null method or data throws `NullPointerException` at the call.
 * The instance is read when the client is created. A reply which arrives after the call deadline is acknowledged.
-* Deviation from earlier releases: a listener which throws from `onConnected` no longer closes the connection with bad protocol. The failure is reported to `onError` as an `UnclassifiedError`, and the connect handshake goes on: the calls queued for the connect are sent and the connection stays up.
 
 0.3.1
 =====

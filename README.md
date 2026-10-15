@@ -86,8 +86,6 @@ To use with Android don't forget to set INTERNET permission to `AndroidManifest.
 <uses-permission android:name="android.permission.INTERNET" />
 ```
 
-A listener whose `onConnected` throws does not stop the connect: the exception is passed to `onError` as an `UnclassifiedError`, and the connect handshake goes on, so the calls queued for the connect are sent and the subscriptions are restored. A listener whose `onError` throws as well has its exception printed, and the handshake goes on in the same way.
-
 ## Usage in background
 
 When a mobile application goes to the background there are OS-specific limitations for established persistent connections - which can be silently closed shortly. Thus in most cases you need to disconnect from a server when app moves to the background and connect again when app goes to the foreground.

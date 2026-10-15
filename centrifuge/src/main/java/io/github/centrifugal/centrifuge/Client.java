@@ -922,7 +922,7 @@ public class Client {
         event.setUser(result.getUser());
         event.setAuthClass(result.getAuthClass());
         this.setState(ClientState.CONNECTED);
-        Extensions.notifyConnected(this.listener, this, event);
+        this.listener.onConnected(this, event);
         this.auth.applyAuth(result.getUser(), result.getAuthClass(), true);
         this.pingInterval = result.getPing() * 1000;
         this.sendPong = result.getPong();
