@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -80,6 +81,8 @@ final class AuthRefresh {
     // replaced is kept here, and restored when that refresh is refused.
     private boolean connectTokenStored = false;
     private String tokenBeforeConnect;
+    // The token the last refresh made while disconnected stored. A token set since then by the caller is kept.
+    private String connectTokenSet;
     private final Deque<Waiting> waiting = new ArrayDeque<>();
     // The scheduled refresh. The generation is bumped on each cancel, so a timer which fired
     // after its cancel does nothing.
@@ -516,6 +519,7 @@ final class AuthRefresh {
             tokenBeforeConnect = host.connectionToken();
             connectTokenStored = true;
         }
+        connectTokenSet = token;
         host.storeToken(token);
     }
 
@@ -535,10 +539,13 @@ final class AuthRefresh {
     }
 
 
-    // Puts back the token the connection had before a refresh made while it was down.
+    // Puts back the token the connection had before a refresh made while it was down. A token which the caller
+    // set meanwhile, with setToken, is newer than that refresh and is kept.
     private void restoreConnectToken() {
         if (connectTokenStored) {
-            host.storeToken(tokenBeforeConnect);
+            if (Objects.equals(host.connectionToken(), connectTokenSet)) {
+                host.storeToken(tokenBeforeConnect);
+            }
             connectTokenStored = false;
         }
     }

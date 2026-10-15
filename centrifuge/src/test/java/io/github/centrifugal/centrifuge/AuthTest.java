@@ -749,6 +749,32 @@ public class AuthTest extends RpcTestBase {
 
 
     @Test
+    public void refusedRefreshKeepsATokenSetWhileItWasInFlight() throws Exception {
+        server.connectResult = connectResultFor("u1", "authenticated");
+        Options options = new Options();
+        options.setToken("token-1");
+        newAuthClient(options);
+        connect(client);
+        client.disconnect();
+        refuseRefreshes();
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh();
+        CompletableFuture<AuthResult> refused = refresh(client, "token-2");
+        client.setToken("token-3");
+
+        connect(client);
+        awaitCondition("refresh sent", () -> refreshTokens().size() == 1);
+        server.releaseDeferredCommands();
+
+        assertEquals(PERMISSION_DENIED, ((ReplyError) errorOf(refused)).getCode());
+        client.disconnect();
+        server.onCommand = null;
+        server.deferCommand = null;
+        connect(client);
+        assertEquals("the token set by the caller is kept over the refused one", "token-3", lastConnectRequest().getToken());
+    }
+
+
+    @Test
     public void tokenOfAnAcceptedConnectSurvivesADroppedRefresh() throws Exception {
         server.connectResult = connectResultFor("u1", "authenticated");
         Options options = new Options();
