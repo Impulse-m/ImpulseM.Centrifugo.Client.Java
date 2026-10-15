@@ -1,11 +1,19 @@
 package io.github.centrifugal.centrifuge;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -23,6 +31,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
+
+import okhttp3.WebSocket;
 
 import org.junit.Test;
 
@@ -261,6 +271,96 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         assertEquals(msgId, cancel.getCancel());
         long calls = sentRpcRequests().stream().filter((Protocol.RPCRequest request) -> request.getCancel() == 0).count();
         assertEquals("the written call is not sent again", 1, calls);
+    }
+
+
+    // A cancel whose send throws is kept for the next connection, and the cancels and the calls behind it still go out.
+    @Test
+    public void cancelWhoseSendThrowsIsKeptAndTheRestOfTheFlushGoesOut() throws Exception {
+        enableRpcOptions();
+        serveDedup();
+        AtomicBoolean failTheNextFlush = new AtomicBoolean();
+        Client c = newClient(instanceOptions(), new EventListener() {
+            @Override
+            public void onConnected(Client client, ConnectedEvent event) {
+                connectedSignals.release();
+                if (failTheNextFlush.getAndSet(false)) {
+                    failTheFirstSend(client);
+                }
+            }
+
+
+            @Override
+            public void onDisconnected(Client client, DisconnectedEvent event) {
+                disconnectedSignals.release();
+            }
+        });
+        connect(c);
+        holdCalls.set(true);
+        CompletableFuture<RPCResult> firstFuture = new CompletableFuture<>();
+        CompletableFuture<RPCResult> secondFuture = new CompletableFuture<>();
+        c.rpcCall("first", EMPTY_PAYLOAD, into(firstFuture));
+        c.rpcCall("second", EMPTY_PAYLOAD, into(secondFuture));
+        assertTrue("first call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
+        assertTrue("second call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
+        long firstMsgId = sentRpcRequests().get(0).getMsgId();
+        long secondMsgId = sentRpcRequests().get(1).getMsgId();
+        c.disconnect();
+        holdCalls.set(false);
+        CompletableFuture<RPCResult> queuedFuture = new CompletableFuture<>();
+        c.rpcCall("queued", EMPTY_PAYLOAD, into(queuedFuture));
+
+        // The transport fails on the first send after the connect reply: the flush of the cancels sends first.
+        failTheNextFlush.set(true);
+        c.connect();
+        assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+
+        RPCResult queued = queuedFuture.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertEquals("the call queued for the connect is answered", "{}", new String(queued.getData(), StandardCharsets.UTF_8));
+        awaitCondition("one cancel sent with the connect", () -> cancelsSent().size() == 1);
+        c.disconnect();
+        connect(c);
+        awaitCondition("the kept cancel sent with the next connect", () -> cancelsSent().size() == 2);
+        Set<Long> sentCancels = new HashSet<>(cancelsSent());
+        assertEquals("both cancels are sent", new HashSet<>(Arrays.asList(firstMsgId, secondMsgId)), sentCancels);
+    }
+
+
+    // The msg_ids of the cancels the client sent.
+    private List<Long> cancelsSent() {
+        List<Long> msgIds = new ArrayList<>();
+        for (Protocol.RPCRequest request : sentRpcRequests()) {
+            if (request.getCancel() != 0) {
+                msgIds.add(request.getCancel());
+            }
+        }
+        return msgIds;
+    }
+
+
+    // Replaces the transport of the client by one whose first send throws, as a transport can fail inside a send.
+    // That send puts the real transport back, since the replies are matched to the transport the client holds.
+    private static void failTheFirstSend(Client c) {
+        try {
+            Field field = Client.class.getDeclaredField("ws");
+            field.setAccessible(true);
+            WebSocket transport = (WebSocket) field.get(c);
+            AtomicInteger sends = new AtomicInteger();
+            InvocationHandler handler = (Object proxy, Method method, Object[] args) -> {
+                if (method.getName().equals("send") && sends.getAndIncrement() == 0) {
+                    field.set(c, transport);
+                    throw new IllegalStateException("transport failed inside the send");
+                }
+                try {
+                    return method.invoke(transport, args);
+                } catch (InvocationTargetException e) {
+                    throw e.getCause();
+                }
+            };
+            field.set(c, Proxy.newProxyInstance(WebSocket.class.getClassLoader(), new Class<?>[] {WebSocket.class}, handler));
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
 

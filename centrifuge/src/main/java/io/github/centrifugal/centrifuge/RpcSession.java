@@ -515,6 +515,11 @@ final class RpcSession {
         } catch (IOException e) {
             // A cancel which cannot be encoded is kept like one the transport refused.
             sent = false;
+        } catch (RuntimeException e) {
+            // The transport failed inside the send: the cancel is kept like a refused one, and the failure is reported,
+            // since no call waits for the cancel. The caller goes on with the other cancels and the queued calls.
+            host.reportError(e);
+            sent = false;
         }
         if (sent) {
             // The reply is handled on the executor, after this task, so the timer is set before it can come.
