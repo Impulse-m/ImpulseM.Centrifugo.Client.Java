@@ -8,6 +8,8 @@ import java.util.Set;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
@@ -63,6 +65,8 @@ final class TokenExchangeFlow {
         final Map<String, Protocol.SubscribeResult> heldSubs = new LinkedHashMap<>();
         final Set<String> heldUnsubs = new LinkedHashSet<>();
         ScheduledFuture<?> timer;
+        // Set when the access token was stored for the refresh command, and cleared if that command is lost.
+        boolean tokenSet;
 
 
         Bootstrap(WebSocket transport, Protocol.Reply reply) {
@@ -198,9 +202,11 @@ final class TokenExchangeFlow {
     void reset() {
         if (bootstrap != null) {
             cancelTimer(bootstrap);
+            if (bootstrap.tokenSet) {
+                host.storeToken("");
+            }
             bootstrap = null;
         }
-        bootstrapAttempt = 0;
         anonymousConnect = false;
     }
 
@@ -215,7 +221,7 @@ final class TokenExchangeFlow {
             failBootstrap(b, e);
             return true;
         }
-        if (refreshToken == null || refreshToken.isEmpty()) {
+        if (isEmptyToken(refreshToken)) {
             return false;
         }
         runExchange(b, refreshToken, false);
@@ -226,11 +232,31 @@ final class TokenExchangeFlow {
     // Runs one exchange of the bootstrap. The callback hops back to the client's executor. Reloaded marks the
     // retry after a re-read of a changed refresh token: it is not retried again.
     private void runExchange(final Bootstrap b, final String refreshToken, final boolean reloaded) {
+        final AtomicBoolean called = new AtomicBoolean();
         try {
-            exchange.exchange(new TokenExchangeEvent(host, b.transport, refreshToken), (Throwable err, TokenExchangeResult result) -> runOrInline(host, () -> onExchanged(b, refreshToken, reloaded, err, result)));
+            host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> onExchangeTimeout(b, called)), host.timeoutMillis(), TimeUnit.MILLISECONDS);
+            exchange.exchange(new TokenExchangeEvent(host, b.transport, refreshToken), (Throwable err, TokenExchangeResult result) -> {
+                if (called.compareAndSet(false, true)) {
+                    runOrInline(host, () -> onExchanged(b, refreshToken, reloaded, err, result));
+                }
+            });
         } catch (RuntimeException e) {
-            onExchanged(b, refreshToken, reloaded, e, null);
+            if (called.compareAndSet(false, true)) {
+                onExchanged(b, refreshToken, reloaded, e, null);
+            } else {
+                host.reportError(new TokenError(e));
+            }
         }
+    }
+
+
+    // The bootstrap exchange got no callback within the client timeout: the attempt fails and is retried. A callback
+    // which comes later finds the attempt taken and is ignored.
+    private void onExchangeTimeout(Bootstrap b, AtomicBoolean called) {
+        if (!isCurrent(b) || !called.compareAndSet(false, true)) {
+            return;
+        }
+        failBootstrap(b, new TimeoutException("token exchange timed out"));
     }
 
 
@@ -266,12 +292,12 @@ final class TokenExchangeFlow {
         }
         String again;
         try {
-            again = exchange.load();
+            again = reloadedToken(refreshToken);
         } catch (RuntimeException e) {
             failBootstrap(b, e);
             return;
         }
-        if (again == null || again.isEmpty() || again.equals(refreshToken)) {
+        if (again == null) {
             host.failUnauthorized();
             return;
         }
@@ -279,10 +305,27 @@ final class TokenExchangeFlow {
     }
 
 
+    // The refresh token read again after a refusal of the used one. Null when the read gives no token or the same one.
+    // A failed read throws.
+    private String reloadedToken(String used) {
+        String again = exchange.load();
+        if (isEmptyToken(again) || again.equals(used)) {
+            return null;
+        }
+        return again;
+    }
+
+
+    private static boolean isEmptyToken(String token) {
+        return token == null || token.isEmpty();
+    }
+
+
     // Sends the refresh command with the access token over the bootstrap's socket. The token is set just before the
     // command, and cleared again when the server refuses it.
     private void refreshBootstrap(final Bootstrap b, final String accessToken) {
         host.storeToken(accessToken);
+        b.tokenSet = true;
         Protocol.Command.Builder builder = Protocol.Command.newBuilder()
                 .setRefresh(Protocol.RefreshRequest.newBuilder().setToken(accessToken));
         writePlain(host, b.transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> runOrInline(host, () -> onRefreshed(b, reply, err)));
@@ -421,7 +464,7 @@ final class TokenExchangeFlow {
             cb.Done(e, null);
             return;
         }
-        if (refreshToken == null || refreshToken.isEmpty()) {
+        if (isEmptyToken(refreshToken)) {
             cb.Done(new UnauthorizedException(), null);
             return;
         }
@@ -430,10 +473,19 @@ final class TokenExchangeFlow {
 
 
     private void runRenewal(final WebSocket transport, final TokenCallback cb, final String refreshToken, final boolean reloaded) {
+        final AtomicBoolean called = new AtomicBoolean();
         try {
-            exchange.exchange(new TokenExchangeEvent(host, transport, refreshToken), (Throwable err, TokenExchangeResult result) -> runOrInline(host, () -> onRenewed(transport, cb, refreshToken, reloaded, err, result)));
+            exchange.exchange(new TokenExchangeEvent(host, transport, refreshToken), (Throwable err, TokenExchangeResult result) -> {
+                if (called.compareAndSet(false, true)) {
+                    runOrInline(host, () -> onRenewed(transport, cb, refreshToken, reloaded, err, result));
+                }
+            });
         } catch (RuntimeException e) {
-            onRenewed(transport, cb, refreshToken, reloaded, e, null);
+            if (called.compareAndSet(false, true)) {
+                onRenewed(transport, cb, refreshToken, reloaded, e, null);
+            } else {
+                host.reportError(new TokenError(e));
+            }
         }
     }
 
@@ -452,12 +504,12 @@ final class TokenExchangeFlow {
             }
             String again;
             try {
-                again = exchange.load();
+                again = reloadedToken(refreshToken);
             } catch (RuntimeException e) {
                 cb.Done(e, null);
                 return;
             }
-            if (again == null || again.isEmpty() || again.equals(refreshToken)) {
+            if (again == null) {
                 cb.Done(new UnauthorizedException(), null);
                 return;
             }
