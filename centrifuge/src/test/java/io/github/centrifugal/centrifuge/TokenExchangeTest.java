@@ -6,8 +6,10 @@ import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -723,11 +725,16 @@ public class TokenExchangeTest extends FakeServerTestBase {
     public void noFieldOfTheFlowRetainsTheRefreshToken() throws Exception {
         answerExchanges("access-1|refresh-2");
         answerIdentity(false, 0);
-        newClient(exchangeOptions(new Storage("refresh-1")));
+        Storage storage = new Storage("refresh-1");
+        newClient(exchangeOptions(storage));
         client.connect();
         awaitUntil("connected", () -> connected.size() == 1);
         Object flow = fieldOf(client.auth, "flow");
         assertNotNull(flow);
+        // Every refresh token the application handed out or took in: the flow may hold none of them.
+        Set<String> refreshTokens = new HashSet<>(storage.exchanged);
+        refreshTokens.addAll(storage.stored);
+        assertEquals(new HashSet<>(Arrays.asList("refresh-1", "refresh-2")), refreshTokens);
 
         for (Field field : flow.getClass().getDeclaredFields()) {
             if (Modifier.isStatic(field.getModifiers()) || field.getName().equals("exchange") || field.getName().equals("host")) {
@@ -735,7 +742,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
             }
             field.setAccessible(true);
             Object value = field.get(flow);
-            assertFalse("field " + field.getName() + " holds a refresh token", holdsRefreshToken(value, 2));
+            assertFalse("field " + field.getName() + " holds a refresh token", holdsRefreshToken(value, 2, refreshTokens));
         }
     }
 
@@ -953,13 +960,13 @@ public class TokenExchangeTest extends FakeServerTestBase {
     }
 
 
-    // Whether the value holds one of the refresh tokens of the tests, in its fields of this package, to the given depth.
-    private static boolean holdsRefreshToken(Object value, int depth) throws IllegalAccessException {
+    // Whether the value holds one of the given refresh tokens, in its fields of this package, to the given depth.
+    private static boolean holdsRefreshToken(Object value, int depth, Set<String> refreshTokens) throws IllegalAccessException {
         if (value == null) {
             return false;
         }
         if (value instanceof String) {
-            return value.equals("refresh-1") || value.equals("refresh-1b") || value.equals("refresh-2");
+            return refreshTokens.contains(value);
         }
         if (depth == 0 || !value.getClass().getName().startsWith("io.github.centrifugal.centrifuge.")) {
             return false;
@@ -969,7 +976,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
                 continue;
             }
             field.setAccessible(true);
-            if (holdsRefreshToken(field.get(value), depth - 1)) {
+            if (holdsRefreshToken(field.get(value), depth - 1, refreshTokens)) {
                 return true;
             }
         }
