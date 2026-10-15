@@ -7,7 +7,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -54,11 +56,15 @@ public class TokenExchangeTest extends FakeServerTestBase {
     private final List<Throwable> errors = new CopyOnWriteArrayList<>();
     private final List<DisconnectedEvent> disconnects = new CopyOnWriteArrayList<>();
     private final List<String> order = new CopyOnWriteArrayList<>();
+    // The replies of the fake server to the exchange and to the refresh command, set by answerExchanges and answerIdentity.
+    private final Map<String, byte[]> rpcReplies = new ConcurrentHashMap<>();
+    private volatile Protocol.RefreshResult refreshResult = Protocol.RefreshResult.getDefaultInstance();
 
 
     @Before
     public void answerExchangeCommands() {
-        server.exchangeReplies = true;
+        server.completeClose = true;
+        server.onUnhandled = this::answerExchangeCommand;
     }
 
 
@@ -648,7 +654,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
     public void rpcBeforeConnectWaitsForTheBootstrap() throws Exception {
         answerExchanges("access-1|refresh-2");
         answerIdentity(false, 0);
-        server.rpcReplies.put(ECHO, "pong".getBytes(StandardCharsets.UTF_8));
+        rpcReplies.put(ECHO, "pong".getBytes(StandardCharsets.UTF_8));
         newClient(exchangeOptions(new Storage("refresh-1")));
         client.connect();
         CompletableFuture<RPCResult> echo = new CompletableFuture<>();
@@ -792,13 +798,29 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
     // The rpc reply of the exchange method: the access token, then the rotated refresh token when there is one.
     private void answerExchanges(String reply) {
-        server.rpcReplies.put(METHOD, reply.getBytes(StandardCharsets.UTF_8));
+        rpcReplies.put(METHOD, reply.getBytes(StandardCharsets.UTF_8));
+    }
+
+
+    // The fake server's replies to the rpc and the refresh commands, unless a test answered them already.
+    private Protocol.Reply answerExchangeCommand(Protocol.Command cmd) {
+        if (cmd.hasRpc()) {
+            byte[] data = rpcReplies.getOrDefault(cmd.getRpc().getMethod(), new byte[0]);
+            return Protocol.Reply.newBuilder()
+                    .setId(cmd.getId())
+                    .setRpc(Protocol.RPCResult.newBuilder().setData(com.google.protobuf.ByteString.copyFrom(data)))
+                    .build();
+        }
+        if (cmd.hasRefresh()) {
+            return Protocol.Reply.newBuilder().setId(cmd.getId()).setRefresh(refreshResult).build();
+        }
+        return null;
     }
 
 
     // The identity of the refresh reply: user u1, with the expiry of the access token when expires is set.
     private void answerIdentity(boolean expires, int ttl) {
-        server.refreshResult = Protocol.RefreshResult.newBuilder()
+        refreshResult = Protocol.RefreshResult.newBuilder()
                 .setUser("u1")
                 .setAuthClass("authenticated")
                 .setExpires(expires)

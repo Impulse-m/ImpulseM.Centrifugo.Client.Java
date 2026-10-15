@@ -7,8 +7,6 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -92,16 +90,13 @@ public final class FakeCentrifugoServer {
     private final List<Protocol.Command> deferredCommands = Collections.synchronizedList(new ArrayList<>());
 
     /**
-     * Whether the server answers the rpc and refresh commands with the replies below, and completes a close the
-     * client starts. Off by default, which keeps the replies of the other tests as they are.
+     * Answers the commands no other hook answers, before the default replies. Null by default. Returns null
+     * to fall through to the default handling.
      */
-    public boolean exchangeReplies = false;
+    public Function<Protocol.Command, Protocol.Reply> onUnhandled;
 
-    /** Data of the rpc reply per method, by default empty. Used with exchangeReplies. */
-    public final Map<String, byte[]> rpcReplies = new ConcurrentHashMap<>();
-
-    /** The reply to every refresh command, by default an empty result. Used with exchangeReplies. */
-    public Protocol.RefreshResult refreshResult = Protocol.RefreshResult.getDefaultInstance();
+    /** Completes the close handshake which a client starts, as a server does. Off by default. */
+    public boolean completeClose = false;
 
     public void start() throws IOException {
         server.setDispatcher(new Dispatcher() {
@@ -183,8 +178,7 @@ public final class FakeCentrifugoServer {
 
         @Override
         public void onClosing(WebSocket webSocket, int code, String reason) {
-            // Completes the close handshake the way a server does, so a client which closes first is closed.
-            if (exchangeReplies) {
+            if (completeClose) {
                 webSocket.close(code, reason);
             }
         }
@@ -222,6 +216,14 @@ public final class FakeCentrifugoServer {
             return;
         }
 
+        if (onUnhandled != null) {
+            Protocol.Reply reply = onUnhandled.apply(cmd);
+            if (reply != null) {
+                send(webSocket, reply);
+                return;
+            }
+        }
+
         replyDefault(webSocket, cmd);
     }
 
@@ -254,14 +256,6 @@ public final class FakeCentrifugoServer {
                     .setId(cmd.getId())
                     .setUnsubscribe(Protocol.UnsubscribeResult.newBuilder().build())
                     .build());
-        } else if (exchangeReplies && cmd.hasRpc()) {
-            byte[] data = rpcReplies.getOrDefault(cmd.getRpc().getMethod(), new byte[0]);
-            send(webSocket, Protocol.Reply.newBuilder()
-                    .setId(cmd.getId())
-                    .setRpc(Protocol.RPCResult.newBuilder().setData(com.google.protobuf.ByteString.copyFrom(data)))
-                    .build());
-        } else if (exchangeReplies && cmd.hasRefresh()) {
-            send(webSocket, Protocol.Reply.newBuilder().setId(cmd.getId()).setRefresh(refreshResult).build());
         } else if (cmd.getId() != 0) {
             // Reply to anything else with an empty result to avoid client timeouts.
             send(webSocket, Protocol.Reply.newBuilder().setId(cmd.getId()).build());
