@@ -654,7 +654,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void msgIdsStrictlyIncreaseAndFitFiftyThreeBits() throws Exception {
+    public void msgIdsIncreaseWhileTheClockIsSteadyAndFitFiftyThreeBits() throws Exception {
         enableRpcOptions();
         answerRpcs("ok");
         Client c = newClient();
