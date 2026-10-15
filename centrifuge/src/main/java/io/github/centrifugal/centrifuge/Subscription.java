@@ -236,7 +236,7 @@ public class Subscription {
         }
         this.setEpoch(result.getEpoch());
         this.deltaNegotiated = result.getDelta();
-        this.publishDebounceMillis = Integer.toUnsignedLong(result.getPublishDebounce());
+        this.publishDebounceMillis = result.getPublishDebounce() & 0xFFFFFFFFL;
         // Channel compaction: register the numeric channel ID assigned by the
         // server (0 when not negotiated — also clears a stale ID from a previous
         // subscribe session).
