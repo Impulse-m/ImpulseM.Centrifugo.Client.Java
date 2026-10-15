@@ -226,6 +226,22 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void callQueuedBeforeConnectIsCancelledByDisconnectForGood() throws Exception {
+        enableRpcOptions();
+        Client c = newClient();
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("queued", EMPTY_PAYLOAD, into(future));
+        drainExecutor();
+
+        c.disconnect();
+
+        assertEquals("disconnect for good cancels the call, which was never written", ReplyError.CANCELLED, replyErrorOf(future).getCode());
+        connect(c);
+        assertTrue("the cancelled call is not sent with a later connect", sentRpcRequests().isEmpty());
+    }
+
+
+    @Test
     public void rpcAfterCloseThrowsAndItsCallbackNeverFires() throws Exception {
         Client c = newClient();
         c.close(1000);

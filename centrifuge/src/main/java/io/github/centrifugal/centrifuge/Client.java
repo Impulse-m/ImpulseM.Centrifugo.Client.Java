@@ -222,6 +222,8 @@ public class Client {
     public void disconnect() {
         this.executor.submit(() -> {
             Client.this.processDisconnect(DISCONNECTED_DISCONNECT_CALLED, "disconnect called", false);
+            // A client which is already disconnected returns early above: its calls still waiting for a connection end here.
+            Client.this.rpcSession.onTransportLost(false);
         });
     }
 
