@@ -174,7 +174,7 @@ public class Client {
         this.listener = listener;
         this.scheduler = scheduler;
         this.backoff = new Backoff();
-        if (opts.getTokenExchange() != null && opts.getTokenGetter() != null) { throw new IllegalArgumentException("tokenExchange and tokenGetter are exclusive"); }
+        TokenExchangeFlow.checkExclusive(opts);
         ClientHost host = new ClientHost(this);
         this.rpcSession = new RpcSession(host, opts.getMaxPendingRpc());
         this.auth = new AuthRefresh(host, authRetryMinMillis, authRetryMaxMillis);
@@ -918,7 +918,9 @@ public class Client {
         }
         Protocol.ConnectResult result = reply.getConnect();
         this.rpcOptionsSupported = Extensions.hasFlag(result.getFlag(), Extensions.RPC_OPTIONS_FLAG);
-        if (this.auth.interceptConnect(reply)) { return; }
+        if (this.auth.interceptConnect(reply)) {
+            return;
+        }
         ConnectedEvent event = new ConnectedEvent();
         event.setClient(result.getClient());
         event.setData(result.getData().toByteArray());
@@ -1223,7 +1225,9 @@ public class Client {
     }
 
     private void handlePush(Protocol.Push push) throws Exception {
-        if (this.auth.holdPush(push)) { return; }
+        if (this.auth.holdPush(push)) {
+            return;
+        }
         String channel = push.getChannel();
         // Channel compaction: pub/join/leave pushes may carry a numeric channel ID
         // instead of the channel name. Other push types always carry the channel.

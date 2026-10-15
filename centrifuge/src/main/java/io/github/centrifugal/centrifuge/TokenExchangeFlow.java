@@ -83,6 +83,14 @@ final class TokenExchangeFlow {
     private int bootstrapAttempt = 0;
 
 
+    /** Rejects a client which sets both a token exchange and a token getter. Called by the client constructor. */
+    static void checkExclusive(Options opts) {
+        if (opts.getTokenExchange() != null && opts.getTokenGetter() != null) {
+            throw new IllegalArgumentException("tokenExchange and tokenGetter are exclusive");
+        }
+    }
+
+
     TokenExchangeFlow(ClientHost host, TokenExchange exchange) {
         this.host = host;
         this.exchange = exchange;
