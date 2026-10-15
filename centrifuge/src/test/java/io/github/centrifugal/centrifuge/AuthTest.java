@@ -503,6 +503,37 @@ public class AuthTest extends RpcTestBase {
 
 
     @Test
+    public void refreshQueuedBehindAFetchThatEndsWhileDisconnectedIsSentWithTheNextConnect() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        ManualScheduler clock = new ManualScheduler();
+        List<TokenCallback> fetches = new CopyOnWriteArrayList<>();
+        Options options = recordingTokenOptions(fetches);
+        options.setMinReconnectDelay(1);
+        options.setMaxReconnectDelay(1);
+        newAuthClientOnClock(options, clock);
+        connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+        clock.advance(1000);
+        awaitCondition("timer fetch started", () -> fetches.size() == 1);
+        int scheduled = clock.requestedDelays().size();
+        server.closeConnection();
+        awaitCondition("the reconnect is scheduled", () -> clock.requestedDelays().size() > scheduled);
+        answerRefreshes("u2", "authenticated");
+
+        CompletableFuture<AuthResult> refreshFuture = refresh(client, "token-2");
+        awaitCondition("the refresh is taken while disconnected", () -> "token-2".equals(client.token));
+        fetches.get(0).Done(null, "token-timer");
+        awaitExecutorTurn("token-2");
+        assertTrue("the refresh waits for the next connect", refreshTokens().isEmpty());
+
+        clock.advance(2);
+        awaitCondition("reconnected", () -> client.getState() == ClientState.CONNECTED);
+        assertEquals("u2", refreshFuture.get(5, TimeUnit.SECONDS).getUser());
+        assertEquals(Arrays.asList("token-2"), refreshTokens());
+    }
+
+
+    @Test
     public void refreshWithTheSameTokenSharesOneCommand() throws Exception {
         server.connectResult = connectResultFor("u1", "authenticated");
         newAuthClient(new Options());
@@ -1186,6 +1217,15 @@ public class AuthTest extends RpcTestBase {
     private void refuseRefreshes() {
         answerRefreshWith(Protocol.Reply.newBuilder()
                 .setError(Protocol.Error.newBuilder().setCode(PERMISSION_DENIED).setMessage("denied")));
+    }
+
+
+    // Returns once the client executor has run the tasks submitted before this call. The executor runs its
+    // tasks in order, and setToken is one of them: a probe value is set and seen, then the token is set back.
+    private void awaitExecutorTurn(String tokenToRestore) throws InterruptedException {
+        client.setToken("probe");
+        awaitCondition("the executor ran the tasks before the probe", () -> "probe".equals(client.token));
+        client.setToken(tokenToRestore);
     }
 
 

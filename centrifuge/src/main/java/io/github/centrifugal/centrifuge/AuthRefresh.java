@@ -544,15 +544,16 @@ final class AuthRefresh {
     }
 
 
-    // The refresh in flight is over. While the connection is down the waiting refreshes fail with it, since
-    // nothing is sent while disconnected and the timer does not run. Otherwise the next waiting refresh
-    // starts. A queued timer refresh behind a refused refresh is not fetched at once: the retry is armed
-    // instead, as for a superseded timer. A timer fetch does not hold the rpc calls, so they are written
-    // before it starts; without a refresh to start, the rpc calls held for the refresh are written too.
+    // The refresh in flight is over. The next waiting refresh starts: while the connection is down its command
+    // waits in the connect commands, and it is sent with the next connect. Queued timer refreshes are dropped
+    // while the connection is down, since no token is fetched then. A queued timer refresh behind a refused
+    // refresh is not fetched at once: the retry is armed instead, as for a superseded timer. A timer fetch
+    // does not hold the rpc calls, so they are written before it starts; without a refresh to start, the rpc
+    // calls held for the refresh are written too. The waiting refreshes fail only at close, see failWaiting.
     private void complete(boolean refused) {
         inFlight = false;
         commandInFlight = false;
-        if (host.state() != ClientState.CONNECTED) {
+        if (host.state() == ClientState.CLOSED) {
             try {
                 failWaiting();
             } finally {
@@ -562,14 +563,14 @@ final class AuthRefresh {
         }
         while (!waiting.isEmpty()) {
             Waiting next = waiting.poll();
-            // A queued timer refresh is stale once a later schedule or cancel replaced its timer.
-            if (next.token == null && next.generation != timerGeneration) {
-                continue;
-            }
             if (next.token != null) {
                 inFlight = true;
                 startRequested(next.token, next.callbacks);
                 return;
+            }
+            // A queued timer refresh is stale once a later schedule or cancel replaced its timer.
+            if (host.state() != ClientState.CONNECTED || next.generation != timerGeneration) {
+                continue;
             }
             if (refused) {
                 timerSuperseded = true;
