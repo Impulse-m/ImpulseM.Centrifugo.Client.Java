@@ -96,7 +96,7 @@ When a mobile application goes to the background there are OS-specific limitatio
 
 **Channel compaction.** The client always offers channel compaction on subscribe. When the server allows it, the subscribe result carries a numeric channel id, and publication, join and leave pushes carry that id instead of the channel name. It is negotiated automatically and needs no option.
 
-**Delta without positioning.** `SubscriptionOptions.setDelta` asks for delta compression. A subscription without positioning or recovery gets delta too, when the server keeps the latest publication of each channel: the first publication after subscribe is full, and each later one is a patch against the previous publication the client received.
+**Delta without positioning.** `SubscriptionOptions.setDelta` asks for delta compression. A subscription without positioning or recovery gets delta too, when the server keeps the latest publication of each channel: the first publication after subscribe is full, and each later one is a patch against the previous publication the client received. The publisher must send with delta for this (`delta_publish` on the namespace, or the delta flag of the publish request); otherwise publications stay full.
 
 ## RPC options
 
