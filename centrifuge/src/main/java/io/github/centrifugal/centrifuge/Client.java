@@ -90,7 +90,7 @@ public class Client {
         return scheduler;
     }
 
-    static final int NORMAL_CLOSURE_STATUS = 1000;
+    private static final int NORMAL_CLOSURE_STATUS = 1000;
     private static final int MESSAGE_SIZE_LIMIT_EXCEEDED_STATUS = 1009;
 
     static final int DISCONNECTED_DISCONNECT_CALLED = 0;

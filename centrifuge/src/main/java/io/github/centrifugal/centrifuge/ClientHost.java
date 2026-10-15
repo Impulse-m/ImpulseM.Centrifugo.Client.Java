@@ -104,9 +104,12 @@ final class ClientHost {
     }
 
 
-    /** Closes the transport normally, as the client closes a connect which got no reply. */
+    /**
+     * Cancels the transport, whose peer may be unresponsive: a graceful close waits for the peer's close frame, which a
+     * dead peer never sends, and the reconnect would wait for it too. The client reconnects when the transport fails.
+     */
     void closeTransport() {
-        transport().close(Client.NORMAL_CLOSURE_STATUS, "");
+        transport().cancel();
     }
 
 
