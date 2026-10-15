@@ -1,0 +1,112 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "com.github.Impulse-m",
+    "module": "ImpulseM.Centrifugo.Client.Java",
+    "version": "1.2.0",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "8.10.2"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 8,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api"
+      },
+      "dependencies": [
+        {
+          "group": "com.squareup.okhttp3",
+          "module": "okhttp",
+          "version": {
+            "requires": "4.12.0"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "ImpulseM.Centrifugo.Client.Java-1.2.0.jar",
+          "url": "ImpulseM.Centrifugo.Client.Java-1.2.0.jar",
+          "size": 414284,
+          "sha512": "a9a0ea3ab32c4f690a9dec16973da1782e37cb4451850d8eaa393d96a45c08b05e41bd543194e1f8b3663caed10babed6375af187b384b4d86a187a253cadf4e",
+          "sha256": "07d55f5a447096b46a41c2b6b1550f26bfcb29f4a507b0fc376596a8cef2698a",
+          "sha1": "e29bce122b77643bf667da1630d50e44d436b944",
+          "md5": "6bb0f23f44716293ed9fc3b0419e44ed"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 8,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "com.google.protobuf",
+          "module": "protobuf-javalite",
+          "version": {
+            "requires": "3.25.5"
+          }
+        },
+        {
+          "group": "net.sourceforge.streamsupport",
+          "module": "streamsupport-minifuture",
+          "version": {
+            "requires": "1.7.4"
+          }
+        },
+        {
+          "group": "com.squareup.okhttp3",
+          "module": "okhttp",
+          "version": {
+            "requires": "4.12.0"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "ImpulseM.Centrifugo.Client.Java-1.2.0.jar",
+          "url": "ImpulseM.Centrifugo.Client.Java-1.2.0.jar",
+          "size": 414284,
+          "sha512": "a9a0ea3ab32c4f690a9dec16973da1782e37cb4451850d8eaa393d96a45c08b05e41bd543194e1f8b3663caed10babed6375af187b384b4d86a187a253cadf4e",
+          "sha256": "07d55f5a447096b46a41c2b6b1550f26bfcb29f4a507b0fc376596a8cef2698a",
+          "sha1": "e29bce122b77643bf667da1630d50e44d436b944",
+          "md5": "6bb0f23f44716293ed9fc3b0419e44ed"
+        }
+      ]
+    },
+    {
+      "name": "sourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "ImpulseM.Centrifugo.Client.Java-1.2.0-sources.jar",
+          "url": "ImpulseM.Centrifugo.Client.Java-1.2.0-sources.jar",
+          "size": 167863,
+          "sha512": "bbadc7ea5cf54888f74013c63230f858302711614c83d96c4666c4f36219dc22f44360f52da68c06d32af331c274c9ff1d8dfb8bc6b8b30e7428890905c14d04",
+          "sha256": "de37eb37b0e13e69276c21930a34137414a99432865f1826e33da8852641de0d",
+          "sha1": "03e05aa0f49b88391b996a7d6b0f8f1cb7f9c69e",
+          "md5": "9d7258537a2576f965efed9d3ea9853a"
+        }
+      ]
+    }
+  ]
+}
