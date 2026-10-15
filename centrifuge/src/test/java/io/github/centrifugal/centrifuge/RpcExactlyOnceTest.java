@@ -333,8 +333,10 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         Set<Long> sentCancels = new HashSet<>(cancelsSent());
         assertEquals("both cancels are sent", new HashSet<>(Arrays.asList(firstMsgId, secondMsgId)), sentCancels);
         Throwable failure = reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
-        assertTrue("the failed send is reported", failure instanceof IllegalStateException);
-        assertEquals("the failed send is the transport's", "transport failed inside the send", failure.getMessage());
+        assertTrue("the failed send is reported", failure instanceof UnclassifiedError);
+        Throwable cause = ((UnclassifiedError) failure).getError();
+        assertTrue("the cause is the transport's failure", cause instanceof IllegalStateException);
+        assertEquals("the failed send is the transport's", "transport failed inside the send", cause.getMessage());
     }
 
 

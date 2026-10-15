@@ -531,20 +531,9 @@ final class RpcSession {
         pendingAcks.addAll(0, acks);
         if (failure != null) {
             // Reported after the rollback, since the listener may throw: the caller goes on with the other cancels and the queued calls.
-            reportCancelFailure(failure);
+            host.reportUnclassified(failure);
         }
         return false;
-    }
-
-
-    // Reports the failure of a cancel's send to the listener. The listener's own failure cannot end the flush
-    // of the connect, so it is printed here, as the executor would otherwise drop it.
-    private void reportCancelFailure(RuntimeException cause) {
-        try {
-            host.reportError(cause);
-        } catch (RuntimeException listenerFailure) {
-            listenerFailure.printStackTrace();
-        }
     }
 
 

@@ -47,4 +47,32 @@ public class ConnectListenerTest extends RpcTestBase {
         assertTrue("the failure of the listener is reported", failure instanceof UnclassifiedError);
         assertTrue("the listener's exception is its cause", ((UnclassifiedError) failure).getError() instanceof IllegalStateException);
     }
+
+
+    // A listener whose error report throws as well does not skip the handshake either: the calls queued for the connect are written.
+    @Test
+    public void aListenerWhichThrowsOnConnectAndOnErrorDoesNotSkipTheHandshake() throws Exception {
+        enableRpcOptions();
+        answerRpcs("ok", System::currentTimeMillis);
+        EventListener listener = new EventListener() {
+            @Override
+            public void onConnected(Client client, ConnectedEvent event) {
+                throw new IllegalStateException("listener failed");
+            }
+
+
+            @Override
+            public void onError(Client client, ErrorEvent event) {
+                throw new IllegalStateException("listener failed on the report");
+            }
+        };
+        Client c = newClient(instanceOptions(), listener);
+        CompletableFuture<RPCResult> queued = new CompletableFuture<>();
+        c.rpcCall("m", EMPTY_PAYLOAD, into(queued));
+
+        c.connect();
+
+        RPCResult result = queued.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertEquals("ok", new String(result.getData(), StandardCharsets.UTF_8));
+    }
 }

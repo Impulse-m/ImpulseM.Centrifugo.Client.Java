@@ -135,7 +135,21 @@ final class Extensions {
             listener.onConnected(client, event);
         } catch (Throwable e) {
             // Throwable as the other callbacks of the protocol handling, so an Error is reported as well.
-            listener.onError(client, new ErrorEvent(new UnclassifiedError(e)));
+            reportUnclassified(listener, client, e);
+        }
+    }
+
+
+    /**
+     * Reports a failure of the protocol handling to the listener as an error event, wrapped in an
+     * {@link UnclassifiedError}. A listener which throws on the report cannot end the handling which
+     * reports, so its failure is printed here.
+     */
+    static void reportUnclassified(EventListener listener, Client client, Throwable cause) {
+        try {
+            listener.onError(client, new ErrorEvent(new UnclassifiedError(cause)));
+        } catch (Throwable failure) {
+            failure.printStackTrace();
         }
     }
 

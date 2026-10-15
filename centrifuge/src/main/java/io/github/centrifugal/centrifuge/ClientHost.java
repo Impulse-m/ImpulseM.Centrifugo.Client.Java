@@ -123,6 +123,11 @@ final class ClientHost {
     }
 
 
+    void reportUnclassified(Throwable cause) {
+        Extensions.reportUnclassified(client.listener, client, cause);
+    }
+
+
     void reportAuth(AuthEvent event) {
         client.listener.onAuth(client, event);
     }
