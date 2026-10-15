@@ -308,11 +308,7 @@ final class RpcSession {
     // the session state went with the executor, so only the callback of the call runs, on the
     // calling thread, exactly once.
     private void finishOnExecutor(RpcCall call, Protocol.Reply reply, Throwable error) {
-        try {
-            client.getExecutor().submit(() -> finish(call, reply, error));
-        } catch (RejectedExecutionException e) {
-            deliver(call, reply, error);
-        }
+        Extensions.submitOrRun(client.getExecutor(), () -> finish(call, reply, error), () -> deliverReporting(call, reply, error));
     }
 
 
@@ -477,11 +473,17 @@ final class RpcSession {
 
 
     // Acks a call whose reply was received, success or error, with the next rpc request. Only a tracked call has a
-    // msg_id the server keeps a record of.
-    private void acknowledge(RpcCall call) {
-        if (call.wireTracked) {
+    // msg_id the server keeps a record of, and a msg_id the server refused as outside its window is not one of them.
+    private void acknowledge(RpcCall call, Protocol.Reply reply) {
+        if (call.wireTracked && !refusesMsgId(reply)) {
             pendingAcks.add(call.msgId);
         }
+    }
+
+
+    // Whether the reply refuses the msg_id of its call as outside the server window: the server did not record it.
+    private static boolean refusesMsgId(Protocol.Reply reply) {
+        return Extensions.RPC_RETRY_NEW_MSG_ID.equals(Extensions.retrySignal(reply.getError()));
     }
 
 
@@ -573,9 +575,9 @@ final class RpcSession {
                 sendCancel(call.msgId);
             }
         } else {
-            acknowledge(call);
+            acknowledge(call, reply);
         }
-        deliver(call, reply, error);
+        deliverReporting(call, reply, error);
     }
 
 
@@ -629,11 +631,7 @@ final class RpcSession {
     // Runs when the transport settles the attempt of the call. The decision is taken on the executor,
     // and a closed executor completes the call directly.
     private void settleAttempt(RpcCall call, Protocol.Reply reply, Throwable error) {
-        try {
-            client.getExecutor().submit(() -> finishAttempt(call, reply, error));
-        } catch (RejectedExecutionException e) {
-            completeCall(call, reply, error);
-        }
+        Extensions.submitOrRun(client.getExecutor(), () -> finishAttempt(call, reply, error), () -> completeCall(call, reply, error));
     }
 
 
@@ -647,7 +645,7 @@ final class RpcSession {
         }
         if (call.future.isDone()) {
             if (reply != null) {
-                acknowledge(call);
+                acknowledge(call, reply);
             }
             stopLate(call);
             forgetAttempt(call);
@@ -662,7 +660,7 @@ final class RpcSession {
         call.answered = reply != null;
         // A reply which the deadline settled before it came to the executor is acked as a late one.
         if (!completeCall(call, reply, error) && reply != null) {
-            acknowledge(call);
+            acknowledge(call, reply);
         }
     }
 
@@ -673,6 +671,17 @@ final class RpcSession {
             return call.future.complete(reply);
         }
         return call.future.completeExceptionally(error);
+    }
+
+
+    // Hands the outcome to the callback. A callback which throws is reported to the listener: the executor would
+    // drop the failure of the task, and nothing else would tell the caller of the call.
+    private void deliverReporting(RpcCall call, Protocol.Reply reply, Throwable error) {
+        try {
+            deliver(call, reply, error);
+        } catch (RuntimeException failure) {
+            client.reportError(failure);
+        }
     }
 
 

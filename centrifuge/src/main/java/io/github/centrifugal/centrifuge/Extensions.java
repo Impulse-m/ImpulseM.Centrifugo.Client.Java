@@ -68,10 +68,20 @@ final class Extensions {
      * closed then, and the state the task would change went with it.
      */
     static void submitOrIgnore(ExecutorService executor, Runnable task) {
+        submitOrRun(executor, task, () -> {
+        });
+    }
+
+
+    /**
+     * Submits the task to the executor. Once the executor is shut down, which is after the client closed,
+     * the task cannot run there, so {@code onRejected} runs on the calling thread instead.
+     */
+    static void submitOrRun(ExecutorService executor, Runnable task, Runnable onRejected) {
         try {
             executor.submit(task);
-        } catch (RejectedExecutionException ignored) {
-            // The client is closed.
+        } catch (RejectedExecutionException e) {
+            onRejected.run();
         }
     }
 

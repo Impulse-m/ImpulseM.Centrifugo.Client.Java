@@ -6,7 +6,6 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.Iterator;
 import java.util.List;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -397,15 +396,14 @@ final class AuthRefresh {
     // run exactly once. The task then only settles the callbacks: the client is closed. A failure of an inline
     // task goes to the listener.
     private void runOnExecutorOrInline(Runnable task) {
-        try {
-            client.getExecutor().submit(task);
-        } catch (RejectedExecutionException e) {
+        Runnable reported = () -> {
             try {
                 task.run();
             } catch (RuntimeException failure) {
                 client.reportError(failure);
             }
-        }
+        };
+        Extensions.submitOrRun(client.getExecutor(), reported, reported);
     }
 
 
