@@ -247,7 +247,6 @@ package io.github.centrifugal.centrifuge {
     method public byte[]! getData();
     method public io.github.centrifugal.centrifuge.ReplyError! getError();
     method public boolean isCached();
-    method public void setCached(boolean);
     method public void setData(byte[]!);
     method public void setError(io.github.centrifugal.centrifuge.ReplyError!);
   }

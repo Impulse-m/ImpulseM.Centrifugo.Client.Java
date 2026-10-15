@@ -26,7 +26,7 @@ public class RPCResult {
         return cached;
     }
 
-    public void setCached(boolean cached) {
+    void setCached(boolean cached) {
         this.cached = cached;
     }
 
