@@ -51,7 +51,7 @@ final class ClientHost {
     }
 
 
-    /** The flow is built when the client is created, so the getter follows it rather than the option, which may change later. */
+    /** Follows the flow the client was created with, not the option, which may change later. */
     ConnectionTokenGetter tokenGetter() {
         if (client.auth.hasFlow()) {
             return client.auth.exchangeTokenGetter();
