@@ -22,7 +22,8 @@ import okhttp3.WebSocket;
  * {@link Client#refresh}, and the timer which refreshes before the token expires. One refresh is
  * in flight at a time, the others wait their turn. The rpc calls wait for the refresh command in
  * flight, see {@link RpcSession}. Used on the client's executor thread only, except the inline run of
- * {@link #runOnExecutorOrInline} after the client closed, which only settles the callbacks.
+ * {@link #runOnExecutorOrInline} after the client closed: that run completes the refresh in flight
+ * too, so it fails the waiting refreshes and flushes the rpc calls on the completing thread.
  * <p>
  * The fetch and retry loop of the timer mirrors {@code Subscription.sendRefresh}. It is kept here,
  * so that the subscription code stays as it is.
@@ -440,7 +441,12 @@ final class AuthRefresh {
             return null;
         });
 
-        host.enqueueCommand(cmd, f);
+        try {
+            host.enqueueCommand(cmd, f);
+        } catch (RuntimeException e) {
+            // The command could not be sent: the stage above delivers the failure once, as it does a failed reply.
+            f.completeExceptionally(e);
+        }
     }
 
 
@@ -502,7 +508,12 @@ final class AuthRefresh {
     // A timer token fetched while the connection is down, on the connection of the fetch, is the token of the
     // next connect, unless a refresh() call or an accepted token superseded it since the fetch started.
     private void keepTimerTokenForConnect(Throwable err, String token, long generation) {
-        if (err != null || generation != refreshGeneration) {
+        if (generation != refreshGeneration) {
+            return;
+        }
+        if (err != null) {
+            // The fetch failed while the connection is down: the error is reported, as a fetch on a connected client is.
+            host.reportError(new TokenError(err));
             return;
         }
         if (token == null || token.isEmpty()) {
