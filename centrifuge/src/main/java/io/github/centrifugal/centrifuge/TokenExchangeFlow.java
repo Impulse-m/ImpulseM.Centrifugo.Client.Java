@@ -216,11 +216,12 @@ final class TokenExchangeFlow {
 
 
     private void onExchanged(Bootstrap b, String refreshToken, boolean reloaded, Throwable err, TokenExchangeResult result) {
-        // A rotated token is kept even when the connection is gone: the issuer already consumed the old one.
-        storeRotation(result, refreshToken);
+        // A result which arrives after its connection went away is dropped, rotation included: it is handled as a
+        // reply lost with the connection, and the backend's grace covers the pair.
         if (!isCurrent(b)) {
             return;
         }
+        storeRotation(result, refreshToken);
         if (err instanceof UnauthorizedException) {
             reloadAfterRefusal(b, refreshToken, reloaded);
             return;
@@ -419,6 +420,11 @@ final class TokenExchangeFlow {
 
 
     private void onRenewed(WebSocket transport, TokenCallback cb, String refreshToken, boolean reloaded, Throwable err, TokenExchangeResult result) {
+        // The renewal result of a connection which went away is dropped, as the bootstrap drops it.
+        if (transport != host.transport() || host.state() != ClientState.CONNECTED) {
+            cb.Done(new IOException("connection lost"), null);
+            return;
+        }
         storeRotation(result, refreshToken);
         if (err instanceof UnauthorizedException) {
             if (reloaded) {
