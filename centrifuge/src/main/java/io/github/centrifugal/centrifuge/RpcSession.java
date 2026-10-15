@@ -156,11 +156,11 @@ final class RpcSession {
             return;
         }
         queue.remove(call);
-        // A call whose current msg_id was never written (a new msg_id still queued) has nothing to cancel on the server.
-        if (call.wireTracked) {
+        // The call is completed first: when the deadline settled it meanwhile, the deadline sends the cancel, and nothing
+        // is sent here. A call whose current msg_id was never written (a new msg_id still queued) has nothing to cancel.
+        if (call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false)) && call.wireTracked) {
             sendCancel(call.msgId);
         }
-        call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
     }
 
 
