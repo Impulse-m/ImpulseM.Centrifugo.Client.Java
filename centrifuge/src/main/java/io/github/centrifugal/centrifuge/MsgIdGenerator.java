@@ -73,15 +73,20 @@ final class MsgIdGenerator {
 
 
     /**
-     * Re-syncs the generator after the server refused a msg_id as outside its window: the time part
-     * becomes the server second of {@code serverTimeMillis}, even when it is lower than the last one,
-     * and the sequence starts at a new lane. The next msg_id is the first of that lane.
+     * Re-syncs the generator after the server refused a msg_id as outside its window, to the server
+     * second of the refusal, {@code replyTimeMillis}. A second which differs from the last one becomes
+     * the time part, even when it is lower, and the sequence starts at a new lane. The same second keeps
+     * the sequence, so no msg_id of that second is issued twice.
      * <p>
-     * The msg_ids the server accepted before the re-sync may still be recorded in the seconds the time
-     * part covers again. The fresh lane makes a collision with them improbable, not impossible.
+     * The msg_ids the server accepted before a re-sync to another second may still be recorded in the
+     * seconds the time part covers again. The fresh lane makes a collision with them improbable, not impossible.
      */
-    void resync(long serverTimeMillis) {
-        lastSeconds = serverTimeMillis / 1000L;
+    void resync(long replyTimeMillis) {
+        long seconds = replyTimeMillis / 1000L;
+        if (seconds == lastSeconds) {
+            return;
+        }
+        lastSeconds = seconds;
         lane = drawLane();
         lastSeq = lane - 1;
     }

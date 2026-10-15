@@ -489,15 +489,15 @@ final class RpcSession {
 
     // Starts the resend of a call whose error reply carries the retry signal, while the attempts of
     // its kind and its deadline last. Returns false when the error is delivered as it is.
-    private boolean resend(RpcCall call, Protocol.Error error) {
-        String signal = Extensions.retrySignal(error);
+    private boolean resend(RpcCall call, Protocol.Reply reply) {
+        String signal = Extensions.retrySignal(reply.getError());
         long remainingNanos = call.remainingNanos();
         if (signal == null || remainingNanos <= 0L) {
             return false;
         }
         if (Extensions.RPC_RETRY_NEW_MSG_ID.equals(signal) && call.newIdResends < NEW_ID_RESENDS) {
             call.newIdResends++;
-            resendWithNewId(call);
+            resendWithNewId(call, reply.getTime());
             return true;
         }
         if (Extensions.RPC_RETRY_LATER.equals(signal) && call.laterResends < LATER_RESENDS) {
@@ -513,9 +513,10 @@ final class RpcSession {
 
 
     // Sends the refused call again with a new msg_id. The generator is re-synced to the server time
-    // of the refusal first. The refused msg_id was never recorded by the server, so it is not acked.
-    private void resendWithNewId(RpcCall call) {
-        msgIds.resync(client.serverTimeMillis());
+    // of the refusal first, the reply's own time, which the clock offset already covers. The refused
+    // msg_id was never recorded by the server, so it is not acked.
+    private void resendWithNewId(RpcCall call, long replyTimeMillis) {
+        msgIds.resync(replyTimeMillis > 0L ? replyTimeMillis : client.serverTimeMillis());
         try {
             call.msgId = msgIds.next(client.serverTimeMillis());
         } catch (IllegalStateException e) {
@@ -654,7 +655,7 @@ final class RpcSession {
         client.removeFuture(call.commandId);
         onWire.remove(call.commandId);
         call.attempt = null;
-        if (reply != null && reply.getError().getCode() != 0 && call.wireTracked && resend(call, reply.getError())) {
+        if (reply != null && reply.getError().getCode() != 0 && call.wireTracked && resend(call, reply)) {
             return;
         }
         call.answered = reply != null;

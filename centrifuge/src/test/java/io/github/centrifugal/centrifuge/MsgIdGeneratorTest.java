@@ -90,6 +90,20 @@ public class MsgIdGeneratorTest {
 
 
     @Test
+    public void resyncToTheSameSecondContinuesTheSequence() {
+        MsgIdGenerator generator = new MsgIdGenerator(lanes(7, 100));
+        long first = generator.next(SERVER_MILLIS + 100L);
+        long second = generator.next(SERVER_MILLIS + 200L);
+
+        generator.resync(SERVER_MILLIS + 300L);
+        long afterResync = generator.next(SERVER_MILLIS + 300L);
+
+        assertEquals(first + 1, second);
+        assertEquals(second + 1, afterResync);
+    }
+
+
+    @Test
     public void twoScriptedGeneratorsInTheSameSecondGiveDifferentFirstIds() {
         MsgIdGenerator first = new MsgIdGenerator(lanes(7));
         MsgIdGenerator second = new MsgIdGenerator(lanes(9));
