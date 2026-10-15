@@ -271,9 +271,19 @@ final class RpcSession {
         }
         if (!keep) {
             for (RpcCall call : queue.drain()) {
-                call.future.completeExceptionally(new IOException());
+                call.future.completeExceptionally(closedError(call));
             }
         }
+    }
+
+
+    // The error of a call which the client gives up for good. A tracked call whose msg_id was never written
+    // is cancelled: nothing reached the server. Any other call was written, so its connection is gone.
+    private Throwable closedError(RpcCall call) {
+        if (client.hasInstance() && (!call.everSent || call.resendAsNew)) {
+            return new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false);
+        }
+        return new IOException();
     }
 
 
@@ -320,7 +330,7 @@ final class RpcSession {
         }
         // A call submitted before close but started after it: nothing will ever write it, so it fails now.
         if (client.getState() == ClientState.CLOSED) {
-            call.future.completeExceptionally(new IOException());
+            call.future.completeExceptionally(closedError(call));
             return;
         }
         writeOrQueue(call);

@@ -220,7 +220,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
         c.close(1000);
 
-        assertTrue("close fails the queued call", errorOf(future) instanceof IOException);
+        assertEquals("close cancels the queued call, which was never written", ReplyError.CANCELLED, replyErrorOf(future).getCode());
         assertTrue(sentRpcRequests().isEmpty());
     }
 
@@ -261,7 +261,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
         release.countDown();
 
-        assertTrue("the call fails with the close, not with its deadline", errorOf(future) instanceof IOException);
+        assertEquals("the call is cancelled by the close, not failed by its deadline", ReplyError.CANCELLED, replyErrorOf(future).getCode());
     }
 
 
@@ -272,7 +272,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         RpcCall call = c.rpcCall("queued", EMPTY_PAYLOAD, into(future));
         drainExecutor();
         c.close(1000);
-        assertTrue("close fails the queued call", errorOf(future) instanceof IOException);
+        assertEquals("close cancels the queued call", ReplyError.CANCELLED, replyErrorOf(future).getCode());
 
         call.cancel();
     }
