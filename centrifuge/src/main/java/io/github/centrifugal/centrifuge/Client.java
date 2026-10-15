@@ -922,7 +922,12 @@ public class Client {
         event.setUser(result.getUser());
         event.setAuthClass(result.getAuthClass());
         this.setState(ClientState.CONNECTED);
-        this.listener.onConnected(this, event);
+        try {
+            this.listener.onConnected(this, event);
+        } catch (RuntimeException e) {
+            // The handshake goes on, so the calls and the expiry of the connection are not lost to a listener which throws.
+            this.listener.onError(this, new ErrorEvent(e));
+        }
         this.auth.applyAuth(result.getUser(), result.getAuthClass(), true);
         this.pingInterval = result.getPing() * 1000;
         this.sendPong = result.getPong();
