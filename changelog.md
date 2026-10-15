@@ -10,8 +10,8 @@ Unreleased
 * A refused rpc call is sent again when the server sets the `x-centrifugo-retry` metadata key: `new_msg_id` after a re-sync of the clock, with a new `msg_id`, at most twice; `later` after 250 ms, 500 ms and 1 s, with the same `msg_id`, at most three times. The call's deadline bounds the attempts.
 * Deviation from upstream: a timer refresh refused with 103 keeps the connection and its identity, and is not retried. A timer refresh refused with 109 is retried with a fresh token, instead of disconnecting. Other codes behave as upstream.
 * A refresh with the token of a pending refresh shares its command. A refresh made while disconnected sets the token of the next connect, and the previous token is restored when the server refuses it.
-* An rpc call cancelled before it was sent is rejected with `CANCELLED` on every connection. It was `UNSUPPORTED` on a connection without the capability.
-* An rpc call with an instance whose msg_id was never written is rejected with `CANCELLED` when the client closes or disconnects for good. A call which was written fails with `IOException`.
+* An rpc call cancelled before it was sent is rejected with `CANCELLED` on every connection. It was `UNSUPPORTED` on a connection without the capability. A call whose resend with a new msg_id is still queued is `CANCELLED` too.
+* An rpc call with an instance whose msg_id was never written is rejected with `CANCELLED` when the client closes or disconnects for good. A call which was written fails with `IOException`, and the server still gets its cancel with the next connect which carries cancels.
 * A timer refresh token whose fetch is superseded by a `refresh()` call is not sent. A token fetched while disconnected, on the connection it was for, is the token of the next connect.
 * An rpc call with a null method or data throws `NullPointerException` at the call.
 * The instance is read when the client is created. A reply which arrives after the call deadline is acknowledged.
