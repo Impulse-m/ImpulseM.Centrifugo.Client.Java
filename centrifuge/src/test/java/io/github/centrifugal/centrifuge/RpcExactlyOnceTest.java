@@ -1,5 +1,6 @@
 package io.github.centrifugal.centrifuge;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
@@ -33,6 +34,8 @@ import java.util.function.Function;
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
 import okhttp3.WebSocket;
+
+import okio.ByteString;
 
 import org.junit.Test;
 
@@ -319,7 +322,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         CompletableFuture<RPCResult> queuedFuture = new CompletableFuture<>();
         c.rpcCall("queued", EMPTY_PAYLOAD, into(queuedFuture));
 
-        // The transport fails on the first send after the connect reply: the flush of the cancels sends first.
+        // The transport fails on the first cancel sent after the connect reply: the flush of the cancels sends first.
         failTheNextFlush.set(true);
         c.connect();
         assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
@@ -352,7 +355,8 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     }
 
 
-    // Replaces the transport of the client by one whose first send throws, as a transport can fail inside a send.
+    // Replaces the transport of the client by one whose first send of a cancel throws, as a transport can fail inside a
+    // send. The cancel is matched by its payload, so the sends of subscribes or connect commands do not take the failure.
     // That send puts the real transport back, since the replies are matched to the transport the client holds.
     // Coupling: it reads and writes the package-private field Client.ws by name, as no public seam exists for a
     // failing send. A rename of that field fails the callers with an IllegalStateException wrapping NoSuchFieldException.
@@ -361,9 +365,9 @@ public class RpcExactlyOnceTest extends RpcTestBase {
             Field field = Client.class.getDeclaredField("ws");
             field.setAccessible(true);
             WebSocket transport = (WebSocket) field.get(c);
-            AtomicInteger sends = new AtomicInteger();
+            AtomicBoolean failed = new AtomicBoolean();
             InvocationHandler handler = (Object proxy, Method method, Object[] args) -> {
-                if (method.getName().equals("send") && sends.getAndIncrement() == 0) {
+                if (method.getName().equals("send") && isCancelPayload(args[0]) && !failed.getAndSet(true)) {
                     field.set(c, transport);
                     throw new IllegalStateException("transport failed inside the send");
                 }
@@ -377,6 +381,16 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException(e);
         }
+    }
+
+
+    // Whether a sent payload is a command which cancels a call. A payload which is not a command is not one.
+    private static boolean isCancelPayload(Object payload) throws IOException {
+        if (!(payload instanceof ByteString)) {
+            return false;
+        }
+        Protocol.Command cmd = Protocol.Command.parseDelimitedFrom(new ByteArrayInputStream(((ByteString) payload).toByteArray()));
+        return cmd.hasRpc() && cmd.getRpc().getCancel() != 0;
     }
 
 
