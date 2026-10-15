@@ -243,7 +243,7 @@ Ordering rule: a `refresh(token)` call made while the anonymous connection is st
 | Event | When |
 |---|---|
 | `ConnectedEvent` with an empty user | `load` returned no refresh token: the connection stays anonymous |
-| `ErrorEvent` with `TokenError` | an exchange or `store` failed; the exchange is retried with backoff, or the connection goes on |
+| `ErrorEvent` with `TokenError` | an exchange or `store` failed; the exchange is retried with backoff, or the connection goes on. A bootstrap refresh which timed out or failed to write has an unknown outcome: the connection is closed and the client reconnects |
 | `ErrorEvent` with `RefreshError` | a renewal refresh was refused; the error table of the timer refresh applies |
 | `ErrorEvent` with `ReplyError` | a bootstrap refresh was refused with a temporary error, an error below 100 or 109: the exchange is retried with backoff |
 | `DisconnectedEvent` with code 1 (`unauthorized`) | the session is dead: the issuer refused the refresh token again, or `load` returned nothing at renewal. The client does not reconnect |
