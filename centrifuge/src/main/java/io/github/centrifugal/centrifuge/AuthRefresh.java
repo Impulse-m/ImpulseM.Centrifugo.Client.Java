@@ -102,6 +102,11 @@ final class AuthRefresh {
      * beyond the bound of the refresh calls in progress is refused at once with LIMIT_EXCEEDED.
      */
     void refreshWith(String token, ResultCallback<AuthResult> cb) {
+        // Closed: nothing will send the command, so the refresh fails now, as an rpc call does in RpcSession.start.
+        if (client.getState() == ClientState.CLOSED) {
+            cb.onDone(new IOException(), null);
+            return;
+        }
         if (requestedInProgress >= MAX_IN_PROGRESS) {
             cb.onDone(new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many refreshes are in progress", false), null);
             return;
@@ -335,7 +340,11 @@ final class AuthRefresh {
             }
             AuthResult authResult = new AuthResult(result.getUser(), result.getAuthClass(), result.getExpires(), result.getTtl());
             try {
-                applyAuth(result.getUser(), result.getAuthClass(), false);
+                // The identity is reported for a connected client only, as the expiry is scheduled for one. A connect
+                // reports the identity again, so nothing is lost when the client is not connected.
+                if (client.getState() == ClientState.CONNECTED) {
+                    applyAuth(result.getUser(), result.getAuthClass(), false);
+                }
             } finally {
                 rethrow(deliverAll(callbacks, null, authResult));
             }
