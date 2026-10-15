@@ -1429,6 +1429,48 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void cancelOfAResendQueuedWhileALegacyConnectionConnectsIsCancelledLocally() throws Exception {
+        enableRpcOptions();
+        // Holds the first call and the refresh, so the refused call is queued behind the refresh when it is refused.
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh() || (cmd.hasRpc() && !cmd.getRpc().getMethod().isEmpty());
+        Client c = newClient();
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        RpcCall call = c.rpcCall("slow", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(1000).build(), into(future));
+        awaitRequestCount(1);
+        Protocol.Command original = null;
+        for (Protocol.Command command : server.received()) {
+            if (command.hasRpc() && "slow".equals(command.getRpc().getMethod())) {
+                original = command;
+            }
+        }
+        c.refresh("token-2", (Throwable error, AuthResult result) -> {
+        });
+        awaitCondition("refresh sent", () -> hasRefreshCommand());
+        server.sendReply(refusal(original, MSG_ID_INVALID, Extensions.RPC_RETRY_NEW_MSG_ID, System.currentTimeMillis()));
+        syncWithServer();
+        drainExecutor();
+        // The connection is lost, and the next one is a legacy server. Its connect reply is held, so a refresh
+        // starts while the client connects, and the flush of the queued call waits behind it.
+        server.connectResult = Protocol.ConnectResult.newBuilder().setClient("fake-client").setVersion("0.0.0").setPing(25).build();
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasConnect() || cmd.hasRefresh() || (cmd.hasRpc() && !cmd.getRpc().getMethod().isEmpty());
+        server.closeConnection();
+        awaitCondition("reconnect started", () -> server.received().stream().filter(Protocol.Command::hasConnect).count() >= 2);
+        c.refresh("token-3", (Throwable error, AuthResult result) -> {
+        });
+
+        server.releaseDeferredCommands();
+        assertTrue("reconnected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+        drainExecutor();
+        call.cancel();
+
+        assertEquals("a resend queued on a legacy connection is cancelled, not refused", ReplyError.CANCELLED, replyErrorOf(future).getCode());
+        assertTrue("the id of the resend never reached the server, so it has no cancel", sentCancels().isEmpty());
+        assertEquals("the resend was never sent", 1, sentRpcRequests().size());
+    }
+
+
+    @Test
     public void acksOfACommandLostWithItsTransportAreSentAgain() throws Exception {
         enableRpcOptions();
         Client c = newClient();

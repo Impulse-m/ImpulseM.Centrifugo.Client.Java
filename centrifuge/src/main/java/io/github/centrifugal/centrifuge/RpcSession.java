@@ -173,6 +173,12 @@ final class RpcSession {
             call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel needs the instance option", false));
             return;
         }
+        if (call.resendAsNew) {
+            // The new msg_id is still queued, never written: nothing reached the server under it, whatever the connection.
+            queue.remove(call);
+            call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
+            return;
+        }
         if (host.state() == ClientState.CONNECTED && !host.hasRpcOptions()) {
             queue.remove(call);
             call.future.completeExceptionally(new ReplyError(ReplyError.UNSUPPORTED, "rpc cancel is not supported by the server", false));
@@ -411,11 +417,13 @@ final class RpcSession {
             sent = host.sendCommand(cmd);
         } catch (IOException e) {
             // The command cannot be encoded: nothing is sent, and the call fails alone, as a refused write does not.
-            host.removeFuture(id);
-            onWire.remove(id);
-            pendingAcks.addAll(0, acks);
+            abandonWrite(id, acks);
             call.future.completeExceptionally(e);
             return;
+        } catch (RuntimeException e) {
+            // The transport failed inside the send: the attempt is taken back, and writeOrQueue fails the call alone.
+            abandonWrite(id, acks);
+            throw e;
         }
         if (sent) {
             call.everSent = true;
@@ -424,14 +432,20 @@ final class RpcSession {
             call.carriedAcks = acks;
             return;
         }
-        host.removeFuture(id);
-        onWire.remove(id);
-        pendingAcks.addAll(0, acks);
+        abandonWrite(id, acks);
         if (!tracked) {
             call.future.completeExceptionally(new IOException());
         } else {
             queue.add(call);
         }
+    }
+
+
+    // Takes back an attempt which was not written: its future, its entry on the wire and the acks it carried.
+    private void abandonWrite(int id, List<Long> acks) {
+        host.removeFuture(id);
+        onWire.remove(id);
+        pendingAcks.addAll(0, acks);
     }
 
 
@@ -569,6 +583,10 @@ final class RpcSession {
     // of the refusal first, the reply's own time, which the clock offset already covers. The refused
     // msg_id was never recorded by the server, so it is not acked.
     private void resendWithNewId(RpcCall call, long replyTimeMillis) {
+        // A call which settled, or whose deadline passed, is not written: the settling or the deadline delivers it.
+        if (call.future.isDone() || call.remainingNanos() <= 0L) {
+            return;
+        }
         msgIds.resync(replyTimeMillis > 0L ? replyTimeMillis : host.serverTimeMillis());
         try {
             call.msgId = msgIds.next(host.serverTimeMillis());
