@@ -67,8 +67,8 @@ public class Client {
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final ScheduledExecutorService scheduler;
-    private int pingInterval;
-    private boolean sendPong;
+    int pingInterval;
+    boolean sendPong;
     private ScheduledFuture<?> pingTask;
     private ScheduledFuture<?> reconnectTask;
     private int reconnectAttempts = 0;
@@ -174,7 +174,6 @@ public class Client {
         this.listener = listener;
         this.scheduler = scheduler;
         this.backoff = new Backoff();
-        TokenExchangeFlow.checkExclusive(opts);
         ClientHost host = new ClientHost(this);
         this.rpcSession = new RpcSession(host, opts.getMaxPendingRpc());
         this.auth = new AuthRefresh(host, authRetryMinMillis, authRetryMaxMillis);
@@ -918,9 +917,6 @@ public class Client {
         }
         Protocol.ConnectResult result = reply.getConnect();
         this.rpcOptionsSupported = Extensions.hasFlag(result.getFlag(), Extensions.RPC_OPTIONS_FLAG);
-        // Set before a token exchange may hold the connect: the server pings this connection from now on.
-        this.pingInterval = result.getPing() * 1000;
-        this.sendPong = result.getPong();
         if (this.auth.interceptConnect(reply)) {
             return;
         }
@@ -932,6 +928,8 @@ public class Client {
         this.setState(ClientState.CONNECTED);
         this.listener.onConnected(this, event);
         this.auth.applyAuth(result.getUser(), result.getAuthClass(), true);
+        this.pingInterval = result.getPing() * 1000;
+        this.sendPong = result.getPong();
 
         synchronized (this.subs) {
             for (Map.Entry<String, Subscription> entry : this.subs.entrySet()) {

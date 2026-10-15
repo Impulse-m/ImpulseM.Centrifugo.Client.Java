@@ -136,6 +136,8 @@ final class TokenExchangeFlow {
             return false;
         }
         anonymousConnect = false;
+        // The server pings the connection from now on, during the bootstrap too: the ping is answered as a connected one is.
+        host.applyPing(reply.getConnect());
         Bootstrap started = new Bootstrap(host.transport(), reply);
         bootstrap = started;
         if (startExchange(started)) {
@@ -184,18 +186,13 @@ final class TokenExchangeFlow {
 
 
     /**
-     * The connection is gone: the bootstrap is abandoned and its retry is cancelled, and the next bootstrap starts its
-     * backoff again. The expiry record is kept.
+     * The connection is gone: the bootstrap is abandoned and its retry is cancelled. The backoff of the bootstrap
+     * attempts goes on, it restarts when a bootstrap completes. The expiry record is kept.
      */
     void reset() {
         if (bootstrap != null) {
-            cancelTimer(bootstrap);
-            if (bootstrap.tokenSet) {
-                host.storeToken("");
-            }
-            bootstrap = null;
+            abandon(bootstrap);
         }
-        bootstrapAttempt = 0;
         anonymousConnect = false;
     }
 
@@ -225,8 +222,15 @@ final class TokenExchangeFlow {
     }
 
 
-    /** Sends a plain rpc call over the transport and hands its outcome to the callback. Runs on the executor. */
+    /**
+     * Sends a plain rpc call over the transport and hands its outcome to the callback. Runs on the executor, or inline
+     * once the executor is shut down: a closed client fails the call here, so no state of the flow is touched inline.
+     */
     static void sendRpc(final ClientHost host, final WebSocket transport, String method, byte[] data, final ResultCallback<RPCResult> cb) {
+        if (host.state() == ClientState.CLOSED) {
+            cb.onDone(new IOException(), null);
+            return;
+        }
         Protocol.Command.Builder builder = Protocol.Command.newBuilder()
                 .setRpc(Protocol.RPCRequest.newBuilder()
                         .setMethod(method)
@@ -257,16 +261,17 @@ final class TokenExchangeFlow {
     // retry after a re-read of a changed refresh token: it is not retried again.
     private void runExchange(final Bootstrap b, final String refreshToken, final boolean reloaded) {
         final AtomicBoolean called = new AtomicBoolean();
+        final long generation = host.refreshGeneration();
         try {
             b.exchangeTimeout = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> onExchangeTimeout(b, called)), host.timeoutMillis(), TimeUnit.MILLISECONDS);
             exchange.exchange(new TokenExchangeEvent(host, b.transport, refreshToken), (Throwable err, TokenExchangeResult result) -> {
                 if (called.compareAndSet(false, true)) {
-                    host.runOrInline(() -> onExchanged(b, refreshToken, reloaded, err, result));
+                    host.runOrInline(() -> onExchanged(b, refreshToken, generation, reloaded, err, result));
                 }
             });
         } catch (RuntimeException e) {
             if (called.compareAndSet(false, true)) {
-                onExchanged(b, refreshToken, reloaded, e, null);
+                onExchanged(b, refreshToken, generation, reloaded, e, null);
             } else {
                 host.reportError(new TokenError(e));
             }
@@ -276,24 +281,28 @@ final class TokenExchangeFlow {
 
     // The bootstrap exchange got no callback within the client timeout. The connection is closed, as a connect which got
     // no reply is: the reconnect bootstraps again on a new socket, which a silently dead one would never do. A callback
-    // which comes later finds the attempt taken and is ignored.
+    // which comes later does not bootstrap, but its rotation is still stored, see storeAbandonedRotation.
     private void onExchangeTimeout(Bootstrap b, AtomicBoolean called) {
-        if (!isCurrent(b) || !called.compareAndSet(false, true)) {
+        if (!isCurrent(b) || called.get()) {
             return;
         }
+        abandon(b);
         host.reportError(new TokenError(new TimeoutException("token exchange timed out")));
         host.closeTransport();
     }
 
 
-    private void onExchanged(Bootstrap b, String refreshToken, boolean reloaded, Throwable err, TokenExchangeResult result) {
+    private void onExchanged(Bootstrap b, String refreshToken, long generation, boolean reloaded, Throwable err, TokenExchangeResult result) {
         cancelTimer(b);
-        // A result which arrives after its connection went away is dropped, rotation included: it is handled as a
-        // reply lost with the connection, and the backend's grace covers the pair.
+        // A result which arrives after its connection went away, or after the bootstrap gave up, does not bootstrap.
         if (!isCurrent(b)) {
+            storeAbandonedRotation(result, refreshToken);
             return;
         }
-        storeRotation(result, refreshToken);
+        // A refresh(token) call made since the exchange started holds the newest refresh token: it is not overwritten.
+        if (generation == host.refreshGeneration()) {
+            storeRotation(result, refreshToken);
+        }
         if (err instanceof UnauthorizedException) {
             reloadAfterRefusal(b, refreshToken, reloaded);
             return;
@@ -469,6 +478,17 @@ final class TokenExchangeFlow {
     }
 
 
+    // Gives up a bootstrap, when its connection is lost or its exchange timed out: its timers stop, its access token is
+    // cleared, and nothing of it runs again. The retry backoff is kept.
+    private void abandon(Bootstrap b) {
+        cancelTimer(b);
+        if (b.tokenSet) {
+            host.storeToken("");
+        }
+        bootstrap = null;
+    }
+
+
     // Hands a rotated refresh token to the application, before the access token of the result is used. A failure
     // is reported and the exchange goes on: the issuer already consumed the pair.
     private void storeRotation(TokenExchangeResult result, String refreshToken) {
@@ -483,6 +503,26 @@ final class TokenExchangeFlow {
             exchange.store(rotated);
         } catch (RuntimeException e) {
             host.reportError(new TokenError(e));
+        }
+    }
+
+
+    // The rotation of an exchange whose connection went away, or which timed out. It is stored only while the application
+    // still holds the refresh token the exchange used: a newer token, from another exchange or from the application, is
+    // never overwritten by a late result. The access token of such a result is not used.
+    private void storeAbandonedRotation(TokenExchangeResult result, String refreshToken) {
+        if (result == null || result.getRefreshToken() == null) {
+            return;
+        }
+        String current;
+        try {
+            current = exchange.load();
+        } catch (RuntimeException e) {
+            host.reportError(new TokenError(e));
+            return;
+        }
+        if (refreshToken.equals(current)) {
+            storeRotation(result, refreshToken);
         }
     }
 
@@ -524,8 +564,9 @@ final class TokenExchangeFlow {
 
 
     private void onRenewed(WebSocket transport, TokenCallback cb, String refreshToken, boolean reloaded, Throwable err, TokenExchangeResult result) {
-        // The renewal result of a connection which went away is dropped, as the bootstrap drops it.
+        // The renewal result of a connection which went away is not used, but its rotation is stored as the bootstrap's is.
         if (transport != host.transport() || host.state() != ClientState.CONNECTED) {
+            storeAbandonedRotation(result, refreshToken);
             cb.Done(new IOException("connection lost"), null);
             return;
         }

@@ -20,6 +20,7 @@ import java.util.function.BooleanSupplier;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
+import okhttp3.WebSocket;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -426,7 +427,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
 
     @Test
-    public void abandonedBootstrapStartsItsBackoffOverOnTheNextConnect() throws Exception {
+    public void abandonedBootstrapKeepsItsBackoffOnTheNextConnect() throws Exception {
         ManualScheduler clock = new ManualScheduler();
         answerExchanges("access-1|refresh-2");
         answerIdentity(false, 0);
@@ -460,10 +461,9 @@ public class TokenExchangeTest extends FakeServerTestBase {
         awaitUntil("reconnect scheduled", () -> clock.requestedDelays().size() > delaysBefore);
         clock.advance(RETRY_MAX_MILLIS);
 
-        // The first failure of the new bootstrap waits for the first step of the backoff.
+        // The attempts count on across the abandoned bootstrap: the new one's first failure takes the fourth step.
         awaitUntil("fourth retry scheduled", () -> bootstrapDelays(clock).size() == 4);
-        List<Long> delays = bootstrapDelays(clock);
-        assertTrue("retry after an abandoned bootstrap: " + delays.get(3), delays.get(3) <= 2 * BOOTSTRAP_RETRY_MIN_MILLIS);
+        assertEquals(4, ((Integer) fieldOf(fieldOf(client.auth, "flow"), "bootstrapAttempt")).intValue());
     }
 
 
@@ -674,6 +674,106 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
 
     @Test
+    public void rotationOfAnExchangeLostWithItsConnectionIsStoredWhileTheAppHoldsTheUsedToken() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        StallingStorage storage = new StallingStorage("refresh-1");
+        ManualScheduler clock = new ManualScheduler();
+        newClientOnClock(exchangeOptions(storage), clock);
+        client.connect();
+        awaitUntil("first exchange started", () -> storage.held != null);
+        int delaysBefore = clock.requestedDelays().size();
+
+        server.closeConnection();
+        awaitUntil("connection lost", () -> clock.requestedDelays().size() > delaysBefore);
+        // The reconnect is not run: the late reply is the only one, and the application still holds the used token.
+        assertEquals("refresh-1", storage.load());
+        storage.held.onDone(null, new TokenExchangeResult("access-stale", "refresh-2"));
+        drainExecutor();
+
+        assertEquals(Arrays.asList("refresh-2"), storage.stored);
+        assertEquals(Arrays.asList("refresh-1"), storage.exchanged);
+        assertEquals(1, kinds().stream().filter("connect"::equals).count());
+        assertTrue(connected.isEmpty());
+        assertTrue(errors.isEmpty());
+    }
+
+
+    @Test
+    public void rotationOfAnExchangeLateAfterItsTimeoutIsStored() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        StallingStorage storage = new StallingStorage("refresh-1");
+        ManualScheduler clock = new ManualScheduler();
+        Options options = exchangeOptions(storage);
+        options.setTimeout(1000);
+        newClientOnClock(options, clock);
+        client.connect();
+        awaitUntil("first exchange started", () -> storage.held != null);
+
+        clock.advance(options.getTimeout());
+        awaitUntil("timeout reported", () -> !errors.isEmpty());
+        storage.held.onDone(null, new TokenExchangeResult("access-stale", "refresh-2"));
+        drainExecutor();
+
+        assertEquals(Arrays.asList("refresh-2"), storage.stored);
+        assertTrue(connected.isEmpty());
+    }
+
+
+    @Test
+    public void rotationOfABootstrapDoesNotOverwriteATokenSetDuringTheExchange() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        StallingStorage storage = new StallingStorage("refresh-1");
+        newClient(exchangeOptions(storage));
+        client.connect();
+        awaitUntil("exchange started", () -> storage.held != null);
+
+        // The app logs in while the exchange runs: the refresh token of the login is the newest one, and the app stores it.
+        client.refresh("login-token", (Throwable err, AuthResult result) -> {
+        });
+        drainExecutor();
+        storage.refreshToken = "login-refresh";
+        storage.held.onDone(null, new TokenExchangeResult("access-1", "refresh-2"));
+
+        awaitUntil("connected", () -> connected.size() == 1);
+        assertTrue(storage.stored.isEmpty());
+        assertEquals("login-refresh", storage.load());
+        assertTrue(errors.isEmpty());
+    }
+
+
+    @Test
+    public void bootstrapRefreshWhoseWriteFailsClosesTheConnectionAndBootstrapsAgain() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        StallingStorage storage = new StallingStorage("refresh-1");
+        ManualScheduler clock = new ManualScheduler();
+        newClientOnClock(exchangeOptions(storage), clock);
+        client.connect();
+        awaitUntil("exchange started", () -> storage.held != null);
+        int delaysBefore = clock.requestedDelays().size();
+
+        // The socket is closed before the refresh command is written: the write is refused, so its outcome is unknown.
+        ((WebSocket) fieldOf(client, "ws")).close(1000, "");
+        storage.held.onDone(null, new TokenExchangeResult("access-1", "refresh-2"));
+
+        awaitUntil("write failure reported", () -> !errors.isEmpty());
+        assertTrue(errors.get(0) instanceof TokenError);
+        assertTrue(refreshTokens().isEmpty());
+        assertTrue(connected.isEmpty());
+        awaitUntil("reconnect scheduled", () -> clock.requestedDelays().size() > delaysBefore);
+        clock.advance(60000);
+
+        awaitUntil("connected", () -> connected.size() == 1);
+        assertEquals(Arrays.asList("refresh-1", "refresh-2"), storage.exchanged);
+        assertEquals(Arrays.asList("refresh-2"), storage.stored);
+        assertEquals(2, kinds().stream().filter("connect"::equals).count());
+    }
+
+
+    @Test
     public void emptyRefreshTokenAtBootstrapConnectsAnonymously() throws Exception {
         answerExchanges("access-1|refresh-2");
         Storage storage = new Storage("");
@@ -829,7 +929,8 @@ public class TokenExchangeTest extends FakeServerTestBase {
         assertEquals(1, rpcCalls.get());
         assertTrue(rpcErrors.get(0) instanceof IOException);
         assertTrue(connected.isEmpty());
-        assertTrue(storage.stored.isEmpty());
+        // The close ends the exchange like a lost connection: its rotation is stored, as the app still holds the used token.
+        assertEquals(Arrays.asList("refresh-late"), storage.stored);
     }
 
 

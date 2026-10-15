@@ -75,9 +75,27 @@ final class ClientHost {
     }
 
 
+    Options options() {
+        return client.getOpts();
+    }
+
+
     /** Handles the connect reply once a token exchange completed it: the connected state follows. */
     void resumeConnect(Protocol.Reply reply) {
         client.handleConnectReply(reply);
+    }
+
+
+    /** Sets the ping settings of a connect reply which is held by a token exchange, as the connected reply sets them. */
+    void applyPing(Protocol.ConnectResult result) {
+        client.pingInterval = result.getPing() * 1000;
+        client.sendPong = result.getPong();
+    }
+
+
+    /** Moves on with each refresh() call and each accepted token, so a change since an exchange started is seen. */
+    long refreshGeneration() {
+        return client.auth.refreshGeneration();
     }
 
 
