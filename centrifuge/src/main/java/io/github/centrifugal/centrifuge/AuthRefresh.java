@@ -390,6 +390,12 @@ final class AuthRefresh {
     }
 
 
+    /** Whether a refresh refused with this error is retried with a fresh token: a temporary error, a client error or an expired token. */
+    static boolean isRetryableRefresh(ReplyError replyError) {
+        return replyError.isTemporary() || replyError.getCode() < SERVER_ERROR_CODE_MIN || replyError.getCode() == ERROR_CODE_TOKEN_EXPIRED;
+    }
+
+
     // Decides on a failed timer refresh: retried with backoff, reported as a disconnect, or kept as it is.
     private void settleTimerError(Throwable error) {
         if (!(error instanceof ReplyError)) {
@@ -397,7 +403,7 @@ final class AuthRefresh {
             return;
         }
         ReplyError replyError = (ReplyError) error;
-        if (replyError.isTemporary() || replyError.getCode() < SERVER_ERROR_CODE_MIN || replyError.getCode() == ERROR_CODE_TOKEN_EXPIRED) {
+        if (isRetryableRefresh(replyError)) {
             scheduleRetry();
         } else if (replyError.getCode() != PERMISSION_DENIED) {
             host.disconnect(replyError.getCode(), replyError.getMessage());

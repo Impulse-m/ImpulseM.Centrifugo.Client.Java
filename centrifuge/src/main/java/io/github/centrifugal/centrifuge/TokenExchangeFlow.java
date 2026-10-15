@@ -37,12 +37,6 @@ final class TokenExchangeFlow {
     private static final double RENEWAL_MIN_SHARE = 0.7;
     private static final double RENEWAL_JITTER = 0.2;
 
-    // Server error code of an expired connection token, retried with a fresh exchange.
-    private static final int ERROR_CODE_TOKEN_EXPIRED = 109;
-
-    // Error codes below this one are client errors, which a bootstrap retries.
-    private static final int SERVER_ERROR_CODE_MIN = 100;
-
 
     // The access token of the connection and when it expires. Null when no expiry is known.
     private static final class Expiry {
@@ -340,8 +334,8 @@ final class TokenExchangeFlow {
             return;
         }
         ReplyError replyError = (ReplyError) failure;
-        if (replyError.isTemporary() || replyError.getCode() < SERVER_ERROR_CODE_MIN || replyError.getCode() == ERROR_CODE_TOKEN_EXPIRED) {
-            host.reportError(new RefreshError(replyError));
+        if (AuthRefresh.isRetryableRefresh(replyError)) {
+            host.reportError(replyError);
             scheduleBootstrapRetry(b);
             return;
         }

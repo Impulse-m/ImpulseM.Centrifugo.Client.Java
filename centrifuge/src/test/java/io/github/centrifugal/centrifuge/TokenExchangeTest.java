@@ -487,6 +487,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         assertEquals(Arrays.asList("refresh-1", "refresh-2"), storage.exchanged);
         assertEquals(1, kinds().stream().filter("connect"::equals).count());
         assertTrue(disconnects.isEmpty());
+        assertEquals(CODE_TOKEN_EXPIRED, ((ReplyError) errors.get(0)).getCode());
     }
 
 
