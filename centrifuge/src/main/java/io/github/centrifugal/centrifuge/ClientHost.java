@@ -170,8 +170,22 @@ final class ClientHost {
     }
 
 
+    /**
+     * Reports a failure to the listener as it was thrown. The report ends nothing: a listener which throws on it, or
+     * throws an Error, has its failure printed here, so the handling which reports goes on and the failure is not lost.
+     */
     void reportError(Throwable cause) {
-        client.listener.onError(client, new ErrorEvent(cause));
+        try {
+            client.listener.onError(client, new ErrorEvent(cause));
+        } catch (Throwable failure) {
+            failure.printStackTrace();
+        }
+    }
+
+
+    /** Reports a failure of the protocol handling as an error event, wrapped in an {@link UnclassifiedError}. */
+    void reportUnclassified(Throwable cause) {
+        reportError(new UnclassifiedError(cause));
     }
 
 
@@ -207,13 +221,15 @@ final class ClientHost {
 
     /**
      * The task which reports a failure of its own to the listener, instead of letting it go: the executor
-     * would drop it, and nothing else would tell the caller.
+     * would drop it, and nothing else would tell the caller. The failure goes to the listener as it was
+     * thrown, not wrapped in an {@link UnclassifiedError} as {@link #reportUnclassified} does: the task runs
+     * the listener's own callbacks, and their exceptions and errors keep their type for the listener.
      */
     Runnable reporting(final Runnable task) {
         return () -> {
             try {
                 task.run();
-            } catch (RuntimeException failure) {
+            } catch (Throwable failure) {
                 reportError(failure);
             }
         };

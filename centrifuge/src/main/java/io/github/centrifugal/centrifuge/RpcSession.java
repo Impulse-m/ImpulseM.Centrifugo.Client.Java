@@ -9,6 +9,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.RejectedExecutionException;
@@ -59,11 +60,14 @@ final class RpcSession {
 
     // A call whose msg_id the server refused is sent again this many times, each time with a new msg_id.
     private static final int NEW_ID_RESENDS = 2;
-    // A call the server refused for now is sent again this many times: after 250 ms, 500 ms and 1 s.
+    // A call the server refused for now is sent again this many times, after a random delay: its n-th
+    // resend waits at most 250 ms * 2^n (n = 0, 1, 2), so at most 250 ms, 500 ms and 1 s.
     private static final int LATER_RESENDS = 3;
-    private static final long LATER_BASE_NANOS = TimeUnit.MILLISECONDS.toNanos(250L);
+    private static final long LATER_BASE_MILLIS = 250L;
 
     private final ClientHost host;
+    // The source of the random delays of the later resends.
+    private final Random random;
     // Calls which wait for the connection or for a refresh, and calls lost with their transport.
     private final RpcQueue queue;
     // Calls written to the current transport, by the id of their command.
@@ -85,10 +89,11 @@ final class RpcSession {
     private final AtomicInteger pending = new AtomicInteger();
 
 
-    RpcSession(ClientHost host, int maxPending) {
+    RpcSession(ClientHost host, int maxPending, Random random) {
         this.host = host;
         this.queue = new RpcQueue();
         this.maxPending = maxPending;
+        this.random = random;
     }
 
 
@@ -370,13 +375,13 @@ final class RpcSession {
 
 
     // Writes the call now when the connection is up and no refresh is in flight, and queues it otherwise.
-    // A call which fails to write fails alone: the calls behind it are still written, and the connect path
-    // which flushes them goes on.
+    // A call which fails to write fails alone, whatever the failure: the calls behind it are still written,
+    // and the connect path which flushes them goes on.
     private void writeOrQueue(RpcCall call) {
         if (host.state() == ClientState.CONNECTED && !host.isRefreshing()) {
             try {
                 write(call);
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {
                 call.future.completeExceptionally(new IOException(e));
             }
         } else {
@@ -427,8 +432,9 @@ final class RpcSession {
             abandonWrite(id, acks);
             call.future.completeExceptionally(e);
             return;
-        } catch (RuntimeException e) {
-            // The transport failed inside the send: the attempt is taken back, and writeOrQueue fails the call alone.
+        } catch (Throwable e) {
+            // The transport failed inside the send, with an exception or an Error: the attempt is taken back, and
+            // writeOrQueue fails the call alone.
             abandonWrite(id, acks);
             throw e;
         }
@@ -515,6 +521,14 @@ final class RpcSession {
         } catch (IOException e) {
             // A cancel which cannot be encoded is kept like one the transport refused.
             sent = false;
+        } catch (Throwable e) {
+            // Unlike a call, a cancel has no future to take a failure of the send, so it is kept like a refused one and the
+            // failure is reported. Every Throwable is caught here on purpose: an Error which ended the flush would leave the
+            // calls queued for the connect waiting. A call's write is caught alike in writeOrQueue, and its future takes the failure.
+            // The report runs on the executor after the current task: the caller still writes its commands, and a listener may
+            // call rpcCall or disconnect, and neither may overtake them. Once the executor is shut down the failure is printed instead.
+            sent = false;
+            Extensions.submitOrRun(host.executor(), () -> host.reportUnclassified(e), e::printStackTrace);
         }
         if (sent) {
             // The reply is handled on the executor, after this task, so the timer is set before it can come.
@@ -577,7 +591,7 @@ final class RpcSession {
         if (Extensions.RPC_RETRY_LATER.equals(signal) && call.laterResends < LATER_RESENDS) {
             // The delay is capped at the remaining deadline, so a resend due after the deadline falls on the deadline
             // itself: the deadline then rejects the call with a timeout and cancels it, as it does for a sent call.
-            long delayNanos = Math.min(LATER_BASE_NANOS << call.laterResends, remainingNanos);
+            long delayNanos = Math.min(TimeUnit.MILLISECONDS.toNanos(laterDelayMillis(random, call.laterResends)), remainingNanos);
             call.laterResends++;
             scheduleResend(call, delayNanos);
             return true;
@@ -605,6 +619,14 @@ final class RpcSession {
         // The new msg_id is not on the wire yet: until it is, a timeout sends no cancel for it.
         call.wireTracked = false;
         writeOrQueue(call);
+    }
+
+
+    // The delay of the resend after the given number of later resends: full jitter, uniform in
+    // [0, 250 ms * 2^resends] in milliseconds, both ends included.
+    static long laterDelayMillis(Random random, int resends) {
+        int boundMillis = (int) (LATER_BASE_MILLIS << resends);
+        return random.nextInt(boundMillis + 1);
     }
 
 

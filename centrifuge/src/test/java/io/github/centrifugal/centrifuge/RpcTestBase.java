@@ -2,8 +2,10 @@ package io.github.centrifugal.centrifuge;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
@@ -112,12 +114,63 @@ abstract class RpcTestBase extends FakeServerTestBase {
      * moves the clock with {@link ManualScheduler#advance}. The client is not connected yet.
      */
     protected Client newClientOnClock(Options options, ManualScheduler clock) {
-        client = new Client(server.url(), options, signallingListener(), AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, clock);
+        return newClientOnClock(options, clock, AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS);
+    }
+
+
+    /**
+     * Same as {@link #newClientOnClock(Options, ManualScheduler)}, with the reconnect backoff bounds given.
+     * The random delays of the rpc resends draw the top of their range, so the delays are the bounds.
+     */
+    protected Client newClientOnClock(Options options, ManualScheduler clock, int retryMinMillis, int retryMaxMillis) {
+        return newClientOnClock(options, clock, retryMinMillis, retryMaxMillis, maximumDraws());
+    }
+
+
+    /**
+     * Same as {@link #newClientOnClock(Options, ManualScheduler, int, int)}, with the source of the random
+     * delays of the rpc resends given.
+     */
+    protected Client newClientOnClock(Options options, ManualScheduler clock, int retryMinMillis, int retryMaxMillis, Random resendDraws) {
+        client = new Client(server.url(), options, signallingListener(), retryMinMillis, retryMaxMillis, clock, resendDraws);
         return client;
     }
 
 
-    private EventListener signallingListener() {
+    /**
+     * Creates the client for the fake server with the options, on real time, whose rpc resends draw the top
+     * of their range, so a later resend waits its whole bound. The client is not connected yet.
+     */
+    protected Client newClientWithMaximumDraws(Options options) {
+        client = new Client(server.url(), options, signallingListener(), AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, new ScheduledThreadPoolExecutor(1), maximumDraws());
+        return client;
+    }
+
+
+    /** A random source whose draws are always the top of their range: the largest delay of each resend. */
+    protected static Random maximumDraws() {
+        return new Random() {
+            @Override
+            public int nextInt(int bound) {
+                return bound - 1;
+            }
+        };
+    }
+
+
+    /** A random source whose draws are always the bottom of their range: no delay for a resend. */
+    protected static Random lowestDraws() {
+        return new Random() {
+            @Override
+            public int nextInt(int bound) {
+                return 0;
+            }
+        };
+    }
+
+
+    /** A listener which signals the connect and the disconnect, for a test which adds its own callbacks around it. */
+    protected EventListener signallingListener() {
         return new EventListener() {
             @Override
             public void onConnected(Client c, ConnectedEvent e) {
