@@ -1162,6 +1162,24 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
+    public void laterResendWithTheLowestDrawIsSentAtOnce() throws Exception {
+        enableRpcOptions();
+        refuseCalls(1, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
+        ManualScheduler clock = new ManualScheduler();
+        Client c = newClientOnClock(instanceOptions(), clock, AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, lowestDraws());
+        connect(c);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpcCall("later", EMPTY_PAYLOAD, into(future));
+        awaitCondition("the resend is scheduled without a delay", () -> clock.requestedDelays().contains(0L));
+
+        clock.advance(0);
+
+        assertEquals("ok", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+        assertEquals(2, sentRpcRequests().size());
+    }
+
+
+    @Test
     public void laterRefusedFourTimesSurfacesTheError() throws Exception {
         enableRpcOptions();
         refuseCalls(4, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
