@@ -218,4 +218,15 @@ final class ClientHost {
             }
         };
     }
+
+
+    /**
+     * Runs the task on the executor, from any thread. Once the executor is shut down, which is after the client closed,
+     * a late completion runs the task inline on the completing thread, so the callbacks still run exactly once.
+     * A failure of the task goes to the listener.
+     */
+    void runOrInline(Runnable task) {
+        Runnable reported = reporting(task);
+        Extensions.submitOrRun(executor(), reported, reported);
+    }
 }

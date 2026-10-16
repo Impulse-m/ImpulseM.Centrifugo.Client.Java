@@ -1,6 +1,5 @@
 package io.github.centrifugal.centrifuge;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -17,7 +16,6 @@ import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
 import java8.util.concurrent.CompletableFuture;
 import okhttp3.WebSocket;
-import okio.ByteString;
 
 
 /**
@@ -201,13 +199,17 @@ final class TokenExchangeFlow {
 
     /**
      * The connection is gone: the bootstrap is abandoned and its retry is cancelled. The backoff of the bootstrap
-     * attempts goes on, it restarts when a bootstrap completes or ends the session. The expiry record is kept.
+     * attempts goes on, it restarts when a bootstrap completes or ends the session. A disconnect the client was asked
+     * for ends the session, so its attempts restart with the next connect. The expiry record is kept.
      */
-    void reset() {
+    void reset(boolean clientInitiated) {
         if (bootstrap != null) {
             abandon(bootstrap);
         }
         anonymousConnect = false;
+        if (clientInitiated) {
+            bootstrapAttempt = 0;
+        }
     }
 
 
@@ -216,7 +218,11 @@ final class TokenExchangeFlow {
      * id, is not retransmitted, and is not held for the connected state. Fails with IOException when the
      * transport is not the current one, or when it refuses the command. Runs on the executor.
      */
-    static CompletableFuture<Protocol.Reply> writePlain(final ClientHost host, final WebSocket transport, Protocol.Command.Builder builder) {
+    static CompletableFuture<Protocol.Reply> writePlain(
+            final ClientHost host,
+            final WebSocket transport,
+            Protocol.Command.Builder builder
+    ) {
         CompletableFuture<Protocol.Reply> future = new CompletableFuture<>();
         if (host.transport() != transport) {
             future.completeExceptionally(new IOException());
@@ -225,7 +231,7 @@ final class TokenExchangeFlow {
         final int id = host.nextCommandId();
         host.addFuture(id, future);
         try {
-            if (!transport.send(ByteString.of(encode(builder.setId(id).build())))) {
+            if (!host.sendCommand(builder.setId(id).build())) {
                 future.completeExceptionally(new IOException());
             }
         } catch (IOException e) {
@@ -236,28 +242,17 @@ final class TokenExchangeFlow {
     }
 
 
-    // Encodes a command as the client writes it. Throws when the encoding fails, so that only the call of the command fails.
-    private static byte[] encode(Protocol.Command cmd) throws IOException {
-        ByteArrayOutputStream stream = new ByteArrayOutputStream();
-        cmd.writeDelimitedTo(stream);
-        return stream.toByteArray();
-    }
-
-
-    // Runs the task on the executor, from any thread. Once the executor is shut down, which is after the client closed,
-    // a late completion runs the task inline on the completing thread, so the callbacks still run exactly once.
-    // A failure of the task goes to the listener.
-    static void runOrInline(ClientHost host, Runnable task) {
-        Runnable reported = host.reporting(task);
-        Extensions.submitOrRun(host.executor(), reported, reported);
-    }
-
-
     /**
      * Sends a plain rpc call over the transport and hands its outcome to the callback. Runs on the executor, or inline
      * once the executor is shut down: a closed client fails the call here, so no state of the flow is touched inline.
      */
-    static void sendRpc(final ClientHost host, final WebSocket transport, String method, byte[] data, final ResultCallback<RPCResult> cb) {
+    static void sendRpc(
+            final ClientHost host,
+            final WebSocket transport,
+            String method,
+            byte[] data,
+            final ResultCallback<RPCResult> cb
+    ) {
         if (host.state() == ClientState.CLOSED) {
             cb.onDone(new IOException(), null);
             return;
@@ -266,7 +261,9 @@ final class TokenExchangeFlow {
                 .setRpc(Protocol.RPCRequest.newBuilder()
                         .setMethod(method)
                         .setData(com.google.protobuf.ByteString.copyFrom(data)));
-        writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> runOrInline(host, () ->RpcSession.deliver(host, cb, reply, err)));
+        writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> {
+            host.runOrInline(() -> RpcSession.deliver(host, cb, reply, err));
+        });
     }
 
 
@@ -294,10 +291,15 @@ final class TokenExchangeFlow {
         final AtomicBoolean called = new AtomicBoolean();
         final long generation = host.refreshGeneration();
         try {
-            b.exchangeTimeout = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> onExchangeTimeout(b, called)), host.timeoutMillis(), TimeUnit.MILLISECONDS);
+            b.exchangeTimeout = host.scheduler().schedule(
+                    () -> Extensions.submitOrIgnore(host.executor(), () -> onExchangeTimeout(b, called)),
+                    host.timeoutMillis(),
+                    TimeUnit.MILLISECONDS);
             exchange.exchange(new TokenExchangeEvent(host, b.transport, refreshToken), (Throwable err, TokenExchangeResult result) -> {
                 if (called.compareAndSet(false, true)) {
-                    runOrInline(host, () ->onExchanged(b, refreshToken, generation, reloaded, Extensions.unwrapCompletion(err), result));
+                    host.runOrInline(() -> {
+                        onExchanged(b, refreshToken, generation, reloaded, Extensions.unwrapCompletion(err), result);
+                    });
                 }
             });
         } catch (RuntimeException e) {
@@ -323,7 +325,14 @@ final class TokenExchangeFlow {
     }
 
 
-    private void onExchanged(Bootstrap b, String refreshToken, long generation, boolean reloaded, Throwable err, TokenExchangeResult result) {
+    private void onExchanged(
+            Bootstrap b,
+            String refreshToken,
+            long generation,
+            boolean reloaded,
+            Throwable err,
+            TokenExchangeResult result
+    ) {
         cancelTimer(b);
         // A result which arrives after its connection went away, or after the bootstrap gave up, does not bootstrap.
         if (!isCurrent(b)) {
@@ -394,7 +403,9 @@ final class TokenExchangeFlow {
         b.tokenSet = true;
         Protocol.Command.Builder builder = Protocol.Command.newBuilder()
                 .setRefresh(Protocol.RefreshRequest.newBuilder().setToken(accessToken));
-        writePlain(host, b.transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> runOrInline(host, () ->onRefreshed(b, reply, err)));
+        writePlain(host, b.transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> {
+            host.runOrInline(() -> onRefreshed(b, reply, err));
+        });
     }
 
 
@@ -590,15 +601,35 @@ final class TokenExchangeFlow {
 
     // Runs one renewal exchange. The client timeout is its deadline: a result which comes after it is not delivered to the
     // callback, its rotation is stored as an abandoned one's, see storeAbandonedRotation.
-    private void runRenewal(final WebSocket transport, final TokenCallback cb, final String refreshToken, final boolean reloaded, final long generation) {
+    private void runRenewal(
+            final WebSocket transport,
+            final TokenCallback cb,
+            final String refreshToken,
+            final boolean reloaded,
+            final long generation
+    ) {
         final Renewal renewal = new Renewal();
         try {
-            renewal.deadline = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> onRenewalTimeout(cb, renewal)), host.timeoutMillis(), TimeUnit.MILLISECONDS);
+            renewal.deadline = host.scheduler().schedule(
+                    () -> Extensions.submitOrIgnore(host.executor(), () -> onRenewalTimeout(cb, renewal)),
+                    host.timeoutMillis(),
+                    TimeUnit.MILLISECONDS);
             exchange.exchange(new TokenExchangeEvent(host, transport, refreshToken), (Throwable err, TokenExchangeResult result) -> {
                 if (renewal.called.compareAndSet(false, true)) {
-                    runOrInline(host, () ->onRenewed(renewal, transport, cb, refreshToken, reloaded, generation, Extensions.unwrapCompletion(err), result));
+                    host.runOrInline(() -> {
+                        onRenewed(
+                                renewal,
+                                transport,
+                                cb,
+                                refreshToken,
+                                reloaded,
+                                generation,
+                                Extensions.unwrapCompletion(err),
+                                result
+                        );
+                    });
                 } else {
-                    runOrInline(host, () ->storeAbandonedRotation(result, refreshToken));
+                    host.runOrInline(() -> storeAbandonedRotation(result, refreshToken));
                 }
             });
         } catch (RuntimeException e) {
@@ -619,7 +650,16 @@ final class TokenExchangeFlow {
     }
 
 
-    private void onRenewed(Renewal renewal, WebSocket transport, TokenCallback cb, String refreshToken, boolean reloaded, long generation, Throwable err, TokenExchangeResult result) {
+    private void onRenewed(
+            Renewal renewal,
+            WebSocket transport,
+            TokenCallback cb,
+            String refreshToken,
+            boolean reloaded,
+            long generation,
+            Throwable err,
+            TokenExchangeResult result
+    ) {
         if (renewal.deadline != null) {
             renewal.deadline.cancel(false);
         }
