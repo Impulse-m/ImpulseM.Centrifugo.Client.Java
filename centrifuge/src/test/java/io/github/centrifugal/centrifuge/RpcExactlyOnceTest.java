@@ -1479,7 +1479,8 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         Client c = newClient();
         connect(c);
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        RpcCall call = c.rpcCall("slow", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(1000).build(), into(future));
+        // The deadline is far beyond the scenario: the call must end by its cancel, never by a slow runner's timeout.
+        RpcCall call = c.rpcCall("slow", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(10_000).build(), into(future));
         awaitRequestCount(1);
         Protocol.Command original = null;
         for (Protocol.Command command : server.received()) {
