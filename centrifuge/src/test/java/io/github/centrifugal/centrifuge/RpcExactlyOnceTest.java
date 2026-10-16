@@ -350,6 +350,58 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     }
 
 
+    // A failed cancel send is reported after the connect reply is handled: the report sees the expiry timer which the reply
+    // armed, and a disconnect from the report leaves no timer armed.
+    @Test
+    public void failedCancelSendIsReportedAfterTheConnectReplyArmsItsExpiryTimer() throws Exception {
+        enableRpcOptions();
+        final int ttlSeconds = 60;
+        final long expiryMillis = TimeUnit.SECONDS.toMillis(ttlSeconds);
+        server.connectResult = server.connectResult.toBuilder().setExpires(true).setTtl(ttlSeconds).build();
+        serveDedup();
+        AtomicBoolean failTheNextFlush = new AtomicBoolean();
+        BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
+        BlockingQueue<Integer> armedAtReport = new LinkedBlockingQueue<>();
+        ManualScheduler clock = new ManualScheduler();
+        EventListener signalling = signallingListener();
+        Client c = new Client(server.url(), instanceOptions(), new EventListener() {
+            @Override
+            public void onConnected(Client client, ConnectedEvent event) {
+                signalling.onConnected(client, event);
+                if (failTheNextFlush.getAndSet(false)) {
+                    failTheFirstSend(client, new IllegalStateException("transport failed inside the send"), true);
+                }
+            }
+
+
+            @Override
+            public void onDisconnected(Client client, DisconnectedEvent event) {
+                signalling.onDisconnected(client, event);
+            }
+
+
+            @Override
+            public void onError(Client client, ErrorEvent event) {
+                reported.add(event.getError());
+                armedAtReport.add(Collections.frequency(clock.requestedDelays(), expiryMillis));
+                client.disconnect();
+            }
+        }, AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, clock);
+        client = c;
+        connect(c);
+        sendHeldCallsAndDisconnect(c, 1);
+
+        failTheNextFlush.set(true);
+        c.connect();
+        assertTrue("the failed send is reported", reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) != null);
+        Integer armed = armedAtReport.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertEquals("the report runs after the connect reply armed its expiry timer", Integer.valueOf(2), armed);
+        awaitCondition("the report disconnects the client", () -> c.getState() == ClientState.DISCONNECTED);
+        drainExecutor();
+        assertEquals("the disconnect leaves no expiry timer armed", 0, clock.pendingWithDelay(expiryMillis));
+    }
+
+
     // An Error from the send of a call fails that call alone: the calls behind it in the flush are still written.
     @Test
     public void callWhoseSendFailsWithAnErrorFailsAloneAndTheRestOfTheFlushGoesOut() throws Exception {

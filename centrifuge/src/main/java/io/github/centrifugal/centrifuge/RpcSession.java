@@ -78,9 +78,6 @@ final class RpcSession {
     private final List<Long> pendingCancels = new ArrayList<>();
     // The cancel commands which wait for their reply, by the id of the command: the msg_id each one cancels.
     private final Map<Integer, CancelCommand> cancelCommands = new TreeMap<>();
-    // The failures of the cancel sends which the transport threw, reported once the caller has written its commands.
-    // Null while there are none, so a connection without a failure allocates nothing.
-    private List<Throwable> cancelFailures;
     private final MsgIdGenerator msgIds = new MsgIdGenerator();
     // The bound of the calls which are not settled, see submit.
     private final int maxPending;
@@ -227,7 +224,6 @@ final class RpcSession {
             }
             writeOrQueue(call);
         }
-        reportCancelFailures();
     }
 
 
@@ -481,21 +477,6 @@ final class RpcSession {
         if (host.state() != ClientState.CONNECTED || !host.hasRpcOptions() || !writeCancel(msgId)) {
             keepCancel(msgId);
         }
-        reportCancelFailures();
-    }
-
-
-    // Reports the failures of the cancel sends, once the caller has written its commands: a listener may call rpcCall
-    // or disconnect, and neither may overtake the commands the caller has yet to write.
-    private void reportCancelFailures() {
-        if (cancelFailures == null) {
-            return;
-        }
-        List<Throwable> failures = cancelFailures;
-        cancelFailures = null;
-        for (Throwable failure : failures) {
-            host.reportUnclassified(failure);
-        }
     }
 
 
@@ -530,7 +511,6 @@ final class RpcSession {
         CancelCommand command = new CancelCommand(msgId, acks);
         cancelCommands.put(id, command);
         boolean sent;
-        Throwable failure = null;
         try {
             sent = host.sendCommand(cmd);
         } catch (IOException e) {
@@ -540,8 +520,10 @@ final class RpcSession {
             // Unlike a call, a cancel has no future to take a failure of the send, so it is kept like a refused one and the
             // failure is reported. Every Throwable is caught here on purpose: an Error which ended the flush would leave the
             // calls queued for the connect waiting. A call's write is caught alike in writeOrQueue, and its future takes the failure.
+            // The report runs on the executor after the current task: the caller still writes its commands, and a listener may
+            // call rpcCall or disconnect, and neither may overtake them.
             sent = false;
-            failure = e;
+            Extensions.submitOrIgnore(host.executor(), () -> host.reportUnclassified(e));
         }
         if (sent) {
             // The reply is handled on the executor, after this task, so the timer is set before it can come.
@@ -551,12 +533,6 @@ final class RpcSession {
         host.removeFuture(id);
         cancelCommands.remove(id);
         pendingAcks.addAll(0, acks);
-        if (failure != null) {
-            if (cancelFailures == null) {
-                cancelFailures = new ArrayList<>();
-            }
-            cancelFailures.add(failure);
-        }
         return false;
     }
 
