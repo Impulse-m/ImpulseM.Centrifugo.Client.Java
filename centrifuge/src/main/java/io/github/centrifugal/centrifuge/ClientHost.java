@@ -118,21 +118,22 @@ final class ClientHost {
     }
 
 
-    void reportError(Throwable cause) {
-        client.listener.onError(client, new ErrorEvent(cause));
-    }
-
-
     /**
-     * Reports a failure of the protocol handling as an error event, wrapped in an {@link UnclassifiedError}. A listener
-     * which throws on the report cannot end the handling which reports, so its failure is printed here.
+     * Reports a failure to the listener as it was thrown. The report ends nothing: a listener which throws on it, or
+     * throws an Error, has its failure printed here, so the handling which reports goes on and the failure is not lost.
      */
-    void reportUnclassified(Throwable cause) {
+    void reportError(Throwable cause) {
         try {
-            client.listener.onError(client, new ErrorEvent(new UnclassifiedError(cause)));
+            client.listener.onError(client, new ErrorEvent(cause));
         } catch (Throwable failure) {
             failure.printStackTrace();
         }
+    }
+
+
+    /** Reports a failure of the protocol handling as an error event, wrapped in an {@link UnclassifiedError}. */
+    void reportUnclassified(Throwable cause) {
+        reportError(new UnclassifiedError(cause));
     }
 
 
