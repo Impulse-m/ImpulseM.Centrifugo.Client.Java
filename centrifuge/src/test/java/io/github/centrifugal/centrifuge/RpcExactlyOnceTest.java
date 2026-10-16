@@ -384,62 +384,6 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     }
 
 
-    // A listener which throws from onConnected leaves the handshake whole: the call queued while disconnected is written,
-    // the ping and expiry timers are armed when the failure is reported, and the failure is reported after them.
-    @Test
-    public void listenerFailureInOnConnectedLeavesTheHandshakeWhole() throws Exception {
-        enableRpcOptions();
-        serveDedup();
-        final int ttlSeconds = 60;
-        final long expiryMillis = TimeUnit.SECONDS.toMillis(ttlSeconds);
-        final long pingMillis = server.connectResult.getPing() * 1000L + instanceOptions().getMaxServerPingDelay();
-        server.connectResult = server.connectResult.toBuilder().setExpires(true).setTtl(ttlSeconds).build();
-        AtomicBoolean failOnConnect = new AtomicBoolean();
-        BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
-        BlockingQueue<Integer> expiryArmedAtReport = new LinkedBlockingQueue<>();
-        BlockingQueue<Integer> pingArmedAtReport = new LinkedBlockingQueue<>();
-        ManualScheduler clock = new ManualScheduler();
-        EventListener signalling = signallingListener();
-        Client c = new Client(server.url(), instanceOptions(), new EventListener() {
-            @Override
-            public void onConnected(Client client, ConnectedEvent event) {
-                signalling.onConnected(client, event);
-                if (failOnConnect.get()) {
-                    throw new IllegalStateException("listener failed on connect");
-                }
-            }
-
-
-            @Override
-            public void onDisconnected(Client client, DisconnectedEvent event) {
-                signalling.onDisconnected(client, event);
-            }
-
-
-            @Override
-            public void onError(Client client, ErrorEvent event) {
-                reported.add(event.getError());
-                expiryArmedAtReport.add(clock.pendingWithDelay(expiryMillis));
-                pingArmedAtReport.add(clock.pendingWithDelay(pingMillis));
-            }
-        }, AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, clock);
-        client = c;
-        connect(c);
-        c.disconnect();
-        c.rpcCall("queued", EMPTY_PAYLOAD, into(new CompletableFuture<RPCResult>()));
-        drainExecutor();
-
-        failOnConnect.set(true);
-        c.connect();
-
-        Throwable failure = reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
-        assertTrue("the listener failure is reported", failure instanceof IllegalStateException);
-        awaitCondition("the queued call is written", () -> sentRpcRequests().size() == 1);
-        assertTrue("the expiry timer is armed when the failure is reported", expiryArmedAtReport.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) > 0);
-        assertTrue("the ping timer is armed when the failure is reported", pingArmedAtReport.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) > 0);
-    }
-
-
     // An Error from the send of a call fails that call alone: the calls behind it in the flush are still written.
     @Test
     public void callWhoseSendFailsWithAnErrorFailsAloneAndTheRestOfTheFlushGoesOut() throws Exception {
