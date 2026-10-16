@@ -63,7 +63,7 @@ final class RpcSession {
     private static final int NEW_ID_RESENDS = 2;
     // A call the server refused for now is sent again this many times, after a random delay: its n-th
     // resend waits at most 250 ms * 2^n (n = 0, 1, 2), so at most 250 ms, 500 ms and 1 s.
-    private static final int LATER_RESENDS = 3;
+    static final int LATER_RESENDS = 3;
     private static final long LATER_BASE_MILLIS = 250L;
 
     private final ClientHost host;

@@ -1,5 +1,6 @@
 package io.github.centrifugal.centrifuge;
 
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.regex.Pattern;
@@ -109,7 +110,13 @@ final class Extensions {
      * one function, so the carrier of the signal can change in one place.
      */
     static String retrySignal(Protocol.Error error) {
-        return error.getMetadataMap().get(RPC_RETRY_METADATA_KEY);
+        return retrySignal(error.getMetadataMap());
+    }
+
+
+    /** The retry value in the metadata of an error, the one carrier of the signal in both forms of the error. */
+    static String retrySignal(Map<String, String> metadata) {
+        return metadata.get(RPC_RETRY_METADATA_KEY);
     }
 
 
