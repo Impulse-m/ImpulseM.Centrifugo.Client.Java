@@ -9,7 +9,6 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -145,7 +144,7 @@ public class Client {
      * @param listener: client event handler.
      */
     public Client(final String endpoint, final Options opts, final EventListener listener) {
-        this(endpoint, opts, listener, AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, createScheduler(), new Random());
+        this(endpoint, opts, listener, AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, createScheduler());
     }
 
     // A cancelled timer leaves the queue at once. Otherwise a cancelled rpc deadline keeps its call alive until
@@ -160,15 +159,14 @@ public class Client {
         return scheduler;
     }
 
-    // The retry bounds, the scheduler and the random delays of the rpc resends are parameters, so that the tests control them.
+    // The retry bounds and the scheduler are parameters, so that the tests control the time.
     Client(
             final String endpoint,
             final Options opts,
             final EventListener listener,
             final int authRetryMinMillis,
             final int authRetryMaxMillis,
-            final ScheduledExecutorService scheduler,
-            final Random rpcResendDraws
+            final ScheduledExecutorService scheduler
     ) {
         this.endpoint = endpoint;
         this.opts = opts;
@@ -177,7 +175,7 @@ public class Client {
         this.scheduler = scheduler;
         this.backoff = new Backoff();
         ClientHost host = new ClientHost(this);
-        this.rpcSession = new RpcSession(host, opts.getMaxPendingRpc(), rpcResendDraws);
+        this.rpcSession = new RpcSession(host, opts.getMaxPendingRpc());
         this.auth = new AuthRefresh(host, authRetryMinMillis, authRetryMaxMillis);
         this.token = opts.getToken();
         if (opts.getData() != null) {

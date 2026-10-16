@@ -4,7 +4,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -1075,7 +1074,7 @@ public class AuthTest extends RpcTestBase {
         server.connectResult = expiringResult("u1", "authenticated", 1);
         ManualScheduler clock = new ManualScheduler();
         Options options = optionsWithTokenGetter(new CopyOnWriteArrayList<Long>());
-        client = new Client(server.url(), options, throwingAuthListener(), FAST_RETRY_MIN_MILLIS, FAST_RETRY_MAX_MILLIS, clock, new Random());
+        client = new Client(server.url(), options, throwingAuthListener(), FAST_RETRY_MIN_MILLIS, FAST_RETRY_MAX_MILLIS, clock);
         connect(client);
         awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
         answerRefreshes("u2", "authenticated");
@@ -1105,13 +1104,13 @@ public class AuthTest extends RpcTestBase {
 
 
     private void newAuthClient(Options options, int retryMinMillis, int retryMaxMillis) {
-        client = new Client(server.url(), options, authListener(), retryMinMillis, retryMaxMillis, Executors.newScheduledThreadPool(1), new Random());
+        client = new Client(server.url(), options, authListener(), retryMinMillis, retryMaxMillis, Executors.newScheduledThreadPool(1));
     }
 
 
     // A client whose timers run on the clock: the test moves it, so the refresh timer fires when the test says.
     private void newAuthClientOnClock(Options options, ManualScheduler clock) {
-        client = new Client(server.url(), options, authListener(), FAST_RETRY_MIN_MILLIS, FAST_RETRY_MAX_MILLIS, clock, new Random());
+        client = new Client(server.url(), options, authListener(), FAST_RETRY_MIN_MILLIS, FAST_RETRY_MAX_MILLIS, clock);
     }
 
 
