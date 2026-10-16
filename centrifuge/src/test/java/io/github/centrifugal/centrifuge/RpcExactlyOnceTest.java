@@ -539,11 +539,16 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
     // Whether a sent payload is an rpc command of the kind the send fails on: a cancel, or a call. A payload which is not
     // a command is neither.
-    private static boolean isTargetPayload(Object payload, boolean cancel) throws IOException {
+    private static boolean isTargetPayload(Object payload, boolean cancel) {
         if (!(payload instanceof ByteString)) {
             return false;
         }
-        Protocol.Command cmd = Protocol.Command.parseDelimitedFrom(new ByteArrayInputStream(((ByteString) payload).toByteArray()));
+        Protocol.Command cmd;
+        try {
+            cmd = Protocol.Command.parseDelimitedFrom(new ByteArrayInputStream(((ByteString) payload).toByteArray()));
+        } catch (IOException e) {
+            return false;
+        }
         return cmd != null && cmd.hasRpc() && (cmd.getRpc().getCancel() != 0) == cancel;
     }
 
