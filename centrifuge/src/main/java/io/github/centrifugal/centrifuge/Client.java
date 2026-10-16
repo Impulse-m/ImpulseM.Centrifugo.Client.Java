@@ -1017,6 +1017,10 @@ public class Client {
         }
         this.connectAsyncCommands.clear();
 
+        // A ping which came during a token exchange of the connect scheduled its own timer: it is replaced here.
+        if (this.pingTask != null) {
+            this.pingTask.cancel(true);
+        }
         this.pingTask = this.scheduler.schedule(Client.this::waitServerPing, this.pingInterval + this.opts.getMaxServerPingDelay(), TimeUnit.MILLISECONDS);
 
         this.auth.scheduleExpiry(result.getExpires(), result.getTtl());
