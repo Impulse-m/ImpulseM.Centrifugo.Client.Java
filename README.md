@@ -186,6 +186,29 @@ String instance = String.format("%032x", new java.math.BigInteger(1, bytes));
 options.setInstance(instance);
 ```
 
+## RPC pool for large payloads
+
+`RpcPool` sends rpc calls with large payloads over several plain connections per endpoint, with a window of calls per connection, a bounded wait queue, and resends. The application names the endpoints through a resolver, keyed by an endpoint key which the server answered (for example a region), and gives each call an optional affinity hint, which the server issued and sends in the header named by `affinityHeader`.
+
+```java
+RpcPool pool = new RpcPool.Builder(endpointKey -> Collections.singletonList("wss://blobs.example/connection/websocket"))
+        .token(token)
+        .affinityHeader("x-example-affinity")
+        .maxConnectionsPerEndpoint(2)
+        .maxInflightPerConnection(1)
+        .build();
+pool.rpc("blob.writePart", chunk, RpcPool.CallOptions.builder().endpointKey("eu-2").affinity(hint).build(), (error, result) -> {
+    // error is a ReplyError, a TimeoutException, or an IOException when the connection was lost for good
+});
+```
+
+- The calls are plain: no `msg_id`, no instance. A resent call may run again on the server, so the method must be idempotent.
+- The window is `maxInflightPerConnection`, 1 by default. The server must allow it: `client.concurrency` on the server is at least the window plus one, or the server's read loop cannot answer pings while calls run.
+- A call is sent again, up to `retries` times (3 by default) counted together, when its connection was lost (`IOException`), when the server refused it with the `x-centrifugo-retry: later` signal (after the same jittered delay as the main client), or when `reroute` maps the server's error to another endpoint key. A timeout is not resent. A connection the server closed for a frame over its size limit (WebSocket 1009) settles its calls with `IOException` and is not resent: the chunk is over the limit every time.
+- `redirect` lets the application move the bytes of a reply or an error to a URL (for example a presigned one). The pool fetches it with OkHttp, within the call's deadline, at most `maxRedirectsInflight` at a time, and the body is bounded by `RpcPool.Redirect` `maxBytes` (16 MiB by default). A fetch that fails, or a URL the endpoint does not allow (`https:` for `wss:`), fails the call with `REDIRECT_FAILED`.
+- `maxQueued` (64 by default) bounds the calls waiting for a connection; a call beyond it fails at once with `LIMIT_EXCEEDED`. `idleTimeout` (60 s by default, 0 keeps the connections) closes a connection with no call. `stats()` reports the connections, the calls in flight and waiting, and the redirect fetches.
+- `close()` closes every connection: the calls waiting fail with `CANCELLED`, the calls on the wire with `IOException`.
+
 ## Refreshing the connection token on demand
 
 `Client.refresh(token, callback)` replaces the connection token now, without waiting for the server to ask for one. On success the callback gets the identity the server reports, and the refresh timer is rescheduled from the new TTL. The token of the connection is replaced only by a token the server accepted. An error is passed to the callback unchanged, with its code and metadata. The connection, its identity and its refresh timer stay as they were, and the refresh is not retried: the caller asked for it, so the caller decides. `rpc` calls issued while a refresh is in progress wait for its reply. A refresh with the same token as a pending refresh shares its command. A refresh made while the client is not connected sets the token the next connect sends, and the previous token is restored when the server refuses that refresh. At most 32 refreshes are in progress; a refresh beyond that fails at once with `ReplyError.LIMIT_EXCEEDED` (16). When the connection drops during a refresh, the refresh in flight fails with an `IOException`. A refresh which waits behind it is not failed: its command goes out with the next connect, and its callback gets that refresh's result. The `rpc` calls which waited for a refresh stay queued until then, and go out after the reconnect. The token of a refresh made while disconnected stays for the next connect.
@@ -207,9 +230,11 @@ The client reports the calls it did not send, or cancelled, with the codes of `R
 |---|---|---|
 | 15 | `UNSUPPORTED` | the call was not sent: the connection cannot carry what it asks for (headers, or a cancel) |
 | 16 | `LIMIT_EXCEEDED` | the call was not sent: the calls of a client with an instance reached `Options.setMaxPendingRpc`, or the refreshes in progress reached 32 |
-| 17 | `CANCELLED` | the call was cancelled with `RpcCall.cancel()`: a call which was not sent yet is never sent |
+| 17 | `CANCELLED` | the call was cancelled with `RpcCall.cancel()`, or `RpcPool.Call.cancel()`: a call which was not sent yet is never sent |
+| 12 | `BAD_CONFIGURATION` | the call of an `RpcPool` was refused: an option of the call, or an endpoint key which resolves to no endpoint |
+| 18 | `REDIRECT_FAILED` | the redirect of an `RpcPool` call could not be fetched, see `RpcPool.RedirectHook` |
 
-Codes 15 to 19 are reserved for client-local errors of the fork SDKs; a server never sends them.
+Codes 12 and 15 to 19 are reserved for client-local errors of the fork SDKs; a server never sends them.
 
 ## CI status
 
