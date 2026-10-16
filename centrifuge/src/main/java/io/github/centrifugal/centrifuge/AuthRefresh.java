@@ -104,7 +104,7 @@ final class AuthRefresh {
 
 
     AuthRefresh(ClientHost host, int retryMinMillis, int retryMaxMillis) {
-        TokenExchangeFlow.checkExclusive(host.options());
+        TokenExchangeFlow.check(host.options());
         this.host = host;
         this.retryMinMillis = retryMinMillis;
         this.retryMaxMillis = retryMaxMillis;

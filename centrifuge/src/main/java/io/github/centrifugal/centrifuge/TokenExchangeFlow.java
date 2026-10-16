@@ -1,6 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
@@ -36,6 +37,13 @@ final class TokenExchangeFlow {
     // Renewal fires at a random share of the ttl in [RENEWAL_MIN_SHARE, RENEWAL_MIN_SHARE + RENEWAL_JITTER).
     private static final double RENEWAL_MIN_SHARE = 0.7;
     private static final double RENEWAL_JITTER = 0.2;
+
+    // The retry delay of a refused attempt within the grace, in milliseconds, and the bounds of the grace in seconds.
+    private static final int REFUSAL_RETRY_MIN_MILLIS = 1000;
+    private static final int REFUSAL_RETRY_MAX_MILLIS = 8000;
+    private static final int GRACE_MAX_SECONDS = 300;
+    // The cause of the retry of a refused refresh token, reported as an error. It names no token.
+    private static final String REFUSED_RETRY_MESSAGE = "refresh token refused, retrying within the grace";
 
 
     // The access token of the connection and when it expires. Null when no expiry is known.
@@ -83,18 +91,37 @@ final class TokenExchangeFlow {
     private final ClientHost host;
     private final TokenExchange exchange;
     private final ConnectionTokenGetter renewalGetter;
+    // The server error names that mean a refused refresh token, copied once from the exchange.
+    private final Set<String> refusalTypes;
     private final Backoff backoff = new Backoff();
     private Expiry expiry;
     // Set by beforeConnect: the next connect reply is bootstrapped when it is anonymous.
     private boolean anonymousConnect = false;
     private Bootstrap bootstrap;
     private int bootstrapAttempt = 0;
+    // The grace in seconds: the exchange's, then the one the latest accepted exchange published.
+    private int graceSeconds;
+    // The refusal run: the deadline of its horizon, null when no run is open, and the refused attempts of the run.
+    private ScheduledFuture<?> horizon;
+    private int refusals = 0;
 
 
-    /** Rejects a client which sets both a token exchange and a token getter. Called by the client constructor. */
-    static void checkExclusive(Options opts) {
-        if (opts.getTokenExchange() != null && opts.getTokenGetter() != null) {
+    /**
+     * Rejects a client which sets both a token exchange and a token getter, or a refusal type which is null or empty.
+     * Called by the client constructor.
+     */
+    static void check(Options opts) {
+        TokenExchange exchange = opts.getTokenExchange();
+        if (exchange == null) {
+            return;
+        }
+        if (opts.getTokenGetter() != null) {
             throw new IllegalArgumentException("tokenExchange and tokenGetter are exclusive");
+        }
+        for (String type : refusalTypesOf(exchange)) {
+            if (type == null || type.isEmpty()) {
+                throw new IllegalArgumentException("refusalTypes() holds a null or empty entry");
+            }
         }
     }
 
@@ -102,6 +129,8 @@ final class TokenExchangeFlow {
     TokenExchangeFlow(ClientHost host, TokenExchange exchange) {
         this.host = host;
         this.exchange = exchange;
+        this.refusalTypes = new LinkedHashSet<>(refusalTypesOf(exchange));
+        this.graceSeconds = clampGrace(exchange.grace());
         this.renewalGetter = new ConnectionTokenGetter() {
             @Override
             public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
@@ -209,6 +238,7 @@ final class TokenExchangeFlow {
         anonymousConnect = false;
         if (clientInitiated) {
             bootstrapAttempt = 0;
+            closeRefusalRun();
         }
     }
 
@@ -249,6 +279,7 @@ final class TokenExchangeFlow {
     static void sendRpc(
             final ClientHost host,
             final WebSocket transport,
+            final Set<String> refusalTypes,
             String method,
             byte[] data,
             final ResultCallback<RPCResult> cb
@@ -261,9 +292,33 @@ final class TokenExchangeFlow {
                 .setRpc(Protocol.RPCRequest.newBuilder()
                         .setMethod(method)
                         .setData(com.google.protobuf.ByteString.copyFrom(data)));
+        final ResultCallback<RPCResult> classified = classifyRefusal(cb, refusalTypes);
         writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> {
-            host.runOrInline(() -> RpcSession.deliver(host, cb, reply, err));
+            host.runOrInline(() -> RpcSession.deliver(host, classified, reply, err));
         });
+    }
+
+
+    // The callback of an exchange rpc: a server error whose app type is a refusal type is passed on as the refusal.
+    private static ResultCallback<RPCResult> classifyRefusal(final ResultCallback<RPCResult> cb, final Set<String> refusalTypes) {
+        return (Throwable err, RPCResult result) -> {
+            if (err instanceof ReplyError && refusalTypes.contains(((ReplyError) err).getAppType())) {
+                cb.onDone(new TokenExchangeRefusedException((ReplyError) err), null);
+                return;
+            }
+            cb.onDone(err, result);
+        };
+    }
+
+
+    private static Set<String> refusalTypesOf(TokenExchange exchange) {
+        Set<String> types = exchange.refusalTypes();
+        return types == null ? Collections.<String>emptySet() : types;
+    }
+
+
+    private static int clampGrace(int seconds) {
+        return Math.max(0, Math.min(GRACE_MAX_SECONDS, seconds));
     }
 
 
@@ -278,16 +333,20 @@ final class TokenExchangeFlow {
             return true;
         }
         if (isEmptyToken(refreshToken)) {
+            if (horizon != null) {
+                // The token was removed during a refusal run: the session ends, as a refusal read again would end it.
+                endBootstrapSession();
+                return true;
+            }
             return false;
         }
-        runExchange(b, refreshToken, false);
+        runExchange(b, refreshToken);
         return true;
     }
 
 
-    // Runs one exchange of the bootstrap. The callback hops back to the client's executor. Reloaded marks the
-    // retry after a re-read of a changed refresh token: it is not retried again.
-    private void runExchange(final Bootstrap b, final String refreshToken, final boolean reloaded) {
+    // Runs one exchange of the bootstrap. The callback hops back to the client's executor.
+    private void runExchange(final Bootstrap b, final String refreshToken) {
         final AtomicBoolean called = new AtomicBoolean();
         final long generation = host.refreshGeneration();
         try {
@@ -295,16 +354,16 @@ final class TokenExchangeFlow {
                     () -> Extensions.submitOrIgnore(host.executor(), () -> onExchangeTimeout(b, called)),
                     host.timeoutMillis(),
                     TimeUnit.MILLISECONDS);
-            exchange.exchange(new TokenExchangeEvent(host, b.transport, refreshToken), (Throwable err, TokenExchangeResult result) -> {
+            exchange.exchange(new TokenExchangeEvent(host, b.transport, refreshToken, refusalTypes), (Throwable err, TokenExchangeResult result) -> {
                 if (called.compareAndSet(false, true)) {
                     host.runOrInline(() -> {
-                        onExchanged(b, refreshToken, generation, reloaded, Extensions.unwrapCompletion(err), result);
+                        onExchanged(b, refreshToken, generation, Extensions.unwrapCompletion(err), result);
                     });
                 }
             });
         } catch (RuntimeException e) {
             if (called.compareAndSet(false, true)) {
-                onExchanged(b, refreshToken, generation, reloaded, e, null);
+                onExchanged(b, refreshToken, generation, e, null);
             } else {
                 host.reportError(new TokenError(e));
             }
@@ -329,11 +388,13 @@ final class TokenExchangeFlow {
             Bootstrap b,
             String refreshToken,
             long generation,
-            boolean reloaded,
             Throwable err,
             TokenExchangeResult result
     ) {
         cancelTimer(b);
+        if (err == null) {
+            acceptedExchange(result);
+        }
         // A result which arrives after its connection went away, or after the bootstrap gave up, does not bootstrap.
         if (!isCurrent(b)) {
             storeAbandonedRotation(result, refreshToken);
@@ -341,7 +402,7 @@ final class TokenExchangeFlow {
         }
         storeRotationSince(result, refreshToken, generation);
         if (err instanceof UnauthorizedException) {
-            reloadAfterRefusal(b, refreshToken, reloaded);
+            reloadAfterRefusal(b, refreshToken);
             return;
         }
         if (err != null) {
@@ -356,38 +417,77 @@ final class TokenExchangeFlow {
     }
 
 
-    // The issuer refused the refresh token. The token is read again: a changed one is tried once more, anything
-    // else ends the session.
-    private void reloadAfterRefusal(Bootstrap b, String refreshToken, boolean reloaded) {
-        if (reloaded) {
-            bootstrapAttempt = 0;
-            host.failUnauthorized();
-            return;
-        }
+    // The issuer refused the refresh token: the refusal run goes on. The storage is read again first: a changed token is
+    // presented at once, an empty one ends the session, and the same one is presented again after the backoff, until the
+    // grace horizon has passed. A failed read throws.
+    private void reloadAfterRefusal(Bootstrap b, String refreshToken) {
+        openRefusalRun();
         String again;
         try {
-            again = reloadedToken(refreshToken);
+            again = exchange.load();
         } catch (RuntimeException e) {
             failBootstrap(b, e);
             return;
         }
-        if (again == null) {
-            bootstrapAttempt = 0;
-            host.failUnauthorized();
+        if (isEmptyToken(again)) {
+            endBootstrapSession();
             return;
         }
-        runExchange(b, again, true);
+        if (!again.equals(refreshToken)) {
+            runExchange(b, again);
+            return;
+        }
+        if (horizonPassed()) {
+            endBootstrapSession();
+            return;
+        }
+        host.reportError(new TokenError(new IllegalStateException(REFUSED_RETRY_MESSAGE)));
+        long delay = Math.min(
+                backoff.duration(refusals, REFUSAL_RETRY_MIN_MILLIS, REFUSAL_RETRY_MAX_MILLIS),
+                horizon.getDelay(TimeUnit.MILLISECONDS));
+        refusals++;
+        scheduleRetry(b, delay);
     }
 
 
-    // The refresh token read again after a refusal of the used one. Null when the read gives no token or the same one.
-    // A failed read throws.
-    private String reloadedToken(String used) {
-        String again = exchange.load();
-        if (isEmptyToken(again) || again.equals(used)) {
-            return null;
+    // The session ends: the run is closed, and the bootstrap backoff starts afresh with the next connect.
+    private void endBootstrapSession() {
+        bootstrapAttempt = 0;
+        closeRefusalRun();
+        host.failUnauthorized();
+    }
+
+
+    // Opens the refusal run at its first refusal. Its horizon is the grace, timed on the scheduler's own monotonic clock.
+    private void openRefusalRun() {
+        if (horizon == null) {
+            horizon = host.scheduler().schedule(() -> {}, graceSeconds, TimeUnit.SECONDS);
         }
-        return again;
+    }
+
+
+    // Whether the horizon of the open run has passed.
+    private boolean horizonPassed() {
+        return horizon.getDelay(TimeUnit.MILLISECONDS) <= 0;
+    }
+
+
+    // Ends the refusal run: its horizon is cancelled and its count of refused attempts starts again at zero.
+    private void closeRefusalRun() {
+        if (horizon != null) {
+            horizon.cancel(false);
+            horizon = null;
+        }
+        refusals = 0;
+    }
+
+
+    // An accepted exchange ends the refusal run, and the grace the issuer published with it is kept for the next run.
+    private void acceptedExchange(TokenExchangeResult result) {
+        closeRefusalRun();
+        if (result != null && result.getGrace() >= 0) {
+            graceSeconds = clampGrace(result.getGrace());
+        }
     }
 
 
@@ -488,6 +588,11 @@ final class TokenExchangeFlow {
     private void scheduleBootstrapRetry(final Bootstrap b) {
         long delay = backoff.duration(bootstrapAttempt, BOOTSTRAP_RETRY_MIN_MILLIS, BOOTSTRAP_RETRY_MAX_MILLIS);
         bootstrapAttempt++;
+        scheduleRetry(b, delay);
+    }
+
+
+    private void scheduleRetry(final Bootstrap b, long delay) {
         b.timer = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> onRetry(b)), delay, TimeUnit.MILLISECONDS);
     }
 
@@ -593,10 +698,11 @@ final class TokenExchangeFlow {
             return;
         }
         if (isEmptyToken(refreshToken)) {
+            closeRefusalRun();
             cb.Done(new UnauthorizedException(), null);
             return;
         }
-        runRenewal(transport, cb, refreshToken, false, generation);
+        runRenewal(transport, cb, refreshToken, generation);
     }
 
 
@@ -606,7 +712,6 @@ final class TokenExchangeFlow {
             final WebSocket transport,
             final TokenCallback cb,
             final String refreshToken,
-            final boolean reloaded,
             final long generation
     ) {
         final Renewal renewal = new Renewal();
@@ -615,7 +720,7 @@ final class TokenExchangeFlow {
                     () -> Extensions.submitOrIgnore(host.executor(), () -> onRenewalTimeout(cb, renewal)),
                     host.timeoutMillis(),
                     TimeUnit.MILLISECONDS);
-            exchange.exchange(new TokenExchangeEvent(host, transport, refreshToken), (Throwable err, TokenExchangeResult result) -> {
+            exchange.exchange(new TokenExchangeEvent(host, transport, refreshToken, refusalTypes), (Throwable err, TokenExchangeResult result) -> {
                 if (renewal.called.compareAndSet(false, true)) {
                     host.runOrInline(() -> {
                         onRenewed(
@@ -623,19 +728,23 @@ final class TokenExchangeFlow {
                                 transport,
                                 cb,
                                 refreshToken,
-                                reloaded,
                                 generation,
                                 Extensions.unwrapCompletion(err),
                                 result
                         );
                     });
                 } else {
-                    host.runOrInline(() -> storeAbandonedRotation(result, refreshToken));
+                    host.runOrInline(() -> {
+                        if (err == null) {
+                            acceptedExchange(result);
+                        }
+                        storeAbandonedRotation(result, refreshToken);
+                    });
                 }
             });
         } catch (RuntimeException e) {
             if (renewal.called.compareAndSet(false, true)) {
-                onRenewed(renewal, transport, cb, refreshToken, reloaded, generation, e, null);
+                onRenewed(renewal, transport, cb, refreshToken, generation, e, null);
             } else {
                 host.reportError(new TokenError(e));
             }
@@ -656,13 +765,15 @@ final class TokenExchangeFlow {
             WebSocket transport,
             TokenCallback cb,
             String refreshToken,
-            boolean reloaded,
             long generation,
             Throwable err,
             TokenExchangeResult result
     ) {
         if (renewal.deadline != null) {
             renewal.deadline.cancel(false);
+        }
+        if (err == null) {
+            acceptedExchange(result);
         }
         // The renewal result of a connection which went away is not used, but its rotation is stored as the bootstrap's is.
         if (transport != host.transport() || host.state() != ClientState.CONNECTED) {
@@ -672,22 +783,30 @@ final class TokenExchangeFlow {
         }
         storeRotationSince(result, refreshToken, generation);
         if (err instanceof UnauthorizedException) {
-            if (reloaded) {
-                cb.Done(err, null);
-                return;
-            }
+            openRefusalRun();
             String again;
             try {
-                again = reloadedToken(refreshToken);
+                again = exchange.load();
             } catch (RuntimeException e) {
                 cb.Done(e, null);
                 return;
             }
-            if (again == null) {
+            if (isEmptyToken(again)) {
+                closeRefusalRun();
                 cb.Done(new UnauthorizedException(), null);
                 return;
             }
-            runRenewal(transport, cb, again, true, generation);
+            if (!again.equals(refreshToken)) {
+                runRenewal(transport, cb, again, generation);
+                return;
+            }
+            if (horizonPassed()) {
+                closeRefusalRun();
+                cb.Done(new UnauthorizedException(), null);
+                return;
+            }
+            // Within the grace: the fetch fails with a retryable error, and the next fetch reads the storage again.
+            cb.Done(new IllegalStateException(REFUSED_RETRY_MESSAGE), null);
             return;
         }
         if (err != null) {

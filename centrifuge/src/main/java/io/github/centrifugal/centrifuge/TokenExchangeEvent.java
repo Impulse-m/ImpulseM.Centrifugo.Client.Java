@@ -1,6 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
 import java.util.Objects;
+import java.util.Set;
 
 import okhttp3.WebSocket;
 
@@ -13,12 +14,14 @@ public final class TokenExchangeEvent {
     private final ClientHost host;
     private final WebSocket transport;
     private final String refreshToken;
+    private final Set<String> refusalTypes;
 
 
-    TokenExchangeEvent(ClientHost host, WebSocket transport, String refreshToken) {
+    TokenExchangeEvent(ClientHost host, WebSocket transport, String refreshToken, Set<String> refusalTypes) {
         this.host = host;
         this.transport = transport;
         this.refreshToken = refreshToken;
+        this.refusalTypes = refusalTypes;
     }
 
 
@@ -43,6 +46,6 @@ public final class TokenExchangeEvent {
     public void rpc(final String method, final byte[] data, final ResultCallback<RPCResult> cb) {
         Objects.requireNonNull(method, "method");
         Objects.requireNonNull(data, "data");
-        host.runOrInline(() -> TokenExchangeFlow.sendRpc(host, transport, method, data, cb));
+        host.runOrInline(() -> TokenExchangeFlow.sendRpc(host, transport, refusalTypes, method, data, cb));
     }
 }
