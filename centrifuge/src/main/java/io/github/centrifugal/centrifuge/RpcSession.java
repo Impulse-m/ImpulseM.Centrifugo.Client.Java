@@ -9,6 +9,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.RejectedExecutionException;
@@ -59,11 +60,14 @@ final class RpcSession {
 
     // A call whose msg_id the server refused is sent again this many times, each time with a new msg_id.
     private static final int NEW_ID_RESENDS = 2;
-    // A call the server refused for now is sent again this many times: after 250 ms, 500 ms and 1 s.
+    // A call the server refused for now is sent again this many times, after a random delay: its n-th
+    // resend waits at most 250 ms * 2^n (n = 0, 1, 2), so at most 250 ms, 500 ms and 1 s.
     private static final int LATER_RESENDS = 3;
-    private static final long LATER_BASE_NANOS = TimeUnit.MILLISECONDS.toNanos(250L);
+    private static final long LATER_BASE_MILLIS = 250L;
 
     private final ClientHost host;
+    // The source of the random delays of the later resends.
+    private final Random random;
     // Calls which wait for the connection or for a refresh, and calls lost with their transport.
     private final RpcQueue queue;
     // Calls written to the current transport, by the id of their command.
@@ -85,10 +89,11 @@ final class RpcSession {
     private final AtomicInteger pending = new AtomicInteger();
 
 
-    RpcSession(ClientHost host, int maxPending) {
+    RpcSession(ClientHost host, int maxPending, Random random) {
         this.host = host;
         this.queue = new RpcQueue();
         this.maxPending = maxPending;
+        this.random = random;
     }
 
 
@@ -577,7 +582,7 @@ final class RpcSession {
         if (Extensions.RPC_RETRY_LATER.equals(signal) && call.laterResends < LATER_RESENDS) {
             // The delay is capped at the remaining deadline, so a resend due after the deadline falls on the deadline
             // itself: the deadline then rejects the call with a timeout and cancels it, as it does for a sent call.
-            long delayNanos = Math.min(LATER_BASE_NANOS << call.laterResends, remainingNanos);
+            long delayNanos = Math.min(TimeUnit.MILLISECONDS.toNanos(laterDelayMillis(random, call.laterResends)), remainingNanos);
             call.laterResends++;
             scheduleResend(call, delayNanos);
             return true;
@@ -605,6 +610,14 @@ final class RpcSession {
         // The new msg_id is not on the wire yet: until it is, a timeout sends no cancel for it.
         call.wireTracked = false;
         writeOrQueue(call);
+    }
+
+
+    // The delay of the resend after the given number of later resends: full jitter, uniform in
+    // [0, 250 ms * 2^resends] in milliseconds, both ends included.
+    static long laterDelayMillis(Random random, int resends) {
+        int boundMillis = (int) (LATER_BASE_MILLIS << resends);
+        return random.nextInt(boundMillis + 1);
     }
 
 
