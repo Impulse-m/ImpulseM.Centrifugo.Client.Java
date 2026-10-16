@@ -42,6 +42,11 @@ public class ReplyError extends Throwable {
 
     private int code;
 
+    // The error of a call which the client cancelled: the same error on every path of the client.
+    static ReplyError cancelled() {
+        return new ReplyError(CANCELLED, "rpc call cancelled", false);
+    }
+
     public ReplyError(int code, String message, boolean temporary) {
         this(code, message, temporary, 0, "", Collections.<String, String>emptyMap());
     }

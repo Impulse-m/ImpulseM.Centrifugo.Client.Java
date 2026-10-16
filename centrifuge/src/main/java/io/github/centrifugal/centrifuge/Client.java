@@ -16,7 +16,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.UnaryOperator;
 import javax.net.ssl.SSLSocketFactory;
@@ -155,13 +154,7 @@ public class Client {
     // A cancelled timer leaves the queue at once. Otherwise a cancelled rpc deadline keeps its call alive until
     // its delay ends. The policy is missing below Android API 21, where the cancelled timers stay queued.
     private static ScheduledExecutorService createScheduler() {
-        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1);
-        try {
-            scheduler.setRemoveOnCancelPolicy(true);
-        } catch (NoSuchMethodError e) {
-            // The policy is not in this platform's runtime: the cancelled timers stay queued until their delay ends.
-        }
-        return scheduler;
+        return Extensions.newScheduler(Executors.defaultThreadFactory());
     }
 
     // The retry bounds, the scheduler and the random delays of the rpc resends are parameters, so that the tests control them.
@@ -1347,6 +1340,8 @@ public class Client {
 
     /**
      * Send RPC with method to server, process result in callback.
+     *
+     * The array must not change until the callback: the call may wait before it is sent.
      *
      * @param method: of RPC call.
      * @param data:   a custom payload for RPC call.

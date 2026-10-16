@@ -23,6 +23,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
+import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import okhttp3.Callback;
 import okhttp3.OkHttpClient;
 import okhttp3.Response;
@@ -57,13 +58,16 @@ public final class RpcPool {
         /**
          * The redirect of the outcome of an attempt, or null when the outcome is no redirect. Called
          * once for the outcome which settles the call, a reply or an error, but not for a cancel, a
-         * close or the deadline.
+         * close, or a deadline: the deadline of the call and the timeout of its attempt.
          */
         Redirect redirect(RPCResult reply, Throwable error);
     }
 
 
-    /** Receives the errors of the connections: a disconnect for a frame over the size limit of the server. */
+    /**
+     * Receives the disconnects of the connections which the client closed for good: a frame over the size limit of
+     * the server, or another close after which the client does not reconnect.
+     */
     public interface ErrorListener {
         void onError(String endpoint, Throwable error);
     }
@@ -486,6 +490,8 @@ public final class RpcPool {
     }
 
 
+    private static final Backoff BACKOFF = new Backoff();
+
     private final EndpointResolver resolver;
     private final Options options;
     private final String affinityHeader;
@@ -511,7 +517,7 @@ public final class RpcPool {
     private final Map<String, List<RpcPoolEndpoint>> resolved = new HashMap<>();
     private final Map<String, RpcPoolEndpoint> endpoints = new HashMap<>();
     private final Deque<RpcPoolCall> redirectWaiting = new ArrayDeque<>();
-    private OkHttpClient defaultHttpClient;
+    private OkHttpClient fetchHttpClient;
     private int redirectsInflight;
     private boolean closed;
 
@@ -544,12 +550,7 @@ public final class RpcPool {
             poolThread.set(thread);
             return thread;
         };
-        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, factory);
-        try {
-            executor.setRemoveOnCancelPolicy(true);
-        } catch (NoSuchMethodError e) {
-            // The policy is not in this platform's runtime: the cancelled timers stay queued until their delay ends.
-        }
+        ScheduledThreadPoolExecutor executor = Extensions.newScheduler(factory);
         executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         return executor;
     }
@@ -559,6 +560,8 @@ public final class RpcPool {
      * Sends the call to an endpoint of its key, and returns it. The callback gets the reply or the error:
      * a {@link ReplyError} of the server or of the pool, {@link java.util.concurrent.TimeoutException} at the deadline,
      * or an {@link IOException} when the connection of the call was lost and the call could not be sent again.
+     * The data is read when the call is sent, which can be after it waited in the queue: the array must not change
+     * until the callback.
      *
      * @throws NullPointerException when the method, the data or the callback is null.
      */
@@ -569,7 +572,7 @@ public final class RpcPool {
         CallOptions opts = callOptions != null ? callOptions : CallOptions.NONE;
         long timeout = opts.getTimeout() > 0 ? opts.getTimeout() : options.getTimeout();
         final RpcPoolCall call = new RpcPoolCall(method, data, opts.getEndpointKey(), opts.getHeaders(), opts.getAffinity(), timeout, cb);
-        Extensions.submitOrRun(executor, () -> start(call), () -> call.callback.onDone(cancelledError(), null));
+        Extensions.submitOrRun(executor, () -> start(call), () -> call.callback.onDone(ReplyError.cancelled(), null));
         return new Call(this, call);
     }
 
@@ -605,7 +608,7 @@ public final class RpcPool {
 
     // Called on the pool's thread by a call's cancel.
     void cancel(RpcPoolCall call) {
-        Extensions.submitOrIgnore(executor, () -> settle(call, null, cancelledError()));
+        Extensions.submitOrIgnore(executor, () -> settle(call, null, ReplyError.cancelled()));
     }
 
 
@@ -625,6 +628,7 @@ public final class RpcPool {
     void onConnected(RpcPoolConnection conn) {
         if (!conn.removed) {
             conn.connecting = false;
+            conn.endpoint.closes = 0;
             pump();
             if (!conn.removed && conn.calls.isEmpty()) {
                 scheduleIdle(conn);
@@ -634,7 +638,9 @@ public final class RpcPool {
 
 
     // The connection is gone for good: the client does not reconnect it. A frame over the size limit settles
-    // the calls on the wire with no resend, since the chunk would be over the limit again.
+    // the calls on the wire with no resend, since the chunk would be over the limit again, and opens no replacement.
+    // Any other close is reported, and holds the opens of the endpoint back for a backoff delay: the calls on the
+    // wire are sent again as their attempts end, and a server which closes each connection at once is not dialled in a loop.
     void onDisconnected(RpcPoolConnection conn, int code, String reason) {
         if (conn.removed) {
             return;
@@ -649,23 +655,41 @@ public final class RpcPool {
                 finishAttempt(call, null, new IOException(reason));
             }
         } else {
-            // The calls on the wire fail with the lost connection, and are sent again on another one.
+            report(conn.endpoint.url(), new IOException(reason));
             remove(conn);
+            hold(conn.endpoint);
         }
+        pump();
+    }
+
+
+    // Holds the opens of the endpoint for the next backoff delay, which grows with each close until a connection connects.
+    private void hold(RpcPoolEndpoint endpoint) {
+        long delayMillis = BACKOFF.duration(endpoint.closes, options.getMinReconnectDelay(), options.getMaxReconnectDelay());
+        endpoint.closes++;
+        if (endpoint.holdTask != null) {
+            endpoint.holdTask.cancel(false);
+        }
+        endpoint.holdTask = executor.schedule(() -> onHoldEnd(endpoint), delayMillis, TimeUnit.MILLISECONDS);
+    }
+
+
+    private void onHoldEnd(RpcPoolEndpoint endpoint) {
+        endpoint.holdTask = null;
         pump();
     }
 
 
     private void start(RpcPoolCall call) {
         if (closed) {
-            settle(call, null, cancelledError());
+            settle(call, null, ReplyError.cancelled());
             return;
         }
         if (call.affinity != null && affinityHeader == null) {
             settle(call, null, badConfiguration("affinity needs the affinityHeader option"));
             return;
         }
-        if (call.affinity != null && call.headers.containsKey(affinityHeader)) {
+        if (call.affinity != null && hasHeaderIgnoreCase(call.headers, affinityHeader)) {
             settle(call, null, badConfiguration("affinity header is given as a header of the call"));
             return;
         }
@@ -686,12 +710,23 @@ public final class RpcPool {
         if (queue.isEmpty() && tryAssign(call, eps)) {
             return;
         }
-        if (queue.size() >= maxQueued) {
+        // The queue bound applies to a call which cannot open a connection: a call which can is queued and opens one.
+        if (queue.size() >= maxQueued && openable(eps) == null) {
             settle(call, null, new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls are waiting", false));
             return;
         }
         enqueue(call);
         pump();
+    }
+
+
+    private static boolean hasHeaderIgnoreCase(Map<String, String> headers, String name) {
+        for (String key : headers.keySet()) {
+            if (key.equalsIgnoreCase(name)) {
+                return true;
+            }
+        }
+        return false;
     }
 
 
@@ -780,19 +815,31 @@ public final class RpcPool {
 
     // Opens a connection to the first endpoint which has room for one and has none connecting: the opens of an endpoint are serialised.
     private void openFor(List<RpcPoolEndpoint> eps) {
-        for (RpcPoolEndpoint endpoint : eps) {
-            if (endpoint.connections().size() < maxConnectionsPerEndpoint && !endpoint.hasConnecting()) {
-                open(endpoint);
-                return;
-            }
+        RpcPoolEndpoint endpoint = openable(eps);
+        if (endpoint != null) {
+            open(endpoint);
         }
     }
 
 
+    // The first endpoint of the list which may open a connection now, or null when none may.
+    private RpcPoolEndpoint openable(List<RpcPoolEndpoint> eps) {
+        for (RpcPoolEndpoint endpoint : eps) {
+            if (endpoint.connections().size() < maxConnectionsPerEndpoint && !endpoint.hasConnecting() && !endpoint.isHeld()) {
+                return endpoint;
+            }
+        }
+        return null;
+    }
+
+
+    // A connection with no call is closed after the idle timeout from the open, so that a connection whose calls all
+    // time out while it connects does not stay open.
     private void open(RpcPoolEndpoint endpoint) {
         RpcPoolConnection conn = new RpcPoolConnection(this, endpoint, options);
         endpoint.connections().add(conn);
         conn.connect();
+        scheduleIdle(conn);
     }
 
 
@@ -847,7 +894,7 @@ public final class RpcPool {
 
     private void onReplyError(RpcPoolCall call, ReplyError error) {
         if (canResend(call)) {
-            if (Extensions.RPC_RETRY_LATER.equals(Extensions.retrySignal(error.getMetadata()))) {
+            if (Extensions.RPC_RETRY_LATER.equals(error.getMetadata().get(Extensions.RPC_RETRY_METADATA_KEY))) {
                 scheduleLater(call);
                 return;
             }
@@ -906,7 +953,8 @@ public final class RpcPool {
         if (call.settled) {
             return;
         }
-        RpcPool.Redirect target = consultRedirect(call, result, error);
+        // The client's own deadline of the attempt is not a server outcome: the hook is not asked about it.
+        RpcPool.Redirect target = error instanceof TimeoutException ? null : consultRedirect(call, result, error);
         if (target == null) {
             settle(call, result, error);
             return;
@@ -948,6 +996,8 @@ public final class RpcPool {
                     body = RpcPoolRedirect.readBody(response, maxBytes);
                 } catch (IOException e) {
                     failure = e;
+                } catch (RuntimeException e) {
+                    failure = new IOException("redirect body could not be read", e);
                 } finally {
                     response.close();
                 }
@@ -1119,7 +1169,7 @@ public final class RpcPool {
             if (call.connection != null) {
                 settle(call, null, new IOException("rpc pool closed"));
             } else {
-                settle(call, null, cancelledError());
+                settle(call, null, ReplyError.cancelled());
             }
         }
         for (RpcPoolEndpoint endpoint : endpoints.values()) {
@@ -1144,14 +1194,13 @@ public final class RpcPool {
     }
 
 
+    // A redirect is never followed across schemes: the body of a secure endpoint is not fetched over plain HTTP.
     private OkHttpClient fetchClient() {
-        if (httpClient != null) {
-            return httpClient;
+        if (fetchHttpClient == null) {
+            OkHttpClient base = httpClient != null ? httpClient : new OkHttpClient();
+            fetchHttpClient = base.newBuilder().followSslRedirects(false).build();
         }
-        if (defaultHttpClient == null) {
-            defaultHttpClient = new OkHttpClient();
-        }
-        return defaultHttpClient;
+        return fetchHttpClient;
     }
 
 
@@ -1172,7 +1221,4 @@ public final class RpcPool {
     }
 
 
-    private static ReplyError cancelledError() {
-        return new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false);
-    }
 }
