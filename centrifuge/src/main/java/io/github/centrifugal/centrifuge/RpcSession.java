@@ -521,9 +521,9 @@ final class RpcSession {
             // failure is reported. Every Throwable is caught here on purpose: an Error which ended the flush would leave the
             // calls queued for the connect waiting. A call's write is caught alike in writeOrQueue, and its future takes the failure.
             // The report runs on the executor after the current task: the caller still writes its commands, and a listener may
-            // call rpcCall or disconnect, and neither may overtake them.
+            // call rpcCall or disconnect, and neither may overtake them. Once the executor is shut down the failure is printed instead.
             sent = false;
-            Extensions.submitOrIgnore(host.executor(), () -> host.reportUnclassified(e));
+            Extensions.submitOrRun(host.executor(), () -> host.reportUnclassified(e), e::printStackTrace);
         }
         if (sent) {
             // The reply is handled on the executor, after this task, so the timer is set before it can come.
