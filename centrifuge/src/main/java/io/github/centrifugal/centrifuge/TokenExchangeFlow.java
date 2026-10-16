@@ -438,11 +438,7 @@ final class TokenExchangeFlow {
             endBootstrapSession();
             return;
         }
-        if (!again.equals(refreshToken)) {
-            if (!mayPresentChanged()) {
-                endBootstrapSession();
-                return;
-            }
+        if (!again.equals(refreshToken) && mayPresentChanged()) {
             runExchange(b, again);
             return;
         }
@@ -468,9 +464,11 @@ final class TokenExchangeFlow {
 
 
     // Opens the refusal run at its first refusal. Its horizon is the grace, timed on the scheduler's own monotonic clock.
-    // A closed client schedules nothing: its scheduler may be shut down.
+    // Only a refusal of a connection which is still going on opens one: the state is CONNECTING after a transport loss,
+    // and a refusal which arrives after the application disconnected or closed the client belongs to a session that ended.
     private void openRefusalRun() {
-        if (horizon == null && host.state() != ClientState.CLOSED) {
+        ClientState state = host.state();
+        if (horizon == null && (state == ClientState.CONNECTING || state == ClientState.CONNECTED)) {
             horizon = host.scheduler().schedule(() -> {}, graceSeconds, TimeUnit.SECONDS);
         }
     }
@@ -482,10 +480,11 @@ final class TokenExchangeFlow {
     }
 
 
-    // Whether a changed refresh token may be presented at once. The first one of a run always may, as a grace of zero
-    // needs it; later ones only while the horizon is open, so a storage which keeps changing cannot extend the run.
+    // Whether a changed refresh token may be presented at once. Only the first one of a run may: the winner/loser race
+    // needs that one. Later changed values wait for the backoff like an unchanged one, so a storage which keeps changing
+    // cannot make the run exchange back to back within the grace.
     private boolean mayPresentChanged() {
-        if (changedPresents > 0 && horizonPassed()) {
+        if (changedPresents > 0) {
             return false;
         }
         changedPresents++;
@@ -504,11 +503,14 @@ final class TokenExchangeFlow {
     }
 
 
-    // An accepted exchange ends the refusal run, and the grace the issuer published with it is kept for the next run.
+    // An accepted exchange ends the refusal run. The grace is the one the result published, kept for the next run; a result
+    // without one (a negative value is the absent marker) falls back to the option's grace, not to the last published one.
     private void acceptedExchange(TokenExchangeResult result) {
         closeRefusalRun();
         if (result != null && result.getGrace() >= 0) {
             graceSeconds = clampGrace(result.getGrace());
+        } else {
+            graceSeconds = clampGrace(exchange.grace());
         }
     }
 
@@ -824,12 +826,7 @@ final class TokenExchangeFlow {
                 cb.Done(new UnauthorizedException(), null);
                 return;
             }
-            if (!again.equals(refreshToken)) {
-                if (!mayPresentChanged()) {
-                    closeRefusalRun();
-                    cb.Done(new UnauthorizedException(), null);
-                    return;
-                }
+            if (!again.equals(refreshToken) && mayPresentChanged()) {
                 runRenewal(transport, cb, again, generation);
                 return;
             }

@@ -656,10 +656,109 @@ public class TokenExchangeTest extends RpcTestBase {
         newExchangeClient(exchangeOptions(storage), clock);
 
         client.connect();
-        awaitCondition("disconnected", () -> disconnects.size() == 1);
+        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1);
         assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
-        // The first changed token is presented at once, the later ones only inside the horizon: the run ends at it.
+        // The first changed token is presented at once; the later ones wait for the backoff, which the clock moves past.
         assertTrue(storage.exchanged.size() <= 4);
+    }
+
+
+    @Test
+    public void changedValuesAfterTheFirstWaitForTheBackoffWhileTheClockStands() throws Exception {
+        // The storage returns a new value on every read and the issuer refuses each attempt at once. The clock does not
+        // move: only the first changed value is presented at once, and the next one waits for the backoff of the run.
+        ManualScheduler clock = new ManualScheduler();
+        AtomicInteger loads = new AtomicInteger();
+        Storage storage = new Storage("refresh-0") {
+            @Override
+            public String load() {
+                return "refresh-" + loads.incrementAndGet();
+            }
+
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                exchanged.add(event.getRefreshToken());
+                cb.onDone(new UnauthorizedException(), null);
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+
+        client.connect();
+        awaitCondition("refusal reported", () -> !errors.isEmpty());
+        drainExecutor();
+        assertEquals(Arrays.asList("refresh-1", "refresh-2"), storage.exchanged);
+        assertTrue(disconnects.isEmpty());
+
+        // The retry comes after the backoff, and presents the value read then, once more and no sooner.
+        clock.advance(2000);
+        drainExecutor();
+        assertEquals(3, storage.exchanged.size());
+        assertTrue(disconnects.isEmpty());
+    }
+
+
+    @Test
+    public void refusalAfterDisconnectOpensNoRun() throws Exception {
+        // The application disconnects, then logs out: the held exchange is refused after both. No run may survive them,
+        // or the anonymous connect that follows would end the session on an empty storage.
+        ManualScheduler clock = new ManualScheduler();
+        answerIdentity(false, 0);
+        StallingStorage storage = new StallingStorage("refresh-1");
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("first exchange started", () -> storage.held != null);
+
+        client.disconnect();
+        awaitCondition("disconnected", () -> client.getState() == ClientState.DISCONNECTED);
+        storage.refreshToken = "";
+        storage.held.onDone(new UnauthorizedException(), null);
+        drainExecutor();
+        assertNull(horizonOf());
+
+        client.connect();
+        awaitCondition("connected anonymously", () -> connected.size() == 1);
+        assertEquals(0, disconnects.stream().filter((DisconnectedEvent event) -> event.getCode() == CODE_DISCONNECT_UNAUTHORIZED).count());
+        // The empty storage is read, and nothing is presented to the issuer: the connect went on anonymously.
+        assertEquals(Collections.singletonList("refresh-1"), storage.exchanged);
+    }
+
+
+    @Test
+    public void graceOfTheOptionReturnsWhenAResultPublishesNone() throws Exception {
+        // The first result publishes a grace of 300 s, the second publishes none: the refusal run then takes the option's 7 s.
+        ManualScheduler clock = new ManualScheduler();
+        answerIdentity(false, 0);
+        AtomicInteger calls = new AtomicInteger();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public int grace() {
+                return 7;
+            }
+
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                exchanged.add(event.getRefreshToken());
+                int call = calls.incrementAndGet();
+                if (call == 1) {
+                    cb.onDone(null, new TokenExchangeResult("access-1", "refresh-2", 300));
+                    return;
+                }
+                if (call == 2) {
+                    cb.onDone(null, new TokenExchangeResult("access-2", "refresh-3"));
+                    return;
+                }
+                cb.onDone(new UnauthorizedException(), null);
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("connected", () -> connected.size() == 1);
+
+        server.closeConnection();
+        pumpUntil(clock, "second connected", () -> connected.size() == 2);
+        server.closeConnection();
+        pumpUntil(clock, "horizon of the option", () -> clock.requestedDelays().contains(7000L));
+        assertFalse(clock.requestedDelays().contains(300000L));
     }
 
 
