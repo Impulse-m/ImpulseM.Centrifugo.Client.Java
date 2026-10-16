@@ -20,6 +20,8 @@ import java.util.function.BooleanSupplier;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
+import java8.util.concurrent.CompletionException;
+
 import okhttp3.WebSocket;
 import org.junit.Before;
 import org.junit.Test;
@@ -39,7 +41,7 @@ import static org.junit.Assert.fail;
  * not rotate); the refresh command of the bootstrap or the renewal is answered by the fake server's refresh
  * result.
  */
-public class TokenExchangeTest extends FakeServerTestBase {
+public class TokenExchangeTest extends RpcTestBase {
     private static final String METHOD = "exchange";
     private static final String ECHO = "echo";
     private static final int TTL_SECONDS = 10;
@@ -158,7 +160,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertEquals(Arrays.asList("connect", "rpc:" + METHOD, "refresh"), kinds());
         assertEquals("", connectTokens().get(0));
         assertEquals("access-1", lastRefreshToken());
@@ -192,7 +194,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertEquals(Arrays.asList("store:refresh-2", "refresh"), log);
     }
 
@@ -206,7 +208,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertEquals("access-1", lastRefreshToken());
         assertTrue(storage.stored.isEmpty());
     }
@@ -221,7 +223,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertTrue(storage.stored.isEmpty());
     }
 
@@ -233,7 +235,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         answerIdentity(false, 0);
         newClient(exchangeOptions(storage));
         client.connect();
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         // The server identifies a connect which carries a valid token, so its reply carries the user.
         server.connectResult = server.connectResult.toBuilder()
                 .setUser("u1")
@@ -242,7 +244,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         server.closeConnection();
 
-        awaitUntil("reconnected", () -> connected.size() == 2);
+        awaitCondition("reconnected", () -> connected.size() == 2);
         assertEquals("access-1", connectTokens().get(connectTokens().size() - 1));
         assertEquals(Arrays.asList("connect", "rpc:" + METHOD, "refresh", "connect"), kinds());
         assertEquals(1, storage.exchanged.size());
@@ -260,7 +262,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertEquals(Arrays.asList("connect", "rpc:" + METHOD, "refresh"), kinds());
         assertEquals("cached-token", connectTokens().get(0));
         assertEquals("access-1", lastRefreshToken());
@@ -282,7 +284,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertEquals(Arrays.asList("connect"), kinds());
         assertEquals("proxy-user", connected.get(0).getUser());
         assertEquals(1, auths.size());
@@ -302,11 +304,11 @@ public class TokenExchangeTest extends FakeServerTestBase {
         options.setMaxReconnectDelay(2000);
         newClient(options);
         client.connect();
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
 
         server.closeConnection();
 
-        awaitUntil("reconnected", () -> connected.size() == 2);
+        awaitCondition("reconnected", () -> connected.size() == 2);
         assertEquals("", connectTokens().get(connectTokens().size() - 1));
         assertEquals(2, storage.exchanged.size());
         assertTrue(errors.isEmpty());
@@ -329,11 +331,11 @@ public class TokenExchangeTest extends FakeServerTestBase {
         };
         newClient(exchangeOptions(storage));
         client.connect();
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
 
         server.closeConnection();
 
-        awaitUntil("connected again", () -> connected.size() == 2);
+        awaitCondition("connected again", () -> connected.size() == 2);
         assertEquals(2, storage.exchanged.size());
         assertEquals(1, errors.size());
         assertEquals(CODE_TOKEN_EXPIRED, ((ReplyError) errors.get(0)).getCode());
@@ -349,7 +351,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         answerIdentity(true, TTL_SECONDS);
         newClientOnClock(exchangeOptions(storage), clock);
         client.connect();
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         long delay = renewalDelay(clock);
         assertTrue("renewal delay " + delay, delay >= WINDOW_MIN_MILLIS && delay <= WINDOW_MAX_MILLIS);
 
@@ -358,7 +360,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         drainExecutor();
         assertEquals("no renewal before the window", 1, storage.exchanged.size());
         clock.advance(300);
-        awaitUntil("renewed", () -> refreshTokens().size() == 2);
+        awaitCondition("renewed", () -> refreshTokens().size() == 2);
 
         assertEquals(Arrays.asList("access-1", "access-2"), refreshTokens());
         assertEquals(Arrays.asList("refresh-2", "refresh-3"), storage.stored);
@@ -376,7 +378,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
             newClientOnClock(exchangeOptions(new Storage("refresh-1")), clock);
             client.connect();
             final int expected = run + 1;
-            awaitUntil("connected", () -> connected.size() == expected);
+            awaitCondition("connected", () -> connected.size() == expected);
             long delay = renewalDelay(clock);
             assertTrue("renewal delay " + delay, delay >= WINDOW_MIN_MILLIS && delay <= WINDOW_MAX_MILLIS);
             client.close(1000);
@@ -398,12 +400,57 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("disconnected", () -> disconnects.size() == 1);
+        awaitCondition("disconnected", () -> disconnects.size() == 1);
         assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
         assertEquals(ClientState.DISCONNECTED, client.getState());
         assertTrue(storage.stored.isEmpty());
         clock.advance(60000);
         assertEquals("no reconnect", 1, kinds().stream().filter("connect"::equals).count());
+    }
+
+
+    @Test
+    public void wrappedUnauthorizedAtBootstrapDisconnects() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                exchanged.add(event.getRefreshToken());
+                cb.onDone(new CompletionException(new UnauthorizedException()), null);
+            }
+        };
+        newClientOnClock(exchangeOptions(storage), clock);
+
+        client.connect();
+
+        awaitCondition("disconnected", () -> disconnects.size() == 1);
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        assertEquals(ClientState.DISCONNECTED, client.getState());
+        assertEquals(Arrays.asList("refresh-1"), storage.exchanged);
+        assertTrue(storage.stored.isEmpty());
+        clock.advance(60000);
+        assertEquals("no reconnect", 1, kinds().stream().filter("connect"::equals).count());
+    }
+
+
+    @Test
+    public void nullRpcPayloadFailsTheBootstrapExchangeAtOnce() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                event.rpc(METHOD, null, (Throwable err, RPCResult result) -> cb.onDone(err, null));
+            }
+        };
+        newClientOnClock(exchangeOptions(storage), clock);
+
+        client.connect();
+
+        awaitCondition("error reported", () -> !errors.isEmpty());
+        assertTrue(errors.get(0) instanceof TokenError);
+        assertTrue(((TokenError) errors.get(0)).getError() instanceof NullPointerException);
+        assertTrue(connected.isEmpty());
+        assertFalse(kinds().contains("rpc:" + METHOD));
     }
 
 
@@ -417,17 +464,17 @@ public class TokenExchangeTest extends FakeServerTestBase {
         options.setTimeout(1000);
         newClientOnClock(options, clock);
         client.connect();
-        awaitUntil("first exchange started", () -> storage.held != null);
+        awaitCondition("first exchange started", () -> storage.held != null);
         int delaysBefore = clock.requestedDelays().size();
 
         clock.advance(options.getTimeout());
 
-        awaitUntil("timeout reported", () -> !errors.isEmpty());
+        awaitCondition("timeout reported", () -> !errors.isEmpty());
         assertTrue(errors.get(0) instanceof TokenError);
         assertTrue(connected.isEmpty());
-        awaitUntil("reconnect scheduled", () -> clock.requestedDelays().size() == delaysBefore + 1);
+        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() == delaysBefore + 1);
         clock.advance(60000);
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertEquals(Arrays.asList("refresh-1", "refresh-1"), storage.exchanged);
         assertEquals(Arrays.asList("refresh-2"), storage.stored);
         assertEquals(2, kinds().stream().filter("connect"::equals).count());
@@ -445,18 +492,18 @@ public class TokenExchangeTest extends FakeServerTestBase {
         options.setTimeout(200);
         newClientOnClock(options, clock);
         client.connect();
-        awaitUntil("refresh sent", () -> refreshTokens().size() == 1);
+        awaitCondition("refresh sent", () -> refreshTokens().size() == 1);
         int delaysBefore = clock.requestedDelays().size();
 
-        awaitUntil("timeout reported", () -> !errors.isEmpty());
+        awaitCondition("timeout reported", () -> !errors.isEmpty());
         assertTrue(errors.get(0) instanceof TokenError);
-        awaitUntil("reconnect scheduled", () -> clock.requestedDelays().size() > delaysBefore);
+        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() > delaysBefore);
         assertTrue(connected.isEmpty());
         // The app logs out while the client waits: the next bootstrap finds no refresh token.
         storage.refreshToken = null;
         clock.advance(60000);
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertTrue(connected.get(0).getUser().isEmpty());
         assertEquals(Arrays.asList("connect", "rpc:" + METHOD, "refresh", "connect"), kinds());
         assertEquals(Arrays.asList("refresh-1"), storage.exchanged);
@@ -472,13 +519,13 @@ public class TokenExchangeTest extends FakeServerTestBase {
         StallingStorage storage = new StallingStorage("refresh-1");
         newClient(exchangeOptions(storage));
         client.connect();
-        awaitUntil("exchange started", () -> storage.held != null);
+        awaitCondition("exchange started", () -> storage.held != null);
 
         server.sendPing();
 
-        awaitUntil("pong sent", () -> server.received().contains(Protocol.Command.getDefaultInstance()));
+        awaitCondition("pong sent", () -> server.received().contains(Protocol.Command.getDefaultInstance()));
         storage.held.onDone(null, new TokenExchangeResult("access-1", null));
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
     }
 
 
@@ -508,17 +555,17 @@ public class TokenExchangeTest extends FakeServerTestBase {
         // Three failed exchanges: the retry after the third one is pending when the connection drops.
         for (int retry = 1; retry <= 2; retry++) {
             final int expected = retry;
-            awaitUntil("retry " + retry + " scheduled", () -> bootstrapDelays(clock).size() == expected);
+            awaitCondition("retry " + retry + " scheduled", () -> bootstrapDelays(clock).size() == expected);
             clock.advance(60000);
         }
-        awaitUntil("third retry scheduled", () -> bootstrapDelays(clock).size() == 3);
+        awaitCondition("third retry scheduled", () -> bootstrapDelays(clock).size() == 3);
         int delaysBefore = clock.requestedDelays().size();
         server.closeConnection();
-        awaitUntil("reconnect scheduled", () -> clock.requestedDelays().size() > delaysBefore);
+        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() > delaysBefore);
         clock.advance(RETRY_MAX_MILLIS);
 
         // The attempts count on across the abandoned bootstrap: the new one's first failure takes the fourth step.
-        awaitUntil("fourth retry scheduled", () -> bootstrapDelays(clock).size() == 4);
+        awaitCondition("fourth retry scheduled", () -> bootstrapDelays(clock).size() == 4);
         assertEquals(4, ((Integer) fieldOf(fieldOf(client.auth, "flow"), "bootstrapAttempt")).intValue());
     }
 
@@ -544,7 +591,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertEquals(Arrays.asList("refresh-1", "refresh-1b"), storage.exchanged);
         assertEquals(Arrays.asList("refresh-2"), storage.stored);
         assertTrue(errors.isEmpty());
@@ -580,12 +627,12 @@ public class TokenExchangeTest extends FakeServerTestBase {
         Storage storage = new Storage("refresh-1");
         newClientOnClock(exchangeOptions(storage), clock);
         client.connect();
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         long delay = renewalDelay(clock);
 
         storage.failNext.set(true);
         clock.advance(delay);
-        awaitUntil("renewal reported", () -> !errors.isEmpty());
+        awaitCondition("renewal reported", () -> !errors.isEmpty());
         pumpUntil(clock, "renewed", () -> refreshTokens().size() == 2);
 
         assertTrue(errors.get(0) instanceof TokenError);
@@ -603,7 +650,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         Options options = exchangeOptions(new Storage("refresh-1"));
         newClientOnClock(options, clock);
         client.connect();
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         long delay = renewalDelay(clock);
 
         options.setTokenExchange(null);
@@ -642,16 +689,16 @@ public class TokenExchangeTest extends FakeServerTestBase {
         newClientOnClock(options, clock);
         client.connect();
         // One failed exchange, then the retry is refused: the session ends, and the backoff of the bootstrap ends with it.
-        awaitUntil("retry scheduled", () -> bootstrapDelays(clock).size() == 1);
+        awaitCondition("retry scheduled", () -> bootstrapDelays(clock).size() == 1);
         clock.advance(60000);
-        awaitUntil("disconnected", () -> disconnects.size() == 1);
+        awaitCondition("disconnected", () -> disconnects.size() == 1);
         assertEquals(CODE_PERMISSION_DENIED, disconnects.get(0).getCode());
         assertEquals(0, ((Integer) fieldOf(fieldOf(fieldOf(client, "auth"), "flow"), "bootstrapAttempt")).intValue());
 
         // A new connect starts at the first step of the backoff again: its first retry is at most the first step.
         failing.set(true);
         client.connect();
-        awaitUntil("retry of the new connect scheduled", () -> bootstrapDelays(clock).size() == 2);
+        awaitCondition("retry of the new connect scheduled", () -> bootstrapDelays(clock).size() == 2);
         assertTrue(bootstrapDelays(clock).get(1) <= 2 * BOOTSTRAP_RETRY_MIN_MILLIS);
     }
 
@@ -670,7 +717,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("disconnected", () -> disconnects.size() == 1);
+        awaitCondition("disconnected", () -> disconnects.size() == 1);
         assertEquals(CODE_PERMISSION_DENIED, disconnects.get(0).getCode());
         assertTrue(connected.isEmpty());
         clock.advance(60000);
@@ -718,7 +765,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("subscribed", () -> order.size() == 2);
+        awaitCondition("subscribed", () -> order.size() == 2);
         assertEquals(Arrays.asList("connected", "subscribed:news"), order);
     }
 
@@ -741,7 +788,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         drainExecutor();
         assertEquals(Arrays.asList("connected"), order);
     }
@@ -754,12 +801,12 @@ public class TokenExchangeTest extends FakeServerTestBase {
         StallingStorage storage = new StallingStorage("refresh-1");
         newClient(exchangeOptions(storage));
         client.connect();
-        awaitUntil("first exchange started", () -> storage.held != null);
+        awaitCondition("first exchange started", () -> storage.held != null);
 
         server.closeConnection();
 
-        awaitUntil("second bootstrap", () -> storage.exchanged.size() == 2);
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("second bootstrap", () -> storage.exchanged.size() == 2);
+        awaitCondition("connected", () -> connected.size() == 1);
         storage.held.onDone(null, new TokenExchangeResult("access-stale", "refresh-stale"));
         drainExecutor();
 
@@ -777,14 +824,14 @@ public class TokenExchangeTest extends FakeServerTestBase {
         StallingStorage storage = new StallingStorage("refresh-1");
         newClient(exchangeOptions(storage));
         client.connect();
-        awaitUntil("bootstrap exchange started", () -> storage.held != null);
+        awaitCondition("bootstrap exchange started", () -> storage.held != null);
 
         client.refresh("app-token", (Throwable err, AuthResult result) -> {
         });
         storage.held.onDone(null, new TokenExchangeResult("access-1", "refresh-2"));
 
-        awaitUntil("app refresh applied", () -> refreshTokens().size() == 2);
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("app refresh applied", () -> refreshTokens().size() == 2);
+        awaitCondition("connected", () -> connected.size() == 1);
         // The held exchange answered the test itself, so no rpc reached the server.
         assertEquals(Arrays.asList("connect", "refresh", "refresh"), kinds());
         assertEquals(Arrays.asList("access-1", "app-token"), refreshTokens());
@@ -805,11 +852,11 @@ public class TokenExchangeTest extends FakeServerTestBase {
         ManualScheduler clock = new ManualScheduler();
         newClientOnClock(exchangeOptions(storage), clock);
         client.connect();
-        awaitUntil("first exchange started", () -> storage.held != null);
+        awaitCondition("first exchange started", () -> storage.held != null);
         int delaysBefore = clock.requestedDelays().size();
 
         server.closeConnection();
-        awaitUntil("connection lost", () -> clock.requestedDelays().size() > delaysBefore);
+        awaitCondition("connection lost", () -> clock.requestedDelays().size() > delaysBefore);
         // The reconnect is not run: the late reply is the only one, and the application still holds the used token.
         assertEquals("refresh-1", storage.load());
         storage.held.onDone(null, new TokenExchangeResult("access-stale", "refresh-2"));
@@ -833,10 +880,10 @@ public class TokenExchangeTest extends FakeServerTestBase {
         options.setTimeout(1000);
         newClientOnClock(options, clock);
         client.connect();
-        awaitUntil("first exchange started", () -> storage.held != null);
+        awaitCondition("first exchange started", () -> storage.held != null);
 
         clock.advance(options.getTimeout());
-        awaitUntil("timeout reported", () -> !errors.isEmpty());
+        awaitCondition("timeout reported", () -> !errors.isEmpty());
         storage.held.onDone(null, new TokenExchangeResult("access-stale", "refresh-2"));
         drainExecutor();
 
@@ -855,12 +902,12 @@ public class TokenExchangeTest extends FakeServerTestBase {
         options.setTimeout(1000);
         newClientOnClock(options, clock);
         client.connect();
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         clock.advance(renewalDelay(clock));
-        awaitUntil("renewal exchange started", () -> storage.held != null);
+        awaitCondition("renewal exchange started", () -> storage.held != null);
 
         clock.advance(options.getTimeout());
-        awaitUntil("timeout reported", () -> !errors.isEmpty());
+        awaitCondition("timeout reported", () -> !errors.isEmpty());
         storage.held.onDone(null, new TokenExchangeResult("access-2", "refresh-3"));
         drainExecutor();
 
@@ -882,12 +929,12 @@ public class TokenExchangeTest extends FakeServerTestBase {
         options.setTimeout(1000);
         newClientOnClock(options, clock);
         client.connect();
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         clock.advance(renewalDelay(clock));
-        awaitUntil("renewal exchange started", () -> storage.held != null);
+        awaitCondition("renewal exchange started", () -> storage.held != null);
 
         clock.advance(options.getTimeout());
-        awaitUntil("timeout reported", () -> !errors.isEmpty());
+        awaitCondition("timeout reported", () -> !errors.isEmpty());
         // The app logs out while the connection stays up: the storage is cleared, and the late rotation must not return to it.
         storage.refreshToken = null;
         storage.held.onDone(null, new TokenExchangeResult("access-2", "refresh-3"));
@@ -908,9 +955,9 @@ public class TokenExchangeTest extends FakeServerTestBase {
         ManualScheduler clock = new ManualScheduler();
         newClientOnClock(exchangeOptions(storage), clock);
         client.connect();
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         clock.advance(renewalDelay(clock));
-        awaitUntil("renewal exchange started", () -> storage.held != null);
+        awaitCondition("renewal exchange started", () -> storage.held != null);
 
         // The app logs in as another user while the renewal runs: it stores that user's refresh token, and refreshes with its access token.
         storage.refreshToken = "login-refresh";
@@ -919,7 +966,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         drainExecutor();
         storage.held.onDone(null, new TokenExchangeResult("access-2", "refresh-3"));
 
-        awaitUntil("login refresh sent", () -> refreshTokens().contains("login-token"));
+        awaitCondition("login refresh sent", () -> refreshTokens().contains("login-token"));
         drainExecutor();
         assertEquals("login-refresh", storage.load());
         assertEquals(Arrays.asList("refresh-2"), storage.stored);
@@ -934,7 +981,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         StallingStorage storage = new StallingStorage("refresh-1");
         newClient(exchangeOptions(storage));
         client.connect();
-        awaitUntil("exchange started", () -> storage.held != null);
+        awaitCondition("exchange started", () -> storage.held != null);
 
         // The app logs in while the exchange runs: the refresh token of the login is the newest one, and the app stores it.
         client.refresh("login-token", (Throwable err, AuthResult result) -> {
@@ -943,7 +990,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         storage.refreshToken = "login-refresh";
         storage.held.onDone(null, new TokenExchangeResult("access-1", "refresh-2"));
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertTrue(storage.stored.isEmpty());
         assertEquals("login-refresh", storage.load());
         assertTrue(errors.isEmpty());
@@ -957,7 +1004,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         StallingStorage storage = new StallingStorage("refresh-1");
         newClient(exchangeOptions(storage));
         client.connect();
-        awaitUntil("exchange started", () -> storage.held != null);
+        awaitCondition("exchange started", () -> storage.held != null);
 
         // The app refreshes with a login token but stores no refresh token: the storage still holds the used one.
         client.refresh("login-token", (Throwable err, AuthResult result) -> {
@@ -965,7 +1012,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         drainExecutor();
         storage.held.onDone(null, new TokenExchangeResult("access-1", "refresh-2"));
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertEquals(Arrays.asList("refresh-2"), storage.stored);
         assertEquals("refresh-2", storage.load());
     }
@@ -979,7 +1026,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         ManualScheduler clock = new ManualScheduler();
         newClientOnClock(exchangeOptions(storage), clock);
         client.connect();
-        awaitUntil("exchange started", () -> storage.held != null);
+        awaitCondition("exchange started", () -> storage.held != null);
         int delaysBefore = clock.requestedDelays().size();
 
         // The socket is closed before the refresh command is written: the write is refused, so its outcome is unknown.
@@ -988,14 +1035,14 @@ public class TokenExchangeTest extends FakeServerTestBase {
         ((WebSocket) fieldOf(client, "ws")).close(1000, "");
         storage.held.onDone(null, new TokenExchangeResult("access-1", "refresh-2"));
 
-        awaitUntil("write failure reported", () -> !errors.isEmpty());
+        awaitCondition("write failure reported", () -> !errors.isEmpty());
         assertTrue(errors.get(0) instanceof TokenError);
         assertTrue(refreshTokens().isEmpty());
         assertTrue(connected.isEmpty());
-        awaitUntil("reconnect scheduled", () -> clock.requestedDelays().size() > delaysBefore);
+        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() > delaysBefore);
         clock.advance(60000);
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertEquals(Arrays.asList("refresh-1", "refresh-2"), storage.exchanged);
         assertEquals(Arrays.asList("refresh-2"), storage.stored);
         assertEquals(2, kinds().stream().filter("connect"::equals).count());
@@ -1010,7 +1057,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertEquals(Arrays.asList("connect"), kinds());
         assertEquals("", connected.get(0).getUser());
         assertTrue(storage.exchanged.isEmpty());
@@ -1025,7 +1072,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         Storage storage = new Storage("refresh-1");
         newClientOnClock(exchangeOptions(storage), clock);
         client.connect();
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
 
         storage.refreshToken = null;
         pumpUntil(clock, "disconnected", () -> disconnects.size() == 1);
@@ -1049,7 +1096,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertEquals(1, errors.size());
         assertTrue(errors.get(0) instanceof TokenError);
         assertEquals("access-1", lastRefreshToken());
@@ -1078,7 +1125,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         Storage storage = new Storage("refresh-1");
         newClient(exchangeOptions(storage));
         client.connect();
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         CompletableFuture<AuthResult> refreshed = new CompletableFuture<>();
 
         client.refresh("manual-token", (Throwable err, AuthResult result) -> {
@@ -1125,7 +1172,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
         client.connect();
 
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         assertEquals("access-1", lastRefreshToken());
         assertEquals(Arrays.asList("refresh-2"), storage.stored);
     }
@@ -1149,11 +1196,11 @@ public class TokenExchangeTest extends FakeServerTestBase {
         };
         newClient(exchangeOptions(storage));
         client.connect();
-        awaitUntil("exchange started", () -> held.size() == 1);
+        awaitCondition("exchange started", () -> held.size() == 1);
 
         client.close(5000);
         held.get(0).onDone(null, new TokenExchangeResult("access-late", "refresh-late"));
-        awaitUntil("late result settled", () -> rpcCalls.get() == 1);
+        awaitCondition("late result settled", () -> rpcCalls.get() == 1);
 
         assertEquals(1, rpcCalls.get());
         assertTrue(rpcErrors.get(0) instanceof IOException);
@@ -1170,7 +1217,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
         Storage storage = new Storage("refresh-1");
         newClient(exchangeOptions(storage));
         client.connect();
-        awaitUntil("connected", () -> connected.size() == 1);
+        awaitCondition("connected", () -> connected.size() == 1);
         Object flow = fieldOf(client.auth, "flow");
         assertNotNull(flow);
         // Every refresh token the application handed out or took in: the flow may hold none of them.
@@ -1189,13 +1236,16 @@ public class TokenExchangeTest extends FakeServerTestBase {
     }
 
 
-    private void newClient(Options options) {
-        client = new Client(server.url(), options, listener());
+    @Override
+    protected Client newClient(Options options) {
+        return newClient(options, listener());
     }
 
 
-    private void newClientOnClock(Options options, ManualScheduler clock) {
+    @Override
+    protected Client newClientOnClock(Options options, ManualScheduler clock) {
         client = new Client(server.url(), options, listener(), RETRY_MIN_MILLIS, RETRY_MAX_MILLIS, clock);
+        return client;
     }
 
 
@@ -1366,7 +1416,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
     // The delay of the renewal timer: the one of the scheduled delays inside the window. The connected event comes
     // before the timer is set, so this waits for it.
     private long renewalDelay(ManualScheduler clock) throws InterruptedException {
-        awaitUntil("renewal timer", () -> renewalDelayIn(clock) != null);
+        awaitCondition("renewal timer", () -> renewalDelayIn(clock) != null);
         return renewalDelayIn(clock);
     }
 
@@ -1381,25 +1431,6 @@ public class TokenExchangeTest extends FakeServerTestBase {
     }
 
 
-    // Waits until the tasks queued on the client executor so far have run, for a check that nothing else happens.
-    private void drainExecutor() throws Exception {
-        client.getExecutor().submit(() -> {
-        }).get(5, TimeUnit.SECONDS);
-    }
-
-
-    // Waits for the condition on the real clock.
-    private static void awaitUntil(String what, BooleanSupplier condition) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (!condition.getAsBoolean()) {
-            if (System.nanoTime() > deadline) {
-                fail("timed out waiting for " + what);
-            }
-            Thread.sleep(5);
-        }
-    }
-
-
     // Moves the manual clock forward until the condition holds. The clock stays inside the ping delay of a connection.
     private void pumpUntil(ManualScheduler clock, String what, BooleanSupplier condition) throws InterruptedException {
         for (int step = 0; step < PUMP_STEPS; step++) {
@@ -1409,7 +1440,7 @@ public class TokenExchangeTest extends FakeServerTestBase {
             clock.advance(PUMP_STEP_MILLIS);
             Thread.sleep(5);
         }
-        awaitUntil(what, condition);
+        awaitCondition(what, condition);
     }
 
 
