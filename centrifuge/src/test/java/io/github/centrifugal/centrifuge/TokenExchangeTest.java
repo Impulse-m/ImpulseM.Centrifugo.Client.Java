@@ -771,6 +771,33 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
 
     @Test
+    public void refreshTokenDuringBootstrapIsAppliedAfterTheBootstrap() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        StallingStorage storage = new StallingStorage("refresh-1");
+        newClient(exchangeOptions(storage));
+        client.connect();
+        awaitUntil("bootstrap exchange started", () -> storage.held != null);
+
+        client.refresh("app-token", (Throwable err, AuthResult result) -> {
+        });
+        storage.held.onDone(null, new TokenExchangeResult("access-1", "refresh-2"));
+
+        awaitUntil("app refresh applied", () -> refreshTokens().size() == 2);
+        awaitUntil("connected", () -> connected.size() == 1);
+        // The held exchange answered the test itself, so no rpc reached the server.
+        assertEquals(Arrays.asList("connect", "refresh", "refresh"), kinds());
+        assertEquals(Arrays.asList("access-1", "app-token"), refreshTokens());
+        assertEquals("app-token", lastRefreshToken());
+        assertEquals("u1", connected.get(0).getUser());
+        // The app's refresh moved the generation on, so the rotation of the bootstrap is stored only while the
+        // app still holds the token which it used.
+        assertEquals(Arrays.asList("refresh-2"), storage.stored);
+        assertTrue(errors.isEmpty());
+    }
+
+
+    @Test
     public void rotationOfAnExchangeLostWithItsConnectionIsStoredWhileTheAppHoldsTheUsedToken() throws Exception {
         answerExchanges("access-1|refresh-2");
         answerIdentity(false, 0);
