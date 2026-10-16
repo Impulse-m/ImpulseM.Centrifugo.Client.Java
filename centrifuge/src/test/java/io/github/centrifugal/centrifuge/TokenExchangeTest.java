@@ -234,6 +234,11 @@ public class TokenExchangeTest extends FakeServerTestBase {
         newClient(exchangeOptions(storage));
         client.connect();
         awaitUntil("connected", () -> connected.size() == 1);
+        // The server identifies a connect which carries a valid token, so its reply carries the user.
+        server.connectResult = server.connectResult.toBuilder()
+                .setUser("u1")
+                .setAuthClass("authenticated")
+                .build();
 
         server.closeConnection();
 
@@ -241,6 +246,48 @@ public class TokenExchangeTest extends FakeServerTestBase {
         assertEquals("access-1", connectTokens().get(connectTokens().size() - 1));
         assertEquals(Arrays.asList("connect", "rpc:" + METHOD, "refresh", "connect"), kinds());
         assertEquals(1, storage.exchanged.size());
+    }
+
+
+    @Test
+    public void anonymousReplyToAConnectWithATokenBootstraps() throws Exception {
+        Storage storage = new Storage("refresh-1");
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        Options options = exchangeOptions(storage);
+        options.setToken("cached-token");
+        newClient(options);
+
+        client.connect();
+
+        awaitUntil("connected", () -> connected.size() == 1);
+        assertEquals(Arrays.asList("connect", "rpc:" + METHOD, "refresh"), kinds());
+        assertEquals("cached-token", connectTokens().get(0));
+        assertEquals("access-1", lastRefreshToken());
+        assertEquals("u1", connected.get(0).getUser());
+        assertEquals(Arrays.asList("refresh-1"), storage.exchanged);
+        assertTrue(errors.isEmpty());
+    }
+
+
+    @Test
+    public void connectReplyWithAUserIsNotBootstrapped() throws Exception {
+        Storage storage = new Storage("refresh-1");
+        answerExchanges("access-1|refresh-2");
+        server.connectResult = server.connectResult.toBuilder()
+                .setUser("proxy-user")
+                .setAuthClass("authenticated")
+                .build();
+        newClient(exchangeOptions(storage));
+
+        client.connect();
+
+        awaitUntil("connected", () -> connected.size() == 1);
+        assertEquals(Arrays.asList("connect"), kinds());
+        assertEquals("proxy-user", connected.get(0).getUser());
+        assertEquals(1, auths.size());
+        assertTrue(storage.exchanged.isEmpty());
+        assertTrue(errors.isEmpty());
     }
 
 

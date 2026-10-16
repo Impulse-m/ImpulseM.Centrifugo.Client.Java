@@ -85,7 +85,7 @@ final class TokenExchangeFlow {
     private final ConnectionTokenGetter renewalGetter;
     private final Backoff backoff = new Backoff();
     private Expiry expiry;
-    // Set by beforeConnect when the connect command carries no token: the next connect reply is then bootstrapped.
+    // Set by beforeConnect: the next connect reply is bootstrapped when it is anonymous.
     private boolean anonymousConnect = false;
     private Bootstrap bootstrap;
     private int bootstrapAttempt = 0;
@@ -130,20 +130,24 @@ final class TokenExchangeFlow {
             host.setRefreshRequired(false);
             expiry = null;
         }
-        anonymousConnect = host.connectionToken().isEmpty();
+        anonymousConnect = true;
     }
 
 
     /**
      * Called with the connect reply before the connected state. Returns true when the exchange took the reply
      * over: the connect resumes with the merged reply later. False when the connect goes on at once, which is
-     * the case for a connect with a token, for a second call of the same connect, and for an empty refresh token.
+     * the case for a reply which carries a user, whether the connect sent a token or not, for a second call of the
+     * same connect, and for an empty refresh token.
      */
     boolean interceptConnect(Protocol.Reply reply) {
         if (!anonymousConnect) {
             return false;
         }
         anonymousConnect = false;
+        if (!reply.getConnect().getUser().isEmpty()) {
+            return false;
+        }
         // The server pings the connection from now on, during the bootstrap too: the ping is answered as a connected one is.
         host.applyPing(reply.getConnect());
         Bootstrap started = new Bootstrap(host.transport(), reply);
