@@ -204,35 +204,44 @@ The refresh timer runs before the token expires. Its errors follow the upstream 
 Instead of a connection token, the application can hand the client a long-lived refresh token, once, and let the client obtain and renew the short access token itself, over the same socket. The application persists the refresh token and supplies three callbacks through `TokenExchange`: `load` reads it, `store` persists a rotated one, and `exchange` trades it for an access token. `Options.setTokenExchange` turns the feature on; it is exclusive with `setTokenGetter`, and a client created with both throws `IllegalArgumentException`.
 
 ```java
-SharedPreferences prefs = context.getSharedPreferences("auth", Context.MODE_PRIVATE);
+Path tokenFile = Paths.get(dataDir, "refresh_token");
 
 TokenExchange exchange = new TokenExchange() {
     @Override
     public String load() {
-        return prefs.getString("refresh_token", null);
+        return readToken(tokenFile);
     }
 
     @Override
     public void store(String refreshToken) {
-        prefs.edit().putString("refresh_token", refreshToken).apply();
+        writeToken(tokenFile, refreshToken);
     }
 
     @Override
     public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
         // Encode the request with your own codec. The rpc goes over the connection the exchange runs on.
         event.rpc("auth.exchange", encodeRequest(event.getRefreshToken()), (Throwable err, RPCResult result) -> {
-            if (err instanceof ReplyError && isRefusal((ReplyError) err)) {
-                // The issuer refused the refresh token, by the code your backend uses: the session is dead.
-                cb.onDone(new UnauthorizedException(), null);
-                return;
-            }
             if (err != null) {
+                // A refusal arrives as TokenExchangeRefusedException, because its app type is in refusalTypes().
                 cb.onDone(err, null);
                 return;
             }
-            // Decode the reply with your own codec: the access token, and the rotated refresh token if there is one.
+            // Decode the reply with your own codec: the access token, the rotated refresh token if there is one,
+            // and the grace in seconds the issuer keeps the consumed refresh token for.
             cb.onDone(null, decodeReply(result.getData()));
         });
+    }
+
+    @Override
+    public Set<String> refusalTypes() {
+        // The app type your backend sets on a refused refresh token, see below. Any name the backend sends.
+        return Collections.singleton("REFRESH_TOKEN_REFUSED");
+    }
+
+    @Override
+    public int grace() {
+        // Used until the issuer publishes one in a result. The default is 30 seconds.
+        return 30;
     }
 };
 
@@ -242,19 +251,105 @@ Client client = new Client(endpoint, options, listener);
 client.connect();
 ```
 
+The backend answers a refused refresh token with an error whose app type is `REFRESH_TOKEN_REFUSED` (any gRPC status; the app type goes in the `app-type` trailer). The client classifies a refusal by that name, from `refusalTypes()`, and never by the error code or the HTTP status. An rpc rejected with a name in the list fails with `TokenExchangeRefusedException` (an `UnauthorizedException`, with the server error as `getReplyError()`); an rpc rejected with any other name is an ordinary error, and the exchange is retried with backoff. The list is empty by default: the client then classifies nothing, and your `exchange` may throw `UnauthorizedException` itself, for a refusal it finds in the reply body.
+
 The flow: when the connect reply is anonymous (no user), whether the connect sent a token or not, the client runs the exchange on the new socket before it reports the connection as connected. It then sets the access token as the connection token and sends a `refresh` command with it, which binds the connection to the user. The `connected` event fires once, with that user. Every rotated refresh token goes to `store` before the access token issued with it is used. The client renews the access token over the connected socket at a random moment between 70% and 90% of its TTL, so a fleet which connected together spreads its renewals. Without the option, the refresh timer runs at the full TTL, as before.
 
-Several tabs or processes of one installation can share one refresh token, with no lock in the client. The client reads `load` immediately before each exchange and stores the rotated token immediately after. An exchange which is refused is retried once, with the token read again, when another one rotated the token meanwhile. The backend keeps a short grace for the previous refresh token, so two clients which exchange at the same moment both get the same rotated pair.
+Several tabs or processes of one installation can share one refresh token, with no lock in the client. The client reads `load` immediately before each exchange and stores the rotated token immediately after. The backend keeps a grace for the previous refresh token, so two clients which exchange the same token inside the grace both get the same rotated refresh token, and each its own access token: each client binds its own connection with its own access token, and both store the same rotated refresh token.
+
+#### Refusal run and grace
+
+A refused refresh token is not the end of the session at once. When the issuer refuses the token the client presented, a refusal run starts: the client reads `load` again, presents the token it finds at once when it changed (another client rotated it meanwhile), and presents the same token again with backoff otherwise. The run ends with an accepted exchange, with the session's end, or with `disconnect()`. A transport loss does not end it: a client which reconnects in a loop still ends the session at the horizon.
+
+The horizon is the grace, measured from the first refusal of the run on the scheduler's monotonic clock; the wall clock does not move it. The grace is in seconds. An accepted result publishes it (`new TokenExchangeResult(token, refreshToken, graceSeconds)`; the two-argument constructor publishes none), and `TokenExchange.grace()` gives it until the first one arrives. A value below 0 is ignored, and one above 300 is clamped to 300. Only when the horizon has passed, or `load` returns nothing, is the session dead. The client does not reconnect then, and reports the `DisconnectedEvent` with code 1.
+
+Within the run a refusal is reported as an `ErrorEvent` with `TokenError`, with the message `refresh token refused, retrying within the grace`, which names no token. A dead session costs at most one grace of attempts after its first refusal.
+
+#### Several processes: the file lock
+
+The client holds no lock, and that is enough for a rotation which the next attempt can recover from. An installation whose processes must not present different refresh tokens (one live refresh token per installation) puts the whole rotation inside `exchange`, under a lock of the storage. The lock is taken before the stored token is read, and released after the rotated token is written, so that no other process reads or writes between them. The recipe, with `java.nio` only:
+
+```java
+private final ReentrantLock processLock = new ReentrantLock();
+private final Path lockFile = Paths.get(dataDir, "refresh_token.lock");
+
+@Override
+public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+    // The client's thread takes the process lock, and the callback, which runs on that thread, releases it.
+    processLock.lock();
+    FileChannel channel;
+    FileLock fileLock;
+    try {
+        channel = FileChannel.open(lockFile, CREATE, READ, WRITE);
+        fileLock = channel.lock();
+    } catch (IOException e) {
+        processLock.unlock();
+        cb.onDone(e, null);
+        return;
+    }
+    // Another process may have rotated the token since load: present what the storage holds under the lock.
+    String presented;
+    try {
+        presented = readToken(tokenFile);
+    } catch (IOException e) {
+        release(channel, fileLock);
+        cb.onDone(e, null);
+        return;
+    }
+    if (presented == null) {
+        release(channel, fileLock);
+        cb.onDone(new UnauthorizedException(), null);
+        return;
+    }
+    event.rpc("auth.exchange", encodeRequest(presented), (Throwable err, RPCResult result) -> {
+        try {
+            if (err != null) {
+                cb.onDone(err, null);
+                return;
+            }
+            TokenExchangeResult reply = decodeReply(result.getData());
+            if (reply.getRefreshToken() != null) {
+                // A temporary file and a rename: another process never reads a torn value.
+                writeTokenAtomically(tokenFile, reply.getRefreshToken());
+            }
+            // Written under the lock, so the result carries no refresh token: the client stores nothing after it.
+            cb.onDone(null, new TokenExchangeResult(reply.getToken(), null, reply.getGrace()));
+        } catch (IOException e) {
+            cb.onDone(e, null);
+        } finally {
+            release(channel, fileLock);
+        }
+    });
+}
+
+// Releases the file lock, closes its channel, and unlocks the process lock.
+private void release(FileChannel channel, FileLock fileLock) {
+    try {
+        fileLock.release();
+        channel.close();
+    } catch (IOException e) {
+        // The lock is gone with the channel: nothing else to undo.
+    } finally {
+        processLock.unlock();
+    }
+}
+```
+
+The store of the client runs after `exchange` returns, outside the lock, and writes without comparing: the recipe therefore never returns a refresh token it has written itself. The alternative is a `store` which takes the same lock and writes only when the file still holds the token the exchange presented. `load` reads without the lock: the rename makes it atomic. The lock is held for at most the client timeout, since the rpc fails at it.
+
+#### The attribution claim (`meta`)
+
+The access token is a connection JWT. Its `meta` claim is the issuer's attribution of the connection, for example an installation or a device. The server stores it at connect, and replaces it at every renewal, so the attribution follows the access token. An issuer which wants a stable attribution keeps `meta` the same across the access tokens of one session. The client never reads the claim.
 
 On logout, disconnect or close the client before clearing the stored refresh token: a renewal still in flight while the client stays connected stores its rotated token when it completes.
 
 | Event | When |
 |---|---|
 | `ConnectedEvent` with an empty user | `load` returned no refresh token: the connection stays anonymous |
-| `ErrorEvent` with `TokenError` | an exchange or `store` failed; the exchange is retried with backoff, or the connection goes on. A bootstrap refresh which timed out or failed to write has an unknown outcome: the connection is closed and the client reconnects |
+| `ErrorEvent` with `TokenError` | an exchange or `store` failed; the exchange is retried with backoff, or the connection goes on. A refused refresh token inside the grace is reported with the message `refresh token refused, retrying within the grace`, and retried. A bootstrap refresh which timed out or failed to write has an unknown outcome: the connection is closed and the client reconnects |
 | `ErrorEvent` with `RefreshError` | a renewal refresh was refused; the error table of the timer refresh applies |
 | `ErrorEvent` with `ReplyError` | a bootstrap refresh was refused with a temporary error, an error below 100 or 109: the exchange is retried with backoff |
-| `DisconnectedEvent` with code 1 (`unauthorized`) | the session is dead: the issuer refused the refresh token again, or `load` returned nothing at renewal. The client does not reconnect |
+| `DisconnectedEvent` with code 1 (`unauthorized`) | the session is dead: the grace horizon of the refusal run has passed, or `load` returned nothing. The client does not reconnect |
 
 The server must accept a connection without a token (`client.allow_anonymous_connect_without_token: true`), must allow a refresh which changes the user (`client.rebind.enabled: true`), and the exchange method must be callable by an anonymous connection: a registry entry with `auth_class: anonymous`. The calls of that method carry no connection token, so the issuer authenticates the request by the refresh token alone. The access token is the connection token: the usual `client.token` verification applies, and its `exp` drives the renewal.
 
