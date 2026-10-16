@@ -18,6 +18,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.UnaryOperator;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.X509TrustManager;
 
@@ -37,6 +38,8 @@ import okio.ByteString;
 public class Client {
     WebSocket ws;
     private OkHttpClient httpClient;
+    // Wraps the factory of each transport, which is the http client of the connect; a test sets it before a connect.
+    volatile UnaryOperator<WebSocket.Factory> transportWrap = factory -> factory;
     // Whether httpClient was built from scratch (no user-supplied base client),
     // meaning its Dispatcher and ConnectionPool are ours to dispose. Recorded
     // at build time so a later mutation of Options.okHttpClient cannot
@@ -52,6 +55,7 @@ public class Client {
     final Map<Integer, CompletableFuture<Protocol.Reply>> futures = new ConcurrentHashMap<>();
     private final Map<Integer, Protocol.Command> connectCommands = new ConcurrentHashMap<>();
     private final Map<Integer, Protocol.Command> connectAsyncCommands = new ConcurrentHashMap<>();
+    private final ClientHost host;
     final RpcSession rpcSession;
     final AuthRefresh auth;
 
@@ -177,6 +181,7 @@ public class Client {
         this.scheduler = scheduler;
         this.backoff = new Backoff();
         ClientHost host = new ClientHost(this);
+        this.host = host;
         this.rpcSession = new RpcSession(host, opts.getMaxPendingRpc(), rpcResendDraws);
         this.auth = new AuthRefresh(host, authRetryMinMillis, authRetryMaxMillis);
         this.token = opts.getToken();
@@ -464,7 +469,7 @@ public class Client {
         this.httpClientOwned = baseClient == null;
         // Each transport starts without capabilities; its connect reply confirms them.
         this.rpcOptionsSupported = false;
-        this.ws = this.httpClient.newWebSocket(request, new WebSocketListener() {
+        this.ws = this.transportWrap.apply(this.httpClient).newWebSocket(request, new WebSocketListener() {
             @Override
             public void onOpen(WebSocket webSocket, Response response) {
                 super.onOpen(webSocket, response);
@@ -924,8 +929,10 @@ public class Client {
         event.setUser(result.getUser());
         event.setAuthClass(result.getAuthClass());
         this.setState(ClientState.CONNECTED);
-        this.listener.onConnected(this, event);
-        this.auth.applyAuth(result.getUser(), result.getAuthClass(), true);
+        // The callbacks below run after the handshake, see ConnectNotices.
+        ConnectNotices notices = new ConnectNotices(this.host);
+        notices.add(() -> this.listener.onConnected(this, event));
+        notices.add(() -> this.auth.applyAuth(result.getUser(), result.getAuthClass(), true));
         this.pingInterval = result.getPing() * 1000;
         this.sendPong = result.getPong();
 
@@ -954,7 +961,8 @@ public class Client {
                 data = subResult.getData().toByteArray();
             }
 
-            this.listener.onSubscribed(this, new ServerSubscribedEvent(channel, subResult.getWasRecovering(), subResult.getRecovered(), subResult.getPositioned(), subResult.getRecoverable(), subResult.getPositioned() || subResult.getRecoverable() ? new StreamPosition(subResult.getOffset(), subResult.getEpoch()) : null, data));
+            ServerSubscribedEvent subscribed = new ServerSubscribedEvent(channel, subResult.getWasRecovering(), subResult.getRecovered(), subResult.getPositioned(), subResult.getRecoverable(), subResult.getPositioned() || subResult.getRecoverable() ? new StreamPosition(subResult.getOffset(), subResult.getEpoch()) : null, data);
+            notices.add(() -> this.listener.onSubscribed(this, subscribed));
             if (subResult.getPublicationsCount() > 0) {
                 for (Protocol.Publication publication : subResult.getPublicationsList()) {
                     ServerPublicationEvent publicationEvent = new ServerPublicationEvent();
@@ -967,7 +975,7 @@ public class Client {
                     if (publication.getOffset() > 0) {
                         serverSub.setLastOffset(publication.getOffset());
                     }
-                    this.listener.onPublication(this, publicationEvent);
+                    notices.add(() -> this.listener.onPublication(this, publicationEvent));
                 }
             } else {
                 serverSub.setLastOffset(subResult.getOffset());
@@ -978,7 +986,7 @@ public class Client {
         while (it.hasNext()) {
             Map.Entry<String, ServerSubscription> entry = it.next();
             if (!result.getSubsMap().containsKey(entry.getKey())) {
-                this.listener.onUnsubscribed(this, new ServerUnsubscribedEvent(entry.getKey()));
+                notices.add(() -> this.listener.onUnsubscribed(this, new ServerUnsubscribedEvent(entry.getKey())));
                 it.remove();
             }
         }
@@ -1018,6 +1026,8 @@ public class Client {
         this.pingTask = this.scheduler.schedule(Client.this::waitServerPing, this.pingInterval + this.opts.getMaxServerPingDelay(), TimeUnit.MILLISECONDS);
 
         this.auth.scheduleExpiry(result.getExpires(), result.getTtl());
+
+        notices.run();
     }
 
     private void sendConnect() {

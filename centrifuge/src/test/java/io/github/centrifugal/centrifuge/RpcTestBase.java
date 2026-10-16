@@ -169,7 +169,8 @@ abstract class RpcTestBase extends FakeServerTestBase {
     }
 
 
-    private EventListener signallingListener() {
+    /** A listener which signals the connect and the disconnect, for a test which adds its own callbacks around it. */
+    protected EventListener signallingListener() {
         return new EventListener() {
             @Override
             public void onConnected(Client c, ConnectedEvent e) {

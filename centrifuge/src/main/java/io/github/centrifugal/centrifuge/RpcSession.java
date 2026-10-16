@@ -375,13 +375,13 @@ final class RpcSession {
 
 
     // Writes the call now when the connection is up and no refresh is in flight, and queues it otherwise.
-    // A call which fails to write fails alone: the calls behind it are still written, and the connect path
-    // which flushes them goes on.
+    // A call which fails to write fails alone, whatever the failure: the calls behind it are still written,
+    // and the connect path which flushes them goes on.
     private void writeOrQueue(RpcCall call) {
         if (host.state() == ClientState.CONNECTED && !host.isRefreshing()) {
             try {
                 write(call);
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {
                 call.future.completeExceptionally(new IOException(e));
             }
         } else {
@@ -432,8 +432,9 @@ final class RpcSession {
             abandonWrite(id, acks);
             call.future.completeExceptionally(e);
             return;
-        } catch (RuntimeException e) {
-            // The transport failed inside the send: the attempt is taken back, and writeOrQueue fails the call alone.
+        } catch (Throwable e) {
+            // The transport failed inside the send, with an exception or an Error: the attempt is taken back, and
+            // writeOrQueue fails the call alone.
             abandonWrite(id, acks);
             throw e;
         }
@@ -520,6 +521,14 @@ final class RpcSession {
         } catch (IOException e) {
             // A cancel which cannot be encoded is kept like one the transport refused.
             sent = false;
+        } catch (Throwable e) {
+            // Unlike a call, a cancel has no future to take a failure of the send, so it is kept like a refused one and the
+            // failure is reported. Every Throwable is caught here on purpose: an Error which ended the flush would leave the
+            // calls queued for the connect waiting. A call's write is caught alike in writeOrQueue, and its future takes the failure.
+            // The report runs on the executor after the current task: the caller still writes its commands, and a listener may
+            // call rpcCall or disconnect, and neither may overtake them. Once the executor is shut down the failure is printed instead.
+            sent = false;
+            Extensions.submitOrRun(host.executor(), () -> host.reportUnclassified(e), e::printStackTrace);
         }
         if (sent) {
             // The reply is handled on the executor, after this task, so the timer is set before it can come.

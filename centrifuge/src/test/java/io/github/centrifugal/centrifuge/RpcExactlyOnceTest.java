@@ -1,11 +1,18 @@
 package io.github.centrifugal.centrifuge;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -20,9 +27,17 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
+
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
+
+import okio.ByteString;
 
 import org.junit.Test;
 
@@ -261,6 +276,285 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         assertEquals(msgId, cancel.getCancel());
         long calls = sentRpcRequests().stream().filter((Protocol.RPCRequest request) -> request.getCancel() == 0).count();
         assertEquals("the written call is not sent again", 1, calls);
+    }
+
+
+    // A cancel whose send throws is kept for the next connection, and the cancels and the calls behind it still go out.
+    @Test
+    public void cancelWhoseSendThrowsIsKeptAndTheRestOfTheFlushGoesOut() throws Exception {
+        enableRpcOptions();
+        serveDedup();
+        BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
+        Client c = newClientWithFailingSend(reported, true);
+        connect(c);
+        Set<Long> msgIds = new HashSet<>(sendHeldCallsAndDisconnect(c, 2));
+        CompletableFuture<RPCResult> queuedFuture = new CompletableFuture<>();
+        c.rpcCall("queued", EMPTY_PAYLOAD, into(queuedFuture));
+
+        // The transport fails on the first cancel sent after the connect reply: the flush of the cancels sends first.
+        connectWithFailingSend(c, new IllegalStateException("transport failed inside the send"), true);
+
+        RPCResult queued = queuedFuture.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertEquals("the call queued for the connect is answered", "{}", new String(queued.getData(), StandardCharsets.UTF_8));
+        awaitCondition("one cancel sent with the connect", () -> cancelsSent().size() == 1);
+        c.disconnect();
+        connect(c);
+        awaitCondition("the kept cancel sent with the next connect", () -> cancelsSent().size() == 2);
+        assertEquals("both cancels are sent", msgIds, new HashSet<>(cancelsSent()));
+        Throwable failure = reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertTrue("the failed send is reported", failure instanceof UnclassifiedError);
+        Throwable cause = ((UnclassifiedError) failure).getError();
+        assertTrue("the cause is the transport's failure", cause instanceof IllegalStateException);
+        assertEquals("the failed send is the transport's", "transport failed inside the send", cause.getMessage());
+    }
+
+
+    // An Error from the send of a cancel is handled as a refused cancel: the cancel is kept, and the flush goes on
+    // with the other cancels and the calls queued for the connect.
+    @Test
+    public void cancelWhoseSendFailsWithAnErrorIsKeptAndTheRestOfTheFlushGoesOut() throws Exception {
+        enableRpcOptions();
+        serveDedup();
+        BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
+        Client c = newClientWithFailingSend(reported, false);
+        connect(c);
+        Set<Long> msgIds = new HashSet<>(sendHeldCallsAndDisconnect(c, 3));
+        CompletableFuture<RPCResult> queuedFuture = new CompletableFuture<>();
+        c.rpcCall("queued", EMPTY_PAYLOAD, into(queuedFuture));
+
+        connectWithFailingSend(c, new NoClassDefFoundError("transport linkage failed inside the send"), true);
+
+        RPCResult queued = queuedFuture.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertEquals("the call queued for the connect is answered", "{}", new String(queued.getData(), StandardCharsets.UTF_8));
+        awaitCondition("the two cancels which did not fail are sent with the connect", () -> cancelsSent().size() == 2);
+        Throwable failure = reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertTrue("the failed send is reported", failure instanceof UnclassifiedError);
+        assertTrue("the cause is the transport's Error", ((UnclassifiedError) failure).getError() instanceof NoClassDefFoundError);
+        c.disconnect();
+        connect(c);
+        awaitCondition("the kept cancel sent with the next connect", () -> cancelsSent().size() == 3);
+        assertEquals("every cancel is sent", msgIds, new HashSet<>(cancelsSent()));
+    }
+
+
+    // A failed cancel send is reported after the connect reply is handled: the report sees the expiry timer which the reply
+    // armed, and a disconnect from the report leaves no timer armed.
+    @Test
+    public void failedCancelSendIsReportedAfterTheConnectReplyArmsItsExpiryTimer() throws Exception {
+        enableRpcOptions();
+        final int ttlSeconds = 60;
+        final long expiryMillis = TimeUnit.SECONDS.toMillis(ttlSeconds);
+        server.connectResult = server.connectResult.toBuilder().setExpires(true).setTtl(ttlSeconds).build();
+        serveDedup();
+        BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
+        BlockingQueue<Integer> armedAtReport = new LinkedBlockingQueue<>();
+        ManualScheduler clock = new ManualScheduler();
+        EventListener signalling = signallingListener();
+        Client c = new Client(server.url(), instanceOptions(), new EventListener() {
+            @Override
+            public void onConnected(Client client, ConnectedEvent event) {
+                signalling.onConnected(client, event);
+            }
+
+
+            @Override
+            public void onDisconnected(Client client, DisconnectedEvent event) {
+                signalling.onDisconnected(client, event);
+            }
+
+
+            @Override
+            public void onError(Client client, ErrorEvent event) {
+                reported.add(event.getError());
+                armedAtReport.add(clock.pendingWithDelay(expiryMillis));
+                client.disconnect();
+            }
+        }, AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, clock, maximumDraws());
+        client = c;
+        connect(c);
+        sendHeldCallsAndDisconnect(c, 1);
+
+        connectWithFailingSend(c, new IllegalStateException("transport failed inside the send"), true);
+        assertTrue("the failed send is reported", reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) != null);
+        Integer armed = armedAtReport.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertTrue("the report runs after the connect reply armed its expiry timer", armed != null && armed > 0);
+        awaitCondition("the report disconnects the client", () -> c.getState() == ClientState.DISCONNECTED);
+        drainExecutor();
+        assertEquals("the disconnect leaves no expiry timer armed", 0, clock.pendingWithDelay(expiryMillis));
+    }
+
+
+    // An Error from the send of a call fails that call alone: the calls behind it in the flush are still written.
+    @Test
+    public void callWhoseSendFailsWithAnErrorFailsAloneAndTheRestOfTheFlushGoesOut() throws Exception {
+        enableRpcOptions();
+        serveDedup();
+        Client c = newClientWithFailingSend(new LinkedBlockingQueue<Throwable>(), false);
+        connect(c);
+        c.disconnect();
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        CompletableFuture<RPCResult> second = new CompletableFuture<>();
+        CompletableFuture<RPCResult> third = new CompletableFuture<>();
+        c.rpcCall("first", EMPTY_PAYLOAD, into(first));
+        c.rpcCall("second", EMPTY_PAYLOAD, into(second));
+        c.rpcCall("third", EMPTY_PAYLOAD, into(third));
+
+        // The send of the first call fails inside the connect's flush, which writes the calls queued behind it.
+        connectWithFailingSend(c, new NoClassDefFoundError("transport linkage failed inside the send"), false);
+
+        try {
+            first.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+            fail("the call whose send failed completes with the failure");
+        } catch (ExecutionException e) {
+            assertTrue("the failure is the send's", e.getCause() instanceof IOException);
+            assertTrue("the cause is the transport's Error", e.getCause().getCause() instanceof NoClassDefFoundError);
+        }
+        assertEquals("the second call is answered", "{}", new String(second.get(WAIT_MILLIS, TimeUnit.MILLISECONDS).getData(), StandardCharsets.UTF_8));
+        assertEquals("the third call is answered", "{}", new String(third.get(WAIT_MILLIS, TimeUnit.MILLISECONDS).getData(), StandardCharsets.UTF_8));
+    }
+
+
+    // Connects a client whose first send of a cancel, or of a call, after this connect fails with the given throwable.
+    private void connectWithFailingSend(Client c, Throwable failure, boolean cancelSend) throws Exception {
+        c.transportWrap = factory -> failingSends(factory, failure, cancelSend);
+        c.connect();
+        assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+        c.transportWrap = factory -> factory;
+    }
+
+
+    // A client whose error listener records what it reports. With throwOnReport the error listener throws after the
+    // record, and the flush must go on regardless.
+    private Client newClientWithFailingSend(BlockingQueue<Throwable> reported, boolean throwOnReport) {
+        EventListener signalling = signallingListener();
+        return newClient(instanceOptions(), new EventListener() {
+            @Override
+            public void onConnected(Client client, ConnectedEvent event) {
+                signalling.onConnected(client, event);
+            }
+
+
+            @Override
+            public void onDisconnected(Client client, DisconnectedEvent event) {
+                signalling.onDisconnected(client, event);
+            }
+
+
+            @Override
+            public void onError(Client client, ErrorEvent event) {
+                reported.add(event.getError());
+                if (throwOnReport) {
+                    throw new IllegalStateException("listener failed on the report");
+                }
+            }
+        });
+    }
+
+
+    // Sends the calls which the server holds, waits until they arrive, and disconnects. Returns the msg_ids of the calls.
+    private List<Long> sendHeldCallsAndDisconnect(Client c, int count) throws Exception {
+        holdCalls.set(true);
+        for (int i = 0; i < count; i++) {
+            c.rpcCall("held", EMPTY_PAYLOAD, into(new CompletableFuture<RPCResult>()));
+        }
+        for (int i = 0; i < count; i++) {
+            assertTrue("call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
+        }
+        List<Long> msgIds = new ArrayList<>();
+        for (Protocol.RPCRequest request : sentRpcRequests()) {
+            msgIds.add(request.getMsgId());
+        }
+        c.disconnect();
+        holdCalls.set(false);
+        return msgIds;
+    }
+
+
+    // The msg_ids of the cancels the client sent.
+    private List<Long> cancelsSent() {
+        List<Long> msgIds = new ArrayList<>();
+        for (Protocol.RPCRequest request : sentRpcRequests()) {
+            if (request.getCancel() != 0) {
+                msgIds.add(request.getCancel());
+            }
+        }
+        return msgIds;
+    }
+
+
+    // A transport factory which wraps the transports of the client, so that the first send of a cancel, or of a call, throws
+    // as a transport can fail inside a send. The command is matched by its payload, so the sends of subscribes or connect
+    // commands do not take the failure. The wrapper is the transport the client holds, and the listener of each transport
+    // gets the wrapper as its transport too, so the replies still match the transport the client holds.
+    private static WebSocket.Factory failingSends(WebSocket.Factory factory, Throwable failure, boolean cancelSend) {
+        AtomicBoolean armed = new AtomicBoolean(true);
+        return (Request request, WebSocketListener listener) -> {
+            AtomicReference<WebSocket> real = new AtomicReference<>();
+            InvocationHandler handler = (Object proxy, Method method, Object[] args) -> {
+                if (method.getName().equals("send") && isTargetPayload(args[0], cancelSend) && armed.getAndSet(false)) {
+                    throw failure;
+                }
+                try {
+                    return method.invoke(real.get(), args);
+                } catch (InvocationTargetException e) {
+                    throw e.getCause();
+                }
+            };
+            WebSocket proxy = (WebSocket) Proxy.newProxyInstance(WebSocket.class.getClassLoader(), new Class<?>[] {WebSocket.class}, handler);
+            real.set(factory.newWebSocket(request, new WebSocketListener() {
+                @Override
+                public void onOpen(WebSocket webSocket, Response response) {
+                    listener.onOpen(proxy, response);
+                }
+
+
+                @Override
+                public void onMessage(WebSocket webSocket, String text) {
+                    listener.onMessage(proxy, text);
+                }
+
+
+                @Override
+                public void onMessage(WebSocket webSocket, ByteString bytes) {
+                    listener.onMessage(proxy, bytes);
+                }
+
+
+                @Override
+                public void onClosing(WebSocket webSocket, int code, String reason) {
+                    listener.onClosing(proxy, code, reason);
+                }
+
+
+                @Override
+                public void onClosed(WebSocket webSocket, int code, String reason) {
+                    listener.onClosed(proxy, code, reason);
+                }
+
+
+                @Override
+                public void onFailure(WebSocket webSocket, Throwable cause, Response response) {
+                    listener.onFailure(proxy, cause, response);
+                }
+            }));
+            return proxy;
+        };
+    }
+
+
+    // Whether a sent payload is an rpc command of the kind the send fails on: a cancel, or a call. A payload which is not
+    // a command is neither.
+    private static boolean isTargetPayload(Object payload, boolean cancel) {
+        if (!(payload instanceof ByteString)) {
+            return false;
+        }
+        Protocol.Command cmd;
+        try {
+            cmd = Protocol.Command.parseDelimitedFrom(new ByteArrayInputStream(((ByteString) payload).toByteArray()));
+        } catch (IOException e) {
+            return false;
+        }
+        return cmd != null && cmd.hasRpc() && (cmd.getRpc().getCancel() != 0) == cancel;
     }
 
 
