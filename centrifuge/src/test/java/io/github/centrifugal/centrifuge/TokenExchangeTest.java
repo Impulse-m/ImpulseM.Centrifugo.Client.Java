@@ -9,6 +9,7 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -1274,7 +1275,7 @@ public class TokenExchangeTest extends RpcTestBase {
 
     // The client on the manual clock, with this test's listener. Named apart from the base helper, which is protected.
     private Client newExchangeClient(Options options, ManualScheduler clock) {
-        client = new Client(server.url(), options, listener(), RETRY_MIN_MILLIS, RETRY_MAX_MILLIS, clock);
+        client = new Client(server.url(), options, listener(), RETRY_MIN_MILLIS, RETRY_MAX_MILLIS, clock, new Random());
         return client;
     }
 
