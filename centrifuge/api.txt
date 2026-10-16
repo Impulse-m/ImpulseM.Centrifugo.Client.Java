@@ -267,8 +267,10 @@ package io.github.centrifugal.centrifuge {
     method public void setCode(int);
     method public void setMessage(String);
     method public void setTemporary(boolean);
+    field public static final int BAD_CONFIGURATION = 12; // 0xc
     field public static final int CANCELLED = 17; // 0x11
     field public static final int LIMIT_EXCEEDED = 16; // 0x10
+    field public static final int REDIRECT_FAILED = 18; // 0x12
     field public static final int UNSUPPORTED = 15; // 0xf
   }
 
@@ -290,6 +292,88 @@ package io.github.centrifugal.centrifuge {
     method public io.github.centrifugal.centrifuge.RpcOptions! build();
     method public io.github.centrifugal.centrifuge.RpcOptions.Builder! header(String, String);
     method public io.github.centrifugal.centrifuge.RpcOptions.Builder! timeout(long);
+  }
+
+  public final class RpcPool {
+    method public void close();
+    method public io.github.centrifugal.centrifuge.RpcPool.Call! rpc(String, byte[]!, io.github.centrifugal.centrifuge.RpcPool.CallOptions!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.RPCResult!>!);
+    method public io.github.centrifugal.centrifuge.RpcPool.Stats! stats();
+  }
+
+  public static final class RpcPool.Builder {
+    ctor public RpcPool.Builder(io.github.centrifugal.centrifuge.RpcPool.EndpointResolver!);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! affinityHeader(String);
+    method public io.github.centrifugal.centrifuge.RpcPool! build();
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! errorListener(io.github.centrifugal.centrifuge.RpcPool.ErrorListener!);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! headers(Map<String,String>);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! idleTimeout(long);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! maxConnectionsPerEndpoint(int);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! maxInflightPerConnection(int);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! maxQueued(int);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! maxRedirectsInflight(int);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! name(String);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! okHttpClient(okhttp3.OkHttpClient!);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! redirect(io.github.centrifugal.centrifuge.RpcPool.RedirectHook!);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! reroute(Function<ReplyError,String>);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! retries(int);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! timeout(int);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! token(String);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! tokenGetter(io.github.centrifugal.centrifuge.ConnectionTokenGetter!);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! version(String);
+  }
+
+  public static final class RpcPool.Call {
+    method public void cancel();
+  }
+
+  public static final class RpcPool.CallOptions {
+    method public static io.github.centrifugal.centrifuge.RpcPool.CallOptions.Builder! builder();
+    method public String getAffinity();
+    method public String getEndpointKey();
+    method public Map<String,String> getHeaders();
+    method public long getTimeout();
+  }
+
+  public static final class RpcPool.CallOptions.Builder {
+    ctor public RpcPool.CallOptions.Builder();
+    method public io.github.centrifugal.centrifuge.RpcPool.CallOptions.Builder! affinity(String);
+    method public io.github.centrifugal.centrifuge.RpcPool.CallOptions! build();
+    method public io.github.centrifugal.centrifuge.RpcPool.CallOptions.Builder! endpointKey(String);
+    method public io.github.centrifugal.centrifuge.RpcPool.CallOptions.Builder! header(String, String);
+    method public io.github.centrifugal.centrifuge.RpcPool.CallOptions.Builder! timeout(long);
+  }
+
+  public static interface RpcPool.EndpointResolver {
+    method public List<String> endpoints(String);
+  }
+
+  public static interface RpcPool.ErrorListener {
+    method public void onError(String, Throwable);
+  }
+
+  public static final class RpcPool.Redirect {
+    method public static io.github.centrifugal.centrifuge.RpcPool.Redirect.Builder! builder(String);
+    method public Map<String,String> getHeaders();
+    method public long getMaxBytes();
+    method public String getUrl();
+    field public static final long DEFAULT_MAX_BYTES = 16777216L; // 0x1000000L
+  }
+
+  public static final class RpcPool.Redirect.Builder {
+    method public io.github.centrifugal.centrifuge.RpcPool.Redirect! build();
+    method public io.github.centrifugal.centrifuge.RpcPool.Redirect.Builder! header(String, String);
+    method public io.github.centrifugal.centrifuge.RpcPool.Redirect.Builder! maxBytes(long);
+  }
+
+  public static interface RpcPool.RedirectHook {
+    method public io.github.centrifugal.centrifuge.RpcPool.Redirect! redirect(io.github.centrifugal.centrifuge.RPCResult!, Throwable);
+  }
+
+  public static final class RpcPool.Stats {
+    method public int getConnections();
+    method public int getInflight();
+    method public int getQueued();
+    method public int getRedirects();
   }
 
   public class ServerJoinEvent {
