@@ -261,7 +261,7 @@ Several tabs or processes of one installation can share one refresh token, with 
 
 A refused refresh token is not the end of the session at once. When the issuer refuses the token the client presented, a refusal run starts: the client reads `load` again, presents the token it finds at once when it changed (another client rotated it meanwhile), and presents the same token again with backoff otherwise. The run ends with an accepted exchange, with the session's end, or with `disconnect()`. A transport loss does not end it: a client which reconnects in a loop still ends the session at the horizon.
 
-The horizon is the grace, measured from the first refusal of the run on the scheduler's monotonic clock; the wall clock does not move it. The grace is in seconds. An accepted result publishes it (`new TokenExchangeResult(token, refreshToken, graceSeconds)`; the two-argument constructor publishes none), and `TokenExchange.grace()` gives it until the first one arrives. A value below 0 is ignored, and one above 300 is clamped to 300. Only when the horizon has passed, or `load` returns nothing, is the session dead. The client does not reconnect then, and reports the `DisconnectedEvent` with code 1.
+The horizon is the grace, measured from the first refusal of the run on the scheduler's monotonic clock; the wall clock does not move it. The grace is in seconds. An accepted result publishes it (`new TokenExchangeResult(token, refreshToken, graceSeconds)`; the two-argument constructor publishes none), and `TokenExchange.grace()` gives it until the first one arrives, and again after an accepted result which publishes none (a negative value counts as none). A value above 300 is clamped to 300. Only when the horizon has passed, or `load` returns nothing, is the session dead. The client does not reconnect then, and reports the `DisconnectedEvent` with code 1.
 
 Within the run a refusal is reported as an `ErrorEvent` with `TokenError`, with the message `refresh token refused, retrying within the grace`, which names no token. A dead session costs at most one grace of attempts after its first refusal.
 
@@ -298,27 +298,34 @@ public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResul
         cb.onDone(new UnauthorizedException(), null);
         return;
     }
-    // The callback runs once, on the thread which completes the rpc: after close that is not the client's thread.
-    // A semaphore may be released on any thread, so the callback releases the locks wherever it runs.
-    event.rpc("auth.exchange", encodeRequest(presented), (Throwable err, RPCResult result) -> {
-        try {
-            if (err != null) {
-                cb.onDone(err, null);
-                return;
+    // Any failure before the rpc is accepted releases the locks and fails the callback: a lock left held blocks every later exchange of the JVM.
+    try {
+        // The callback runs once, on the thread which completes the rpc: after close that is not the client's thread.
+        // A semaphore may be released on any thread, so the callback releases the locks wherever it runs.
+        event.rpc("auth.exchange", encodeRequest(presented), (Throwable err, RPCResult result) -> {
+            Throwable failure = err;
+            TokenExchangeResult outcome = null;
+            try {
+                if (err == null) {
+                    TokenExchangeResult reply = decodeReply(result.getData());
+                    if (reply.getRefreshToken() != null) {
+                        // A temporary file and a rename: another process never reads a torn value.
+                        writeTokenAtomically(tokenFile, reply.getRefreshToken());
+                    }
+                    // Written under the lock, so the result carries no refresh token: the client stores nothing after it.
+                    outcome = new TokenExchangeResult(reply.getToken(), null, reply.getGrace());
+                }
+            } catch (IOException | RuntimeException e) {
+                failure = e;
+            } finally {
+                release(processLock, fileLock.channel());
             }
-            TokenExchangeResult reply = decodeReply(result.getData());
-            if (reply.getRefreshToken() != null) {
-                // A temporary file and a rename: another process never reads a torn value.
-                writeTokenAtomically(tokenFile, reply.getRefreshToken());
-            }
-            // Written under the lock, so the result carries no refresh token: the client stores nothing after it.
-            cb.onDone(null, new TokenExchangeResult(reply.getToken(), null, reply.getGrace()));
-        } catch (IOException e) {
-            cb.onDone(e, null);
-        } finally {
-            release(processLock, fileLock.channel());
-        }
-    });
+            cb.onDone(failure, outcome);
+        });
+    } catch (RuntimeException e) {
+        release(processLock, fileLock.channel());
+        cb.onDone(e, null);
+    }
 }
 
 // Takes the process lock, then the file lock, both before the deadline. A failure leaves no lock taken. The file lock is
@@ -363,7 +370,7 @@ private static void release(Semaphore processLock, FileChannel channel) {
 }
 ```
 
-The store of the client runs after `exchange` returns, outside the lock, and writes without comparing: the recipe therefore never returns a refresh token it has written itself. The alternative is a `store` which takes the same lock and writes only when the file still holds the token the exchange presented. `load` reads without the lock: the rename makes it atomic. The lock is held for at most the client timeout, since the rpc fails at it.
+The store of the client runs after `exchange` returns, outside the lock, and writes without comparing: the recipe therefore never returns a refresh token it has written itself. The alternative is a `store` which takes the same lock and writes only when the file still holds the token the exchange presented. `load` reads without the lock: the rename makes it atomic. The lock is held for at most the client timeout, since the rpc fails at it. The wait for the lock runs on the client executor, because `exchange` is invoked there: while another process holds the lock, the client does no other work, pings included, for at most the client timeout. An application which cannot accept that waits on its own thread, and calls the callback from there. The process lock is a `Semaphore` and not a `ReentrantLock`, because the callback releases it on the thread which completes the rpc, and only the owner thread may release a `ReentrantLock`.
 
 The process lock is shared by every client of the process which names the same lock file, so two clients of one JVM wait for each other: a second `FileChannel` lock in one JVM would throw `OverlappingFileLockException`, which the recipe reports as an `IOException`. A client closed during an exchange is safe: its callback still runs once and releases both locks, and a client which then uses the same `TokenExchange` takes them as usual.
 
