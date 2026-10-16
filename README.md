@@ -238,6 +238,8 @@ The flow: when the connect reply is anonymous (no user), whether the connect sen
 
 Several tabs or processes of one installation can share one refresh token, with no lock in the client. The client reads `load` immediately before each exchange and stores the rotated token immediately after. An exchange which is refused is retried once, with the token read again, when another one rotated the token meanwhile. The backend keeps a short grace for the previous refresh token, so two clients which exchange at the same moment both get the same rotated pair.
 
+On logout, disconnect or close the client before clearing the stored refresh token: a renewal still in flight while the client stays connected stores its rotated token when it completes.
+
 | Event | When |
 |---|---|
 | `ConnectedEvent` with an empty user | `load` returned no refresh token: the connection stays anonymous |

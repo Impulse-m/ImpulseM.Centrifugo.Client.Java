@@ -41,6 +41,8 @@ public class Options {
 
     private ConnectionTokenGetter tokenGetter;
 
+    private TokenExchange tokenExchange;
+
     public TokenExchange getTokenExchange() {
         return tokenExchange;
     }
@@ -53,8 +55,6 @@ public class Options {
     public void setTokenExchange(TokenExchange tokenExchange) {
         this.tokenExchange = tokenExchange;
     }
-
-    private TokenExchange tokenExchange;
 
     public String getName() {
         return name;

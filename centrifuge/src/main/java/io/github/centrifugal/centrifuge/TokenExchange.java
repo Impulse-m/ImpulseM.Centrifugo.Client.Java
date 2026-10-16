@@ -22,6 +22,10 @@ public abstract class TokenExchange {
      * Persists a rotated refresh token. Called on the client's thread before the access token issued
      * with it is used. Once the client is closed, it may be called on the thread which completes the
      * exchange instead. A failure is reported to the listener, and the exchange goes on.
+     * <p>
+     * A renewal which is in flight while the client stays connected stores its rotation when it completes,
+     * even after the application cleared its stored refresh token. On logout, disconnect or close the client
+     * before clearing the stored token.
      */
     public abstract void store(String refreshToken);
 
