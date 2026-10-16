@@ -1,29 +1,34 @@
 package io.github.centrifugal.centrifuge;
 
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ScheduledFuture;
 
 
 /**
  * One connection of an {@link RpcPool}: a plain {@link Client} without an instance, so that its calls
- * are plain requests. Its fields are the state of the pool's thread, except {@link #sizeLimited}, which
- * the client's listener sets before it hands the disconnect to the pool.
+ * are plain requests. Its fields are the state of the pool's thread only: the client's listener hands
+ * every event to the pool's thread, and reads nothing of them.
  */
 final class RpcPoolConnection {
     final RpcPoolEndpoint endpoint;
     final Client client;
     // The calls on the wire, each holding one of the slots of the connection until its attempt answers.
     final Set<RpcPoolCall> calls = new HashSet<>();
+    // The calls whose attempt the connection lost. They hold no slot, and wait for the next event of the connection,
+    // which says whether they are sent again or settled.
+    final List<RpcPoolCall> lost = new ArrayList<>();
     // True from the connect until the client is connected, and again while it reconnects.
     boolean connecting = true;
     // The pool has dropped the connection: no call goes to it, and it is closed.
     boolean removed;
     // The idle close of the connection, when it has no call and the pool has an idle timeout.
     ScheduledFuture<?> idleTask;
-    // The server closed the connection for a frame over its size limit. Set before the disconnect is posted, so
-    // that an attempt which fails with the lost connection is not resent.
-    volatile boolean sizeLimited;
+    // The server closed the connection for a frame over its size limit, with this reason: the lost calls are settled, not sent again.
+    boolean sizeLimited;
+    String closeReason;
 
 
     RpcPoolConnection(RpcPool pool, RpcPoolEndpoint endpoint, Options options) {
@@ -70,9 +75,6 @@ final class RpcPoolConnection {
 
         @Override
         public void onDisconnected(Client c, DisconnectedEvent event) {
-            if (event.getCode() == Client.DISCONNECTED_MESSAGE_SIZE_LIMIT) {
-                sizeLimited = true;
-            }
             final String reason = event.getReason();
             final int code = event.getCode();
             pool.post(() -> pool.onDisconnected(RpcPoolConnection.this, code, reason));

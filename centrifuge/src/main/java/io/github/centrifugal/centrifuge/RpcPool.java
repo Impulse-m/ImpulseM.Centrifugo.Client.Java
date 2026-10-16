@@ -621,6 +621,8 @@ public final class RpcPool {
     void onConnecting(RpcPoolConnection conn) {
         if (!conn.removed) {
             conn.connecting = true;
+            releaseLost(conn);
+            pump();
         }
     }
 
@@ -629,8 +631,9 @@ public final class RpcPool {
         if (!conn.removed) {
             conn.connecting = false;
             conn.endpoint.closes = 0;
+            releaseLost(conn);
             pump();
-            if (!conn.removed && conn.calls.isEmpty()) {
+            if (idle(conn)) {
                 scheduleIdle(conn);
             }
         }
@@ -645,21 +648,50 @@ public final class RpcPool {
         if (conn.removed) {
             return;
         }
+        report(conn.endpoint.url(), new IOException(reason));
+        remove(conn);
         if (code == Client.DISCONNECTED_MESSAGE_SIZE_LIMIT) {
-            report(conn.endpoint.url(), new IOException(reason));
-            remove(conn);
-            List<RpcPoolCall> onWire = new ArrayList<>(conn.calls);
+            conn.sizeLimited = true;
+            conn.closeReason = reason;
+            // The attempts of the client failed before this event, and are lost calls already; the rest are settled too.
+            conn.lost.addAll(conn.calls);
             conn.calls.clear();
-            for (RpcPoolCall call : onWire) {
-                call.connection = null;
-                finishAttempt(call, null, new IOException(reason));
-            }
         } else {
-            report(conn.endpoint.url(), new IOException(reason));
-            remove(conn);
             hold(conn.endpoint);
         }
+        releaseLost(conn);
         pump();
+    }
+
+
+    // Decides the calls whose attempt the connection lost, on the connection's event: a message-size close settles
+    // them, and any other loss sends them again while the bound of the call allows.
+    private void releaseLost(RpcPoolConnection conn) {
+        if (conn.lost.isEmpty()) {
+            return;
+        }
+        List<RpcPoolCall> lost = new ArrayList<>(conn.lost);
+        conn.lost.clear();
+        for (RpcPoolCall call : lost) {
+            call.connection = null;
+            if (call.settled) {
+                continue;
+            }
+            if (conn.sizeLimited) {
+                finishAttempt(call, null, new IOException(conn.closeReason));
+            } else if (canResend(call)) {
+                call.resends++;
+                enqueue(call);
+            } else {
+                finishAttempt(call, null, new IOException("rpc connection lost"));
+            }
+        }
+    }
+
+
+    // Whether the connection has no call on the wire and none waiting for its event: only then it may go idle.
+    private static boolean idle(RpcPoolConnection conn) {
+        return conn.calls.isEmpty() && conn.lost.isEmpty();
     }
 
 
@@ -872,21 +904,26 @@ public final class RpcPool {
             pump();
             return;
         }
-        if (conn.calls.isEmpty() && !conn.removed) {
-            scheduleIdle(conn);
-        }
         call.connection = null;
         if (!call.settled) {
             if (error == null) {
                 finishAttempt(call, result, null);
             } else if (error instanceof ReplyError) {
                 onReplyError(call, (ReplyError) error);
-            } else if (error instanceof IOException && !conn.sizeLimited && canResend(call)) {
-                call.resends++;
-                enqueue(call);
+            } else if (error instanceof IOException) {
+                // The loss is not decided here: the client posts its losses before its events, and the event of the
+                // connection says whether the call is sent again. The call keeps the connection until then.
+                call.connection = conn;
+                conn.lost.add(call);
+                if (conn.removed) {
+                    releaseLost(conn);
+                }
             } else {
                 finishAttempt(call, null, error);
             }
+        }
+        if (idle(conn)) {
+            scheduleIdle(conn);
         }
         pump();
     }
@@ -1070,6 +1107,14 @@ public final class RpcPool {
             queue.remove(call);
             call.queued = false;
         }
+        if (call.connection != null && call.connection.lost.remove(call)) {
+            // A lost call waiting for its connection's event leaves the connection with its outcome.
+            RpcPoolConnection conn = call.connection;
+            call.connection = null;
+            if (idle(conn)) {
+                scheduleIdle(conn);
+            }
+        }
         if (call.redirectWaiting) {
             redirectWaiting.remove(call);
             call.redirectWaiting = false;
@@ -1140,7 +1185,7 @@ public final class RpcPool {
 
     private void onIdle(RpcPoolConnection conn) {
         conn.idleTask = null;
-        if (!conn.removed && conn.calls.isEmpty()) {
+        if (!conn.removed && idle(conn)) {
             remove(conn);
             pump();
         }

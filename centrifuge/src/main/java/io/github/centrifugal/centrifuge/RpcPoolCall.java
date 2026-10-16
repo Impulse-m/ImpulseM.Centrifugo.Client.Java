@@ -26,7 +26,8 @@ final class RpcPoolCall {
     boolean queued;
     // The call has its outcome: nothing runs for it any more, and its callback has been given the outcome.
     boolean settled;
-    // The connection which carries the attempt on the wire, null when no attempt is on the wire.
+    // The connection of the attempt in progress: on the wire, or lost and waiting for the connection's next event.
+    // Null when no attempt is in progress.
     RpcPoolConnection connection;
     // The endpoint of the connection of the last attempt, which a redirect URL is checked against.
     String endpointUrl;

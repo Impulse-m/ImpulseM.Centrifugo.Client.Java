@@ -224,6 +224,32 @@ public class RpcPoolTest extends RpcTestBase {
 
 
     @Test
+    public void aMessageSizeCloseOpensNoReplacementForTheCallOnTheWire() throws Exception {
+        AtomicInteger connects = new AtomicInteger();
+        server.onCommand = cmd -> {
+            if (cmd.hasConnect()) {
+                connects.incrementAndGet();
+                return null;
+            }
+            if (!cmd.hasRpc()) {
+                return null;
+            }
+            if ("blob.write".equals(cmd.getRpc().getMethod())) {
+                server.disconnect(1009, "message too big");
+                return null;
+            }
+            return rpcReply(cmd.getId(), "ok");
+        };
+        RpcPool pool = build(builder());
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        pool.rpc("blob.write", EMPTY_PAYLOAD, null, into(future));
+        assertTrue("the call fails", failsWithIOException(future));
+        assertEquals("the call is settled by the close, and sent once", 1, sentRpcRequests().size());
+        assertEquals("the close opens no replacement connection", 1, connects.get());
+    }
+
+
+    @Test
     public void aCallOverItsDeadlineIsNotSentAgain() throws Exception {
         server.onCommand = cmd -> cmd.hasRpc() && "blob.read".equals(cmd.getRpc().getMethod()) ? rpcReply(cmd.getId(), "ok") : null;
         server.deferCommand = cmd -> cmd.hasRpc() && "blob.hold".equals(cmd.getRpc().getMethod());
