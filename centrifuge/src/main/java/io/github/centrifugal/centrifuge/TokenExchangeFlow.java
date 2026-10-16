@@ -394,6 +394,9 @@ final class TokenExchangeFlow {
         cancelTimer(b);
         if (err == null) {
             acceptedExchange(result);
+        } else if (err instanceof UnauthorizedException) {
+            // A refusal which arrives after its connection went away starts the run too: the horizon counts from it.
+            openRefusalRun();
         }
         // A result which arrives after its connection went away, or after the bootstrap gave up, does not bootstrap.
         if (!isCurrent(b)) {
@@ -459,8 +462,9 @@ final class TokenExchangeFlow {
 
 
     // Opens the refusal run at its first refusal. Its horizon is the grace, timed on the scheduler's own monotonic clock.
+    // A closed client schedules nothing: its scheduler may be shut down.
     private void openRefusalRun() {
-        if (horizon == null) {
+        if (horizon == null && host.state() != ClientState.CLOSED) {
             horizon = host.scheduler().schedule(() -> {}, graceSeconds, TimeUnit.SECONDS);
         }
     }
@@ -774,6 +778,8 @@ final class TokenExchangeFlow {
         }
         if (err == null) {
             acceptedExchange(result);
+        } else if (err instanceof UnauthorizedException) {
+            openRefusalRun();
         }
         // The renewal result of a connection which went away is not used, but its rotation is stored as the bootstrap's is.
         if (transport != host.transport() || host.state() != ClientState.CONNECTED) {
