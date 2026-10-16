@@ -3,6 +3,7 @@ package io.github.centrifugal.centrifuge;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -23,6 +24,8 @@ import static org.junit.Assert.fail;
 
 public class RpcPoolTest extends RpcTestBase {
     private static final String AFFINITY_HEADER = "x-example-affinity";
+    // A port nothing listens on: its connections are refused, and never connect.
+    private static final String UNREACHABLE_URL = "ws://127.0.0.1:1/connection/websocket";
 
     private final List<RpcPool> pools = new ArrayList<>();
     private final List<String> errorEndpoints = new ArrayList<>();
@@ -193,10 +196,14 @@ public class RpcPoolTest extends RpcTestBase {
     @Test
     public void aConnectionClosedForItsMessageSizeSettlesWithoutAResend() throws Exception {
         server.onCommand = cmd -> {
-            if (cmd.hasRpc()) {
-                server.disconnect(1009, "message too big");
+            if (!cmd.hasRpc()) {
+                return null;
             }
-            return null;
+            if ("blob.write".equals(cmd.getRpc().getMethod())) {
+                server.disconnect(1009, "message too big");
+                return null;
+            }
+            return rpcReply(cmd.getId(), "ok");
         };
         RpcPool pool = build(builder().errorListener((endpoint, error) -> {
             synchronized (errorEndpoints) {
@@ -206,28 +213,33 @@ public class RpcPoolTest extends RpcTestBase {
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         pool.rpc("blob.write", EMPTY_PAYLOAD, null, into(future));
         assertTrue("the call fails", failsWithIOException(future));
-        Thread.sleep(300L);
-        assertEquals("a size-limit close is not resent", 1, sentRpcRequests().size());
         synchronized (errorEndpoints) {
-            assertEquals("the close is reported to the error listener", 1, errorEndpoints.size());
+            assertEquals("the close is reported before the call settles", 1, errorEndpoints.size());
         }
+        CompletableFuture<RPCResult> next = new CompletableFuture<>();
+        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(next));
+        assertEquals("ok", new String(next.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+        assertEquals("the failed call is not sent again: the next request is the next call", Arrays.asList("blob.write", "blob.read"), sentMethods());
     }
 
 
     @Test
     public void aCallOverItsDeadlineIsNotSentAgain() throws Exception {
-        server.deferCommand = cmd -> cmd.hasRpc();
+        server.onCommand = cmd -> cmd.hasRpc() && "blob.read".equals(cmd.getRpc().getMethod()) ? rpcReply(cmd.getId(), "ok") : null;
+        server.deferCommand = cmd -> cmd.hasRpc() && "blob.hold".equals(cmd.getRpc().getMethod());
         RpcPool pool = build(builder());
-        CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(200L).build(), into(future));
+        CompletableFuture<RPCResult> held = new CompletableFuture<>();
+        pool.rpc("blob.hold", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(200L).build(), into(held));
         try {
-            future.get(5, TimeUnit.SECONDS);
+            held.get(5, TimeUnit.SECONDS);
             fail("the call must time out");
         } catch (ExecutionException e) {
             assertTrue("a timeout", e.getCause() instanceof TimeoutException);
         }
-        Thread.sleep(300L);
-        assertEquals("a timed-out call is not resent", 1, sentRpcRequests().size());
+        CompletableFuture<RPCResult> next = new CompletableFuture<>();
+        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(next));
+        next.get(5, TimeUnit.SECONDS);
+        assertEquals("the timed-out call is not sent again: the next request is the next call", Arrays.asList("blob.hold", "blob.read"), sentMethods());
     }
 
 
@@ -274,13 +286,104 @@ public class RpcPoolTest extends RpcTestBase {
 
     @Test
     public void aPoolWithoutIdleTimeoutKeepsItsConnection() throws Exception {
-        answerRpcs("ok");
+        AtomicInteger connects = new AtomicInteger();
+        server.onCommand = cmd -> {
+            if (cmd.hasConnect()) {
+                connects.incrementAndGet();
+                return null;
+            }
+            return cmd.hasRpc() ? rpcReply(cmd.getId(), "ok") : null;
+        };
         RpcPool pool = build(builder().idleTimeout(0L));
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(first));
+        first.get(5, TimeUnit.SECONDS);
+        CompletableFuture<RPCResult> second = new CompletableFuture<>();
+        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(second));
+        second.get(5, TimeUnit.SECONDS);
+        assertEquals("both calls went over the one connection, which was not closed", 1, connects.get());
+        assertEquals(1, pool.stats().getConnections());
+    }
+
+
+    @Test
+    public void aQueueWithoutRoomStillOpensAConnectionForACall() throws Exception {
+        answerRpcs("ok");
+        RpcPool pool = build(builder().maxQueued(0));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
-        future.get(5, TimeUnit.SECONDS);
-        Thread.sleep(200L);
-        assertEquals(1, pool.stats().getConnections());
+        assertEquals("ok", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+    }
+
+
+    @Test
+    public void aFullQueueForOneKeyDoesNotRefuseACallOfAnotherKeyWithoutAConnection() throws Exception {
+        server.deferCommand = cmd -> cmd.hasRpc();
+        RpcPool pool = build(new RpcPool.Builder(endpointKey -> Collections.singletonList("a".equals(endpointKey) ? server.url() : UNREACHABLE_URL))
+                .random(maximumDraws())
+                .maxConnectionsPerEndpoint(1)
+                .maxQueued(1));
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        CompletableFuture<RPCResult> waiting = new CompletableFuture<>();
+        CompletableFuture<RPCResult> refused = new CompletableFuture<>();
+        CompletableFuture<RPCResult> other = new CompletableFuture<>();
+        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("a").build(), into(first));
+        awaitCondition("the first call on the wire", () -> pool.stats().getInflight() == 1);
+        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("a").build(), into(waiting));
+        awaitCondition("the queue of key a is full", () -> pool.stats().getQueued() == 1);
+        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("a").build(), into(refused));
+        assertEquals(ReplyError.LIMIT_EXCEEDED, replyErrorOf(refused).getCode());
+        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("b").timeout(5_000L).build(), into(other));
+        awaitCondition("a connection is opened for the other key", () -> pool.stats().getConnections() == 2);
+        assertTrue("the call of the other key is not refused", !other.isDone());
+        awaitAll(Collections.singletonList(first), true);
+    }
+
+
+    @Test
+    public void aConnectionOpenedForCallsWhichTimeOutWhileQueuedIsClosedAfterTheIdleTimeout() throws Exception {
+        RpcPool pool = build(new RpcPool.Builder(endpointKey -> Collections.singletonList(UNREACHABLE_URL))
+                .random(maximumDraws())
+                .idleTimeout(100L));
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(50L).build(), into(future));
+        try {
+            future.get(5, TimeUnit.SECONDS);
+            fail("the call must time out");
+        } catch (ExecutionException e) {
+            assertTrue("a timeout", e.getCause() instanceof TimeoutException);
+        }
+        awaitCondition("the connection that never connected is closed", () -> pool.stats().getConnections() == 0);
+    }
+
+
+    @Test
+    public void aConnectionTheServerClosesForGoodIsReportedAndNotDialledInALoop() throws Exception {
+        AtomicInteger connects = new AtomicInteger();
+        server.onCommand = cmd -> {
+            if (cmd.hasConnect()) {
+                connects.incrementAndGet();
+                server.disconnect(3501, "invalid token");
+            }
+            return null;
+        };
+        RpcPool pool = build(builder().errorListener((endpoint, error) -> {
+            synchronized (errorEndpoints) {
+                errorEndpoints.add(endpoint);
+            }
+        }));
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(1_000L).build(), into(future));
+        try {
+            future.get(5, TimeUnit.SECONDS);
+            fail("the call must time out");
+        } catch (ExecutionException e) {
+            assertTrue("a timeout", e.getCause() instanceof TimeoutException);
+        }
+        synchronized (errorEndpoints) {
+            assertTrue("the close is reported to the error listener", errorEndpoints.size() >= 1);
+        }
+        assertTrue("the endpoint is held back between the dials, not dialled at once: " + connects.get(), connects.get() < 5);
     }
 
 
@@ -334,6 +437,15 @@ public class RpcPoolTest extends RpcTestBase {
             }
             return true;
         });
+    }
+
+
+    private List<String> sentMethods() {
+        List<String> methods = new ArrayList<>();
+        for (Protocol.RPCRequest request : sentRpcRequests()) {
+            methods.add(request.getMethod());
+        }
+        return methods;
     }
 
 
