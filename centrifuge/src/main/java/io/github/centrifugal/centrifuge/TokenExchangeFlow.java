@@ -445,6 +445,7 @@ final class TokenExchangeFlow {
         bootstrap = null;
         bootstrapAttempt = 0;
         cancelTimer(b);
+        host.cancelPing();
         host.resumeConnect(b.reply.toBuilder().setConnect(merge(b, refresh)).build());
     }
 

@@ -93,6 +93,15 @@ final class ClientHost {
     }
 
 
+    /** Cancels the ping timer, which a ping during a token exchange of the connect may have scheduled. */
+    void cancelPing() {
+        if (client.pingTask != null) {
+            client.pingTask.cancel(true);
+            client.pingTask = null;
+        }
+    }
+
+
     /** Moves on with each refresh() call and each accepted token, so a change since an exchange started is seen. */
     long refreshGeneration() {
         return client.auth.refreshGeneration();
