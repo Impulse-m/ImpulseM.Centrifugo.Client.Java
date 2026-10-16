@@ -243,7 +243,7 @@ final class TokenExchangeFlow {
                 .setRpc(Protocol.RPCRequest.newBuilder()
                         .setMethod(method)
                         .setData(com.google.protobuf.ByteString.copyFrom(data)));
-        writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> host.runOrInline(() -> deliverRpc(host, reply, err, cb)));
+        writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> host.runOrInline(() -> RpcSession.deliver(host, cb, reply, err)));
     }
 
 
@@ -632,20 +632,5 @@ final class TokenExchangeFlow {
             return;
         }
         cb.Done(null, result.getToken());
-    }
-
-
-    private static void deliverRpc(ClientHost host, Protocol.Reply reply, Throwable err, ResultCallback<RPCResult> cb) {
-        if (err != null) {
-            cb.onDone(Extensions.unwrapCompletion(err), null);
-            return;
-        }
-        if (reply.getError().getCode() != 0) {
-            cb.onDone(host.replyError(reply), null);
-            return;
-        }
-        RPCResult result = new RPCResult();
-        result.setData(reply.getRpc().getData().toByteArray());
-        cb.onDone(null, result);
     }
 }
