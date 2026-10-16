@@ -550,7 +550,7 @@ public class TokenExchangeTest extends RpcTestBase {
         // The verdict waits for the scheduler's clock to pass the grace; no wall clock step moves it.
         for (int step = 0; step < 4; step++) {
             clock.advance(1000);
-            Thread.sleep(5);
+            drainExecutor();
         }
         drainExecutor();
         assertTrue(disconnects.isEmpty());
@@ -609,13 +609,13 @@ public class TokenExchangeTest extends RpcTestBase {
         newExchangeClient(exchangeOptions(storage), clock);
         client.connect();
         awaitCondition("refusal reported", () -> !errors.isEmpty());
-        Object horizon = fieldOf(fieldOf(client.auth, "flow"), "horizon");
+        Object horizon = horizonOf();
         assertNotNull(horizon);
 
         // The reconnect goes on with the same run: its horizon is the one of the first refusal.
         server.closeConnection();
         pumpUntil(clock, "reconnect refused", () -> storage.exchanged.size() >= 3);
-        assertSame(horizon, fieldOf(fieldOf(client.auth, "flow"), "horizon"));
+        assertSame(horizon, horizonOf());
         assertTrue(disconnects.isEmpty());
 
         // The application's disconnect ends the run: a new connect starts one, even past the old horizon.
@@ -625,8 +625,82 @@ public class TokenExchangeTest extends RpcTestBase {
         int before = bootstrapDelays(clock).size();
         client.connect();
         awaitCondition("retry of the new run scheduled", () -> bootstrapDelays(clock).size() > before);
-        assertNotNull(fieldOf(fieldOf(client.auth, "flow"), "horizon"));
+        assertNotNull(horizonOf());
         assertEquals(0, disconnects.stream().filter((DisconnectedEvent event) -> event.getCode() == CODE_DISCONNECT_UNAUTHORIZED).count());
+    }
+
+
+    @Test
+    public void changingStoredTokenIsPresentedOnlyWhileTheHorizonIsOpen() throws Exception {
+        // The storage alternates between two values the issuer refuses. Each attempt moves the clock on by a second.
+        ManualScheduler clock = new ManualScheduler();
+        AtomicInteger loads = new AtomicInteger();
+        Storage storage = new Storage("refresh-a") {
+            @Override
+            public int grace() {
+                return 3;
+            }
+
+            @Override
+            public String load() {
+                return loads.incrementAndGet() % 2 == 0 ? "refresh-a" : "refresh-b";
+            }
+
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                exchanged.add(event.getRefreshToken());
+                clock.advance(1000);
+                cb.onDone(new UnauthorizedException(), null);
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+
+        client.connect();
+        awaitCondition("disconnected", () -> disconnects.size() == 1);
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        // The first changed token is presented at once, the later ones only inside the horizon: the run ends at it.
+        assertTrue(storage.exchanged.size() <= 4);
+    }
+
+
+    @Test
+    public void twoClientsSharingOneStorageStoreTheSameRotationWithTheirOwnAccessTokens() throws Exception {
+        // Both clients read the token before either stores its rotation. The issuer answers each exchange with the
+        // same rotated refresh token and a fresh access token, as it does inside the grace.
+        answerIdentity(false, 0);
+        AtomicInteger issued = new AtomicInteger();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public String load() {
+                return "refresh-1";
+            }
+
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                exchanged.add(event.getRefreshToken());
+                cb.onDone(null, new TokenExchangeResult("access-" + issued.incrementAndGet(), "refresh-2"));
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), new ManualScheduler());
+        Client second = new Client(
+                server.url(),
+                exchangeOptions(storage),
+                listener(),
+                RETRY_MIN_MILLIS,
+                RETRY_MAX_MILLIS,
+                new ManualScheduler(),
+                new Random()
+        );
+        try {
+            client.connect();
+            second.connect();
+            awaitCondition("both connected", () -> connected.size() == 2);
+
+            assertEquals(Arrays.asList("refresh-2", "refresh-2"), storage.stored);
+            assertEquals(new HashSet<>(Arrays.asList("access-1", "access-2")), new HashSet<>(refreshTokens()));
+        } finally {
+            second.close(1000);
+        }
     }
 
 
@@ -687,7 +761,7 @@ public class TokenExchangeTest extends RpcTestBase {
 
         // The listed name starts the refusal run: the attempt is retried within the grace, and is not the verdict.
         awaitCondition("refusal reported", () -> !errors.isEmpty());
-        assertNotNull(fieldOf(fieldOf(client.auth, "flow"), "horizon"));
+        assertNotNull(horizonOf());
         assertTrue(disconnects.isEmpty());
         assertTrue(errors.get(0) instanceof TokenError);
     }
@@ -1276,6 +1350,33 @@ public class TokenExchangeTest extends RpcTestBase {
         assertNull(storage.load());
         assertEquals(1, connected.size());
         assertEquals(1, errors.size());
+    }
+
+
+    @Test
+    public void renewalRefusedAfterItsTimeoutOpensTheRefusalRun() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        StallingStorage storage = new StallingStorage("refresh-1", 2);
+        ManualScheduler clock = new ManualScheduler();
+        Options options = exchangeOptions(storage);
+        options.setTimeout(1000);
+        newExchangeClient(options, clock);
+        client.connect();
+        awaitCondition("connected", () -> connected.size() == 1);
+        clock.advance(renewalDelay(clock));
+        awaitCondition("renewal exchange started", () -> storage.held != null);
+
+        clock.advance(options.getTimeout());
+        awaitCondition("timeout reported", () -> !errors.isEmpty());
+        assertNull(horizonOf());
+        // The refusal arrives late: the horizon counts from it, as it does for a refusal within the deadline.
+        storage.held.onDone(new UnauthorizedException(), null);
+        drainExecutor();
+
+        assertNotNull(horizonOf());
+        assertTrue(disconnects.isEmpty());
+        assertEquals(1, connected.size());
     }
 
 
