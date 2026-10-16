@@ -278,7 +278,7 @@ final class TokenExchangeFlow {
             b.exchangeTimeout = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> onExchangeTimeout(b, called)), host.timeoutMillis(), TimeUnit.MILLISECONDS);
             exchange.exchange(new TokenExchangeEvent(host, b.transport, refreshToken), (Throwable err, TokenExchangeResult result) -> {
                 if (called.compareAndSet(false, true)) {
-                    host.runOrInline(() -> onExchanged(b, refreshToken, generation, reloaded, err, result));
+                    host.runOrInline(() -> onExchanged(b, refreshToken, generation, reloaded, Extensions.unwrapCompletion(err), result));
                 }
             });
         } catch (RuntimeException e) {
@@ -577,7 +577,7 @@ final class TokenExchangeFlow {
             renewal.deadline = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> onRenewalTimeout(cb, renewal)), host.timeoutMillis(), TimeUnit.MILLISECONDS);
             exchange.exchange(new TokenExchangeEvent(host, transport, refreshToken), (Throwable err, TokenExchangeResult result) -> {
                 if (renewal.called.compareAndSet(false, true)) {
-                    host.runOrInline(() -> onRenewed(renewal, transport, cb, refreshToken, reloaded, generation, err, result));
+                    host.runOrInline(() -> onRenewed(renewal, transport, cb, refreshToken, reloaded, generation, Extensions.unwrapCompletion(err), result));
                 } else {
                     host.runOrInline(() -> storeAbandonedRotation(result, refreshToken));
                 }

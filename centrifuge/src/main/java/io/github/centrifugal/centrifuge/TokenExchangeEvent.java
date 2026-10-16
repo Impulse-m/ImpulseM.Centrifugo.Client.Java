@@ -1,5 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
+import java.util.Objects;
+
 import okhttp3.WebSocket;
 
 
@@ -32,11 +34,14 @@ public final class TokenExchangeEvent {
      * It carries no message id and is not retransmitted. It fails with IOException when that connection
      * is lost, and with a timeout when no reply comes within the client timeout.
      *
-     * @param method: the rpc method name.
-     * @param data:   the request payload.
+     * @param method: the rpc method name, not null.
+     * @param data:   the request payload, not null.
      * @param cb:     called with the reply, or with the failure.
+     * @throws NullPointerException when the method or the data is null.
      */
     public void rpc(final String method, final byte[] data, final ResultCallback<RPCResult> cb) {
+        Objects.requireNonNull(method, "method");
+        Objects.requireNonNull(data, "data");
         host.runOrInline(() -> TokenExchangeFlow.sendRpc(host, transport, method, data, cb));
     }
 }
