@@ -270,20 +270,17 @@ Within the run a refusal is reported as an `ErrorEvent` with `TokenError`, with 
 The client holds no lock, and that is enough for a rotation which the next attempt can recover from. An installation whose processes must not present different refresh tokens (one live refresh token per installation) puts the whole rotation inside `exchange`, under a lock of the storage. The lock is taken before the stored token is read, and released after the rotated token is written, so that no other process reads or writes between them. The recipe, with `java.nio` only:
 
 ```java
-private final ReentrantLock processLock = new ReentrantLock();
+private static final ConcurrentMap<Path, Semaphore> PROCESS_LOCKS = new ConcurrentHashMap<>();
 private final Path lockFile = Paths.get(dataDir, "refresh_token.lock");
 
 @Override
 public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
-    // The client's thread takes the process lock, and the callback, which runs on that thread, releases it.
-    processLock.lock();
-    FileChannel channel;
+    // Both waits end at the client timeout, the deadline of the rpc. A failure of either fails the callback.
+    Semaphore processLock = PROCESS_LOCKS.computeIfAbsent(lockFile.toAbsolutePath(), (Path path) -> new Semaphore(1));
     FileLock fileLock;
     try {
-        channel = FileChannel.open(lockFile, CREATE, READ, WRITE);
-        fileLock = channel.lock();
-    } catch (IOException e) {
-        processLock.unlock();
+        fileLock = acquire(processLock, lockFile, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis));
+    } catch (IOException | InterruptedException e) {
         cb.onDone(e, null);
         return;
     }
@@ -292,15 +289,17 @@ public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResul
     try {
         presented = readToken(tokenFile);
     } catch (IOException e) {
-        release(channel, fileLock);
+        release(processLock, fileLock.channel());
         cb.onDone(e, null);
         return;
     }
     if (presented == null) {
-        release(channel, fileLock);
+        release(processLock, fileLock.channel());
         cb.onDone(new UnauthorizedException(), null);
         return;
     }
+    // The callback runs once, on the thread which completes the rpc: after close that is not the client's thread.
+    // A semaphore may be released on any thread, so the callback releases the locks wherever it runs.
     event.rpc("auth.exchange", encodeRequest(presented), (Throwable err, RPCResult result) -> {
         try {
             if (err != null) {
@@ -317,25 +316,56 @@ public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResul
         } catch (IOException e) {
             cb.onDone(e, null);
         } finally {
-            release(channel, fileLock);
+            release(processLock, fileLock.channel());
         }
     });
 }
 
-// Releases the file lock, closes its channel, and unlocks the process lock.
-private void release(FileChannel channel, FileLock fileLock) {
+// Takes the process lock, then the file lock, both before the deadline. A failure leaves no lock taken. The file lock is
+// polled, so the deadline ends the wait.
+private static FileLock acquire(Semaphore processLock, Path file, long deadline) throws IOException, InterruptedException {
+    if (!processLock.tryAcquire(deadline - System.nanoTime(), TimeUnit.NANOSECONDS)) {
+        throw new IOException("the process lock timed out");
+    }
+    FileChannel channel = null;
     try {
-        fileLock.release();
-        channel.close();
+        channel = FileChannel.open(file, CREATE, READ, WRITE);
+        while (true) {
+            FileLock fileLock = channel.tryLock();
+            if (fileLock != null) {
+                return fileLock;
+            }
+            if (System.nanoTime() >= deadline) {
+                throw new IOException("the file lock timed out");
+            }
+            Thread.sleep(20);
+        }
+    } catch (OverlappingFileLockException e) {
+        release(processLock, channel);
+        throw new IOException("the lock file is held by this process", e);
+    } catch (IOException | InterruptedException | RuntimeException e) {
+        release(processLock, channel);
+        throw e;
+    }
+}
+
+// Closes the channel, which releases its file lock, and then releases the process lock. Null channel: only the process lock.
+private static void release(Semaphore processLock, FileChannel channel) {
+    try {
+        if (channel != null) {
+            channel.close();
+        }
     } catch (IOException e) {
         // The lock is gone with the channel: nothing else to undo.
     } finally {
-        processLock.unlock();
+        processLock.release();
     }
 }
 ```
 
 The store of the client runs after `exchange` returns, outside the lock, and writes without comparing: the recipe therefore never returns a refresh token it has written itself. The alternative is a `store` which takes the same lock and writes only when the file still holds the token the exchange presented. `load` reads without the lock: the rename makes it atomic. The lock is held for at most the client timeout, since the rpc fails at it.
+
+The process lock is shared by every client of the process which names the same lock file, so two clients of one JVM wait for each other: a second `FileChannel` lock in one JVM would throw `OverlappingFileLockException`, which the recipe reports as an `IOException`. A client closed during an exchange is safe: its callback still runs once and releases both locks, and a client which then uses the same `TokenExchange` takes them as usual.
 
 #### The attribution claim (`meta`)
 
