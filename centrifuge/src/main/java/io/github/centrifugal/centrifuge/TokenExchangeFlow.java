@@ -1,5 +1,6 @@
 package io.github.centrifugal.centrifuge;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -16,6 +17,7 @@ import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
 import java8.util.concurrent.CompletableFuture;
 import okhttp3.WebSocket;
+import okio.ByteString;
 
 
 /**
@@ -223,7 +225,7 @@ final class TokenExchangeFlow {
         final int id = host.nextCommandId();
         host.addFuture(id, future);
         try {
-            if (!host.sendCommand(builder.setId(id).build())) {
+            if (!transport.send(ByteString.of(encode(builder.setId(id).build())))) {
                 future.completeExceptionally(new IOException());
             }
         } catch (IOException e) {
@@ -231,6 +233,23 @@ final class TokenExchangeFlow {
         }
         return future.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS)
                 .whenComplete((Protocol.Reply reply, Throwable err) -> host.removeFuture(id));
+    }
+
+
+    // Encodes a command as the client writes it. Throws when the encoding fails, so that only the call of the command fails.
+    private static byte[] encode(Protocol.Command cmd) throws IOException {
+        ByteArrayOutputStream stream = new ByteArrayOutputStream();
+        cmd.writeDelimitedTo(stream);
+        return stream.toByteArray();
+    }
+
+
+    // Runs the task on the executor, from any thread. Once the executor is shut down, which is after the client closed,
+    // a late completion runs the task inline on the completing thread, so the callbacks still run exactly once.
+    // A failure of the task goes to the listener.
+    static void runOrInline(ClientHost host, Runnable task) {
+        Runnable reported = host.reporting(task);
+        Extensions.submitOrRun(host.executor(), reported, reported);
     }
 
 
@@ -247,7 +266,7 @@ final class TokenExchangeFlow {
                 .setRpc(Protocol.RPCRequest.newBuilder()
                         .setMethod(method)
                         .setData(com.google.protobuf.ByteString.copyFrom(data)));
-        writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> host.runOrInline(() -> RpcSession.deliver(host, cb, reply, err)));
+        writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> runOrInline(host, () ->RpcSession.deliver(host, cb, reply, err)));
     }
 
 
@@ -278,7 +297,7 @@ final class TokenExchangeFlow {
             b.exchangeTimeout = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> onExchangeTimeout(b, called)), host.timeoutMillis(), TimeUnit.MILLISECONDS);
             exchange.exchange(new TokenExchangeEvent(host, b.transport, refreshToken), (Throwable err, TokenExchangeResult result) -> {
                 if (called.compareAndSet(false, true)) {
-                    host.runOrInline(() -> onExchanged(b, refreshToken, generation, reloaded, Extensions.unwrapCompletion(err), result));
+                    runOrInline(host, () ->onExchanged(b, refreshToken, generation, reloaded, Extensions.unwrapCompletion(err), result));
                 }
             });
         } catch (RuntimeException e) {
@@ -375,7 +394,7 @@ final class TokenExchangeFlow {
         b.tokenSet = true;
         Protocol.Command.Builder builder = Protocol.Command.newBuilder()
                 .setRefresh(Protocol.RefreshRequest.newBuilder().setToken(accessToken));
-        writePlain(host, b.transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> host.runOrInline(() -> onRefreshed(b, reply, err)));
+        writePlain(host, b.transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> runOrInline(host, () ->onRefreshed(b, reply, err)));
     }
 
 
@@ -577,9 +596,9 @@ final class TokenExchangeFlow {
             renewal.deadline = host.scheduler().schedule(() -> Extensions.submitOrIgnore(host.executor(), () -> onRenewalTimeout(cb, renewal)), host.timeoutMillis(), TimeUnit.MILLISECONDS);
             exchange.exchange(new TokenExchangeEvent(host, transport, refreshToken), (Throwable err, TokenExchangeResult result) -> {
                 if (renewal.called.compareAndSet(false, true)) {
-                    host.runOrInline(() -> onRenewed(renewal, transport, cb, refreshToken, reloaded, generation, Extensions.unwrapCompletion(err), result));
+                    runOrInline(host, () ->onRenewed(renewal, transport, cb, refreshToken, reloaded, generation, Extensions.unwrapCompletion(err), result));
                 } else {
-                    host.runOrInline(() -> storeAbandonedRotation(result, refreshToken));
+                    runOrInline(host, () ->storeAbandonedRotation(result, refreshToken));
                 }
             });
         } catch (RuntimeException e) {

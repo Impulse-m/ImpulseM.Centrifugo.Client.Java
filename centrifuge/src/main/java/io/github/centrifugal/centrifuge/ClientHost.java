@@ -135,18 +135,13 @@ final class ClientHost {
 
     /**
      * Sends the command on the current transport. Returns whether the transport took it. Throws when the
-     * command cannot be encoded, so that only the call of the command fails.
+     * command cannot be encoded, so that only the call of the command fails. The encoding mirrors
+     * Client.serializeCommand, which swallows the failure: a copy here, so the failure reaches the call.
      */
     boolean sendCommand(Protocol.Command cmd) throws IOException {
-        return client.ws.send(ByteString.of(encode(cmd)));
-    }
-
-
-    /** Encodes a command as the client writes it. Throws when the encoding fails. */
-    static byte[] encode(Protocol.Command cmd) throws IOException {
         ByteArrayOutputStream stream = new ByteArrayOutputStream();
         cmd.writeDelimitedTo(stream);
-        return stream.toByteArray();
+        return client.ws.send(ByteString.of(stream.toByteArray()));
     }
 
 
@@ -222,16 +217,5 @@ final class ClientHost {
                 reportError(failure);
             }
         };
-    }
-
-
-    /**
-     * Runs the task on the executor, from any thread. Once the executor is shut down, which is after the client
-     * closed, a late completion runs the task inline on the completing thread instead, so the callbacks still run
-     * exactly once. A failure of the task goes to the listener.
-     */
-    void runOrInline(Runnable task) {
-        Runnable reported = reporting(task);
-        Extensions.submitOrRun(executor(), reported, reported);
     }
 }

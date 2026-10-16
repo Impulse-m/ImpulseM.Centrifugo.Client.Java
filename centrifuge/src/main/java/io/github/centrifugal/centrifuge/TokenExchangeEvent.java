@@ -42,6 +42,6 @@ public final class TokenExchangeEvent {
     public void rpc(final String method, final byte[] data, final ResultCallback<RPCResult> cb) {
         Objects.requireNonNull(method, "method");
         Objects.requireNonNull(data, "data");
-        host.runOrInline(() -> TokenExchangeFlow.sendRpc(host, transport, method, data, cb));
+        TokenExchangeFlow.runOrInline(host, () -> TokenExchangeFlow.sendRpc(host, transport, method, data, cb));
     }
 }
