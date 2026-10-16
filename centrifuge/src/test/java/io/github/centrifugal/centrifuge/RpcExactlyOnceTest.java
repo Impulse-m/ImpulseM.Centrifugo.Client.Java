@@ -2,7 +2,6 @@ package io.github.centrifugal.centrifuge;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -28,11 +27,15 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
+import okhttp3.Request;
+import okhttp3.Response;
 import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
 
 import okio.ByteString;
 
@@ -281,23 +284,15 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     public void cancelWhoseSendThrowsIsKeptAndTheRestOfTheFlushGoesOut() throws Exception {
         enableRpcOptions();
         serveDedup();
-        AtomicBoolean failTheNextFlush = new AtomicBoolean();
         BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
-        Client c = newClientWithFailingSend(
-                reported,
-                failTheNextFlush,
-                new IllegalStateException("transport failed inside the send"),
-                true,
-                true);
+        Client c = newClientWithFailingSend(reported, true);
         connect(c);
         Set<Long> msgIds = new HashSet<>(sendHeldCallsAndDisconnect(c, 2));
         CompletableFuture<RPCResult> queuedFuture = new CompletableFuture<>();
         c.rpcCall("queued", EMPTY_PAYLOAD, into(queuedFuture));
 
         // The transport fails on the first cancel sent after the connect reply: the flush of the cancels sends first.
-        failTheNextFlush.set(true);
-        c.connect();
-        assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+        connectWithFailingSend(c, new IllegalStateException("transport failed inside the send"), true);
 
         RPCResult queued = queuedFuture.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
         assertEquals("the call queued for the connect is answered", "{}", new String(queued.getData(), StandardCharsets.UTF_8));
@@ -320,22 +315,14 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     public void cancelWhoseSendFailsWithAnErrorIsKeptAndTheRestOfTheFlushGoesOut() throws Exception {
         enableRpcOptions();
         serveDedup();
-        AtomicBoolean failTheNextFlush = new AtomicBoolean();
         BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
-        Client c = newClientWithFailingSend(
-                reported,
-                failTheNextFlush,
-                new NoClassDefFoundError("transport linkage failed inside the send"),
-                false,
-                true);
+        Client c = newClientWithFailingSend(reported, false);
         connect(c);
         Set<Long> msgIds = new HashSet<>(sendHeldCallsAndDisconnect(c, 3));
         CompletableFuture<RPCResult> queuedFuture = new CompletableFuture<>();
         c.rpcCall("queued", EMPTY_PAYLOAD, into(queuedFuture));
 
-        failTheNextFlush.set(true);
-        c.connect();
-        assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+        connectWithFailingSend(c, new NoClassDefFoundError("transport linkage failed inside the send"), true);
 
         RPCResult queued = queuedFuture.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
         assertEquals("the call queued for the connect is answered", "{}", new String(queued.getData(), StandardCharsets.UTF_8));
@@ -359,7 +346,6 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         final long expiryMillis = TimeUnit.SECONDS.toMillis(ttlSeconds);
         server.connectResult = server.connectResult.toBuilder().setExpires(true).setTtl(ttlSeconds).build();
         serveDedup();
-        AtomicBoolean failTheNextFlush = new AtomicBoolean();
         BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
         BlockingQueue<Integer> armedAtReport = new LinkedBlockingQueue<>();
         ManualScheduler clock = new ManualScheduler();
@@ -368,8 +354,58 @@ public class RpcExactlyOnceTest extends RpcTestBase {
             @Override
             public void onConnected(Client client, ConnectedEvent event) {
                 signalling.onConnected(client, event);
-                if (failTheNextFlush.getAndSet(false)) {
-                    failTheFirstSend(client, new IllegalStateException("transport failed inside the send"), true);
+            }
+
+
+            @Override
+            public void onDisconnected(Client client, DisconnectedEvent event) {
+                signalling.onDisconnected(client, event);
+            }
+
+
+            @Override
+            public void onError(Client client, ErrorEvent event) {
+                reported.add(event.getError());
+                armedAtReport.add(clock.pendingWithDelay(expiryMillis));
+                client.disconnect();
+            }
+        }, AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, clock);
+        client = c;
+        connect(c);
+        sendHeldCallsAndDisconnect(c, 1);
+
+        connectWithFailingSend(c, new IllegalStateException("transport failed inside the send"), true);
+        assertTrue("the failed send is reported", reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) != null);
+        Integer armed = armedAtReport.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertTrue("the report runs after the connect reply armed its expiry timer", armed != null && armed > 0);
+        awaitCondition("the report disconnects the client", () -> c.getState() == ClientState.DISCONNECTED);
+        drainExecutor();
+        assertEquals("the disconnect leaves no expiry timer armed", 0, clock.pendingWithDelay(expiryMillis));
+    }
+
+
+    // A listener which throws from onConnected leaves the handshake whole: the call queued while disconnected is written,
+    // the ping and expiry timers are armed when the failure is reported, and the failure is reported after them.
+    @Test
+    public void listenerFailureInOnConnectedLeavesTheHandshakeWhole() throws Exception {
+        enableRpcOptions();
+        serveDedup();
+        final int ttlSeconds = 60;
+        final long expiryMillis = TimeUnit.SECONDS.toMillis(ttlSeconds);
+        final long pingMillis = server.connectResult.getPing() * 1000L + instanceOptions().getMaxServerPingDelay();
+        server.connectResult = server.connectResult.toBuilder().setExpires(true).setTtl(ttlSeconds).build();
+        AtomicBoolean failOnConnect = new AtomicBoolean();
+        BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
+        BlockingQueue<Integer> expiryArmedAtReport = new LinkedBlockingQueue<>();
+        BlockingQueue<Integer> pingArmedAtReport = new LinkedBlockingQueue<>();
+        ManualScheduler clock = new ManualScheduler();
+        EventListener signalling = signallingListener();
+        Client c = new Client(server.url(), instanceOptions(), new EventListener() {
+            @Override
+            public void onConnected(Client client, ConnectedEvent event) {
+                signalling.onConnected(client, event);
+                if (failOnConnect.get()) {
+                    throw new IllegalStateException("listener failed on connect");
                 }
             }
 
@@ -383,22 +419,24 @@ public class RpcExactlyOnceTest extends RpcTestBase {
             @Override
             public void onError(Client client, ErrorEvent event) {
                 reported.add(event.getError());
-                armedAtReport.add(Collections.frequency(clock.requestedDelays(), expiryMillis));
-                client.disconnect();
+                expiryArmedAtReport.add(clock.pendingWithDelay(expiryMillis));
+                pingArmedAtReport.add(clock.pendingWithDelay(pingMillis));
             }
         }, AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, clock);
         client = c;
         connect(c);
-        sendHeldCallsAndDisconnect(c, 1);
-
-        failTheNextFlush.set(true);
-        c.connect();
-        assertTrue("the failed send is reported", reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) != null);
-        Integer armed = armedAtReport.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
-        assertEquals("the report runs after the connect reply armed its expiry timer", Integer.valueOf(2), armed);
-        awaitCondition("the report disconnects the client", () -> c.getState() == ClientState.DISCONNECTED);
+        c.disconnect();
+        c.rpcCall("queued", EMPTY_PAYLOAD, into(new CompletableFuture<RPCResult>()));
         drainExecutor();
-        assertEquals("the disconnect leaves no expiry timer armed", 0, clock.pendingWithDelay(expiryMillis));
+
+        failOnConnect.set(true);
+        c.connect();
+
+        Throwable failure = reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertTrue("the listener failure is reported", failure instanceof IllegalStateException);
+        awaitCondition("the queued call is written", () -> sentRpcRequests().size() == 1);
+        assertTrue("the expiry timer is armed when the failure is reported", expiryArmedAtReport.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) > 0);
+        assertTrue("the ping timer is armed when the failure is reported", pingArmedAtReport.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) > 0);
     }
 
 
@@ -407,13 +445,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     public void callWhoseSendFailsWithAnErrorFailsAloneAndTheRestOfTheFlushGoesOut() throws Exception {
         enableRpcOptions();
         serveDedup();
-        AtomicBoolean failTheNextFlush = new AtomicBoolean();
-        Client c = newClientWithFailingSend(
-                new LinkedBlockingQueue<Throwable>(),
-                failTheNextFlush,
-                new NoClassDefFoundError("transport linkage failed inside the send"),
-                false,
-                false);
+        Client c = newClientWithFailingSend(new LinkedBlockingQueue<Throwable>(), false);
         connect(c);
         c.disconnect();
         CompletableFuture<RPCResult> first = new CompletableFuture<>();
@@ -424,9 +456,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         c.rpcCall("third", EMPTY_PAYLOAD, into(third));
 
         // The send of the first call fails inside the connect's flush, which writes the calls queued behind it.
-        failTheNextFlush.set(true);
-        c.connect();
-        assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+        connectWithFailingSend(c, new NoClassDefFoundError("transport linkage failed inside the send"), false);
 
         try {
             first.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
@@ -440,23 +470,23 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     }
 
 
-    // A client whose connect listener makes the next send of a cancel, or of a call, fail with the given throwable, when the
-    // flag is set, and whose error listener records what it reports. With throwOnReport the error listener throws after the
+    // Connects a client whose first send of a cancel, or of a call, after this connect fails with the given throwable.
+    private void connectWithFailingSend(Client c, Throwable failure, boolean cancelSend) throws Exception {
+        c.transportWrap = factory -> failingSends(factory, failure, cancelSend);
+        c.connect();
+        assertTrue("connected", connectedSignals.tryAcquire(5, TimeUnit.SECONDS));
+        c.transportWrap = factory -> factory;
+    }
+
+
+    // A client whose error listener records what it reports. With throwOnReport the error listener throws after the
     // record, and the flush must go on regardless.
-    private Client newClientWithFailingSend(
-            BlockingQueue<Throwable> reported,
-            AtomicBoolean failTheNextFlush,
-            Throwable failure,
-            boolean throwOnReport,
-            boolean cancelSend) {
+    private Client newClientWithFailingSend(BlockingQueue<Throwable> reported, boolean throwOnReport) {
         EventListener signalling = signallingListener();
         return newClient(instanceOptions(), new EventListener() {
             @Override
             public void onConnected(Client client, ConnectedEvent event) {
                 signalling.onConnected(client, event);
-                if (failTheNextFlush.getAndSet(false)) {
-                    failTheFirstSend(client, failure, cancelSend);
-                }
             }
 
 
@@ -508,32 +538,64 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     }
 
 
-    // Replaces the transport of the client by one whose first send of a cancel, or of a call, throws, as a transport can
-    // fail inside a send. The command is matched by its payload, so the sends of subscribes or connect commands do not
-    // take the failure. That send puts the real transport back, since the replies are matched to the transport the client holds.
-    // Coupling: it reads and writes the package-private field Client.ws by name, as no public seam exists for a
-    // failing send. A rename of that field fails the callers with an IllegalStateException wrapping NoSuchFieldException.
-    private static void failTheFirstSend(Client c, Throwable failure, boolean cancelSend) {
-        try {
-            Field field = Client.class.getDeclaredField("ws");
-            field.setAccessible(true);
-            WebSocket transport = (WebSocket) field.get(c);
-            AtomicBoolean failed = new AtomicBoolean();
+    // A transport factory which wraps the transports of the client, so that the first send of a cancel, or of a call, throws
+    // as a transport can fail inside a send. The command is matched by its payload, so the sends of subscribes or connect
+    // commands do not take the failure. The wrapper is the transport the client holds, and the listener of each transport
+    // gets the wrapper as its transport too, so the replies still match the transport the client holds.
+    private static WebSocket.Factory failingSends(WebSocket.Factory factory, Throwable failure, boolean cancelSend) {
+        AtomicBoolean armed = new AtomicBoolean(true);
+        return (Request request, WebSocketListener listener) -> {
+            AtomicReference<WebSocket> transport = new AtomicReference<>();
+            WebSocket real = factory.newWebSocket(request, new WebSocketListener() {
+                @Override
+                public void onOpen(WebSocket webSocket, Response response) {
+                    listener.onOpen(transport.get(), response);
+                }
+
+
+                @Override
+                public void onMessage(WebSocket webSocket, String text) {
+                    listener.onMessage(transport.get(), text);
+                }
+
+
+                @Override
+                public void onMessage(WebSocket webSocket, ByteString bytes) {
+                    listener.onMessage(transport.get(), bytes);
+                }
+
+
+                @Override
+                public void onClosing(WebSocket webSocket, int code, String reason) {
+                    listener.onClosing(transport.get(), code, reason);
+                }
+
+
+                @Override
+                public void onClosed(WebSocket webSocket, int code, String reason) {
+                    listener.onClosed(transport.get(), code, reason);
+                }
+
+
+                @Override
+                public void onFailure(WebSocket webSocket, Throwable cause, Response response) {
+                    listener.onFailure(transport.get(), cause, response);
+                }
+            });
             InvocationHandler handler = (Object proxy, Method method, Object[] args) -> {
-                if (method.getName().equals("send") && isTargetPayload(args[0], cancelSend) && !failed.getAndSet(true)) {
-                    field.set(c, transport);
+                if (method.getName().equals("send") && isTargetPayload(args[0], cancelSend) && armed.getAndSet(false)) {
                     throw failure;
                 }
                 try {
-                    return method.invoke(transport, args);
+                    return method.invoke(real, args);
                 } catch (InvocationTargetException e) {
                     throw e.getCause();
                 }
             };
-            field.set(c, Proxy.newProxyInstance(WebSocket.class.getClassLoader(), new Class<?>[] {WebSocket.class}, handler));
-        } catch (ReflectiveOperationException e) {
-            throw new IllegalStateException(e);
-        }
+            WebSocket proxy = (WebSocket) Proxy.newProxyInstance(WebSocket.class.getClassLoader(), new Class<?>[] {WebSocket.class}, handler);
+            transport.set(proxy);
+            return proxy;
+        };
     }
 
 
