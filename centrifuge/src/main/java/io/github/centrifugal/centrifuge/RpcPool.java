@@ -38,7 +38,8 @@ import okhttp3.Response;
  * <p>The calls are plain: a pool connection has no instance, so a call carries no msg_id and is never
  * executed twice by the server on purpose. The methods of the calls must be idempotent. All the state
  * of the pool is confined to one thread of its own, and the callbacks run on that thread, as the
- * callbacks of a {@link Client} run on its executor.
+ * callbacks of a {@link Client} run on its executor. The one exception is a call made after {@link #close()}:
+ * its callback runs at once on the calling thread, with {@link ReplyError#CANCELLED}.
  */
 public final class RpcPool {
 
@@ -303,7 +304,10 @@ public final class RpcPool {
         }
 
 
-        /** Calls waiting for a connection with room. */
+        /**
+         * Calls waiting for a connection with room. The calls waiting for a redirect fetch slot are not counted: their deadline
+         * is their only bound.
+         */
         public int getQueued() {
             return queued;
         }
@@ -316,7 +320,10 @@ public final class RpcPool {
     }
 
 
-    /** Builds a pool. The defaults are the ones of the contract: two connections, a window of one, 64 waiting calls. */
+    /**
+     * Builds a pool. The defaults are safe for a server with the default settings: two connections per endpoint, one call
+     * per connection at a time, 64 waiting calls, and three resends.
+     */
     public static final class Builder {
         private final EndpointResolver resolver;
         private final Options options = new Options();
@@ -474,7 +481,11 @@ public final class RpcPool {
         }
 
 
-        /** The OkHttp client of the connections and of the redirect fetches, shared. Optional. */
+        /**
+         * The OkHttp client of the connections and of the redirect fetches, shared. Optional: without one, the pools share
+         * a default client. The interceptors of this client apply to the redirect fetches too, and redirects are followed
+         * to other hosts, so an interceptor which adds credentials sends them to the host the server redirects to.
+         */
         public Builder okHttpClient(OkHttpClient okHttpClient) {
             this.okHttpClient = okHttpClient;
             options.setOkHttpClient(okHttpClient);
@@ -503,6 +514,9 @@ public final class RpcPool {
 
 
     private static final Backoff BACKOFF = new Backoff();
+
+    // The client of the redirect fetches of the pools without an OkHttp client of their own, created on the first fetch.
+    private static OkHttpClient sharedHttpClient;
 
     private final EndpointResolver resolver;
     private final Options options;
@@ -534,63 +548,11 @@ public final class RpcPool {
     private boolean closed;
 
 
-    private RpcPool(Builder builder) {
-        this.resolver = builder.resolver;
-        this.options = builder.options;
-        this.affinityHeader = builder.affinityHeader;
-        this.maxConnectionsPerEndpoint = builder.maxConnectionsPerEndpoint;
-        this.maxInflightPerConnection = builder.maxInflightPerConnection;
-        this.maxQueued = builder.maxQueued;
-        this.idleTimeoutMillis = builder.idleTimeout;
-        this.retries = builder.retries;
-        this.reroute = builder.reroute;
-        this.redirectHook = builder.redirect;
-        this.maxRedirectsInflight = builder.maxRedirectsInflight;
-        this.httpClient = builder.okHttpClient;
-        this.errorListener = builder.errorListener;
-        this.random = builder.random != null ? builder.random : new Random();
-        this.executor = createExecutor();
-    }
-
-
-    // The pool's thread is created with the first task, and is a daemon: an idle pool keeps the process alive
-    // no more than the clients of its connections do.
-    private ScheduledThreadPoolExecutor createExecutor() {
-        ThreadFactory factory = runnable -> {
-            Thread thread = new Thread(runnable, "centrifuge-rpc-pool");
-            thread.setDaemon(true);
-            poolThread.set(thread);
-            return thread;
-        };
-        ScheduledThreadPoolExecutor executor = newScheduler(factory);
-        executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
-        return executor;
-    }
-
-
-    // A scheduler of one thread, whose cancelled timers leave its queue at once: a cancelled deadline must not keep its call
-    // alive until its delay ends. The policy is missing below Android API 21, where the cancelled timers stay queued.
-    private static ScheduledThreadPoolExecutor newScheduler(ThreadFactory factory) {
-        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, factory);
-        try {
-            scheduler.setRemoveOnCancelPolicy(true);
-        } catch (NoSuchMethodError e) {
-            // The policy is not in this platform's runtime: the cancelled timers stay queued until their delay ends.
-        }
-        return scheduler;
-    }
-
-
-    // The error of a call which the client cancelled: the same error on every path of the pool.
-    private static ReplyError cancelled() {
-        return new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false);
-    }
-
-
     /**
      * Sends the call to an endpoint of its key, and returns it. The callback gets the reply or the error:
      * a {@link ReplyError} of the server or of the pool, {@link java.util.concurrent.TimeoutException} at the deadline,
-     * or an {@link IOException} when the connection of the call was lost and the call could not be sent again.
+     * or an {@link IOException} when the connection of the call was lost and the call could not be sent again. A
+     * {@link RuntimeException} the endpoint resolver throws reaches the callback as it was thrown.
      * The data is read when the call is sent, which can be after it waited in the queue: the array must not change
      * until the callback.
      *
@@ -726,6 +688,59 @@ public final class RpcPool {
     }
 
 
+    private RpcPool(Builder builder) {
+        this.resolver = builder.resolver;
+        this.options = builder.options;
+        this.affinityHeader = builder.affinityHeader;
+        this.maxConnectionsPerEndpoint = builder.maxConnectionsPerEndpoint;
+        this.maxInflightPerConnection = builder.maxInflightPerConnection;
+        this.maxQueued = builder.maxQueued;
+        this.idleTimeoutMillis = builder.idleTimeout;
+        this.retries = builder.retries;
+        this.reroute = builder.reroute;
+        this.redirectHook = builder.redirect;
+        this.maxRedirectsInflight = builder.maxRedirectsInflight;
+        this.httpClient = builder.okHttpClient;
+        this.errorListener = builder.errorListener;
+        this.random = builder.random != null ? builder.random : new Random();
+        this.executor = createExecutor();
+    }
+
+
+    // The pool's thread is created with the first task, and is a daemon: an idle pool keeps the process alive
+    // no more than the clients of its connections do.
+    private ScheduledThreadPoolExecutor createExecutor() {
+        ThreadFactory factory = (Runnable runnable) -> {
+            Thread thread = new Thread(runnable, "centrifuge-rpc-pool");
+            thread.setDaemon(true);
+            poolThread.set(thread);
+            return thread;
+        };
+        ScheduledThreadPoolExecutor executor = newScheduler(factory);
+        executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+        return executor;
+    }
+
+
+    // A scheduler of one thread, whose cancelled timers leave its queue at once: a cancelled deadline must not keep its call
+    // alive until its delay ends. The policy is missing below Android API 21, where the cancelled timers stay queued.
+    private static ScheduledThreadPoolExecutor newScheduler(ThreadFactory factory) {
+        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, factory);
+        try {
+            scheduler.setRemoveOnCancelPolicy(true);
+        } catch (NoSuchMethodError e) {
+            // The policy is not in this platform's runtime: the cancelled timers stay queued until their delay ends.
+        }
+        return scheduler;
+    }
+
+
+    // The error of a call which the client cancelled: the same error on every path of the pool.
+    private static ReplyError cancelled() {
+        return new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false);
+    }
+
+
     // Holds the opens of the endpoint for the next backoff delay, which grows with each close until a connection connects.
     private void hold(RpcPoolEndpoint endpoint) {
         long delayMillis = BACKOFF.duration(endpoint.closes, options.getMinReconnectDelay(), options.getMaxReconnectDelay());
@@ -752,7 +767,7 @@ public final class RpcPool {
             settle(call, null, badConfiguration("affinity needs the affinityHeader option"));
             return;
         }
-        if (call.affinity != null && hasHeaderIgnoreCase(call.headers, affinityHeader)) {
+        if (affinityHeader != null && hasHeaderIgnoreCase(call.headers, affinityHeader)) {
             settle(call, null, badConfiguration("affinity header is given as a header of the call"));
             return;
         }
@@ -768,7 +783,8 @@ public final class RpcPool {
             return;
         }
         unsettled.add(call);
-        call.deadlineTask = executor.schedule(() -> onDeadline(call), call.timeoutMillis, TimeUnit.MILLISECONDS);
+        // The timer runs on the deadline of the call, which started at its submit: the time it waited for the pool's thread is spent.
+        call.deadlineTask = executor.schedule(() -> onDeadline(call), call.remainingNanos(), TimeUnit.NANOSECONDS);
         // A call goes out at once only when no call waits: the waiting calls are older, and go first.
         if (queue.isEmpty() && tryAssign(call, eps)) {
             return;
@@ -985,11 +1001,12 @@ public final class RpcPool {
     }
 
 
-    // The later refusal is sent again after the main client's delay. The draw index is the resend count, capped
+    // The later refusal is sent again after the main client's delay. The draw index is the count of later resends, capped
     // at the count of the client's later delays, so a call with more retries waits at most as long as the client does.
     private void scheduleLater(RpcPoolCall call) {
-        int draws = Math.min(call.resends, RpcSession.LATER_RESENDS - 1);
+        int draws = Math.min(call.laterResends, RpcSession.LATER_RESENDS - 1);
         call.resends++;
+        call.laterResends++;
         long delayMillis = Math.min(RpcSession.laterDelayMillis(random, draws), TimeUnit.NANOSECONDS.toMillis(call.remainingNanos()));
         call.resendTask = executor.schedule(() -> onResendDue(call), delayMillis, TimeUnit.MILLISECONDS);
     }
@@ -1273,10 +1290,20 @@ public final class RpcPool {
     // A redirect is never followed across schemes: the body of a secure endpoint is not fetched over plain HTTP.
     private OkHttpClient fetchClient() {
         if (fetchHttpClient == null) {
-            OkHttpClient base = httpClient != null ? httpClient : new OkHttpClient();
+            OkHttpClient base = httpClient != null ? httpClient : defaultHttpClient();
             fetchHttpClient = base.newBuilder().followSslRedirects(false).build();
         }
         return fetchHttpClient;
+    }
+
+
+    // The client of the pools which were given none, shared by the process: its dispatcher and connection pool are not
+    // left behind by each pool that is closed.
+    private static synchronized OkHttpClient defaultHttpClient() {
+        if (sharedHttpClient == null) {
+            sharedHttpClient = new OkHttpClient();
+        }
+        return sharedHttpClient;
     }
 
 

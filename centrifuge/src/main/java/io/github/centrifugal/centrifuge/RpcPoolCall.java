@@ -22,6 +22,8 @@ final class RpcPoolCall {
     String endpointKey;
     // Resends so far. A lost connection, a later refusal and a reroute count against the one bound.
     int resends;
+    // The later refusals resent so far: the draw index of the delay of the next later resend, as the client counts them.
+    int laterResends;
     // The call waits in the queue for a connection with room.
     boolean queued;
     // The call has its outcome: nothing runs for it any more, and its callback has been given the outcome.

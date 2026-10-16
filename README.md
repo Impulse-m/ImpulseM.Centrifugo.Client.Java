@@ -208,6 +208,7 @@ pool.rpc("blob.writePart", chunk, RpcPool.CallOptions.builder().endpointKey("eu-
 - `redirect` lets the application move the bytes of a reply or an error to a URL (for example a presigned one). The pool fetches it with OkHttp, within the call's deadline, at most `maxRedirectsInflight` at a time, and the body is bounded by `RpcPool.Redirect` `maxBytes` (16 MiB by default). A fetch that fails, or a URL the endpoint does not allow (`https:` for `wss:`), fails the call with `REDIRECT_FAILED`.
 - `maxQueued` (64 by default) bounds the calls waiting for a connection; a call beyond it fails at once with `LIMIT_EXCEEDED`. `idleTimeout` (60 s by default, 0 keeps the connections) closes a connection with no call. `stats()` reports the connections, the calls in flight and waiting, and the redirect fetches.
 - `close()` closes every connection: the calls waiting fail with `CANCELLED`, the calls on the wire with `IOException`.
+- The array of `rpc` must not change until the callback: the pool reads it when it sends the call, which can be after the call waited in the queue. The okHttp client of the pool, when given, also serves the redirect fetches with its interceptors and redirects.
 
 ## Refreshing the connection token on demand
 
@@ -231,8 +232,8 @@ The client reports the calls it did not send, or cancelled, with the codes of `R
 | 15 | `UNSUPPORTED` | the call was not sent: the connection cannot carry what it asks for (headers, or a cancel) |
 | 16 | `LIMIT_EXCEEDED` | the call was not sent: the calls of a client with an instance reached `Options.setMaxPendingRpc`, or the refreshes in progress reached 32 |
 | 17 | `CANCELLED` | the call was cancelled with `RpcCall.cancel()`, or `RpcPool.Call.cancel()`: a call which was not sent yet is never sent |
-| 12 | `BAD_CONFIGURATION` | the call of an `RpcPool` was refused: an option of the call, or an endpoint key which resolves to no endpoint |
-| 18 | `REDIRECT_FAILED` | the redirect of an `RpcPool` call could not be fetched, see `RpcPool.RedirectHook` |
+| 12 | `RpcPool.BAD_CONFIGURATION` | the call of an `RpcPool` was refused: an option of the call, or an endpoint key which resolves to no endpoint |
+| 18 | `RpcPool.REDIRECT_FAILED` | the redirect of an `RpcPool` call could not be fetched, see `RpcPool.RedirectHook` |
 
 Codes 12 and 15 to 19 are reserved for client-local errors of the fork SDKs; a server never sends them.
 
