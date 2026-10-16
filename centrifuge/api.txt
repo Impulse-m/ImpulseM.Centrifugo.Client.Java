@@ -446,7 +446,9 @@ package io.github.centrifugal.centrifuge {
   public abstract class TokenExchange {
     ctor public TokenExchange();
     method public abstract void exchange(io.github.centrifugal.centrifuge.TokenExchangeEvent!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.TokenExchangeResult!>!);
+    method public int grace();
     method public abstract String load();
+    method public Set<String> refusalTypes();
     method public abstract void store(String);
   }
 
@@ -455,8 +457,14 @@ package io.github.centrifugal.centrifuge {
     method public void rpc(String, byte[]!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.RPCResult!>!);
   }
 
+  public final class TokenExchangeRefusedException {
+    method public io.github.centrifugal.centrifuge.ReplyError! getReplyError();
+  }
+
   public final class TokenExchangeResult {
     ctor public TokenExchangeResult(String, String);
+    ctor public TokenExchangeResult(String, String, int);
+    method public int getGrace();
     method public String getRefreshToken();
     method public String getToken();
   }

@@ -32,7 +32,8 @@ public final class TokenExchangeEvent {
      * Sends a plain rpc call over the connection the exchange runs on, the one being set up or the
      * connected one. Callable from any thread; the callback runs on the client's executor, called once.
      * It carries no message id and is not retransmitted. It fails with IOException when that connection
-     * is lost, and with a timeout when no reply comes within the client timeout.
+     * is lost, with a timeout when no reply comes within the client timeout, and with
+     * {@link TokenExchangeRefusedException} when the server error's app type is in {@link TokenExchange#refusalTypes}.
      *
      * @param method: the rpc method name, not null.
      * @param data:   the request payload, not null.

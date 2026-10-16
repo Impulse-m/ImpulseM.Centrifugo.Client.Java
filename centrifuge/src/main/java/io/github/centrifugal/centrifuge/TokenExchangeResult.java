@@ -8,6 +8,7 @@ package io.github.centrifugal.centrifuge;
 public final class TokenExchangeResult {
     private final String token;
     private final String refreshToken;
+    private final int graceSeconds;
 
 
     /**
@@ -15,8 +16,21 @@ public final class TokenExchangeResult {
      * @param refreshToken: the rotated refresh token, or null when it did not change.
      */
     public TokenExchangeResult(String token, String refreshToken) {
+        this(token, refreshToken, -1);
+    }
+
+
+    /**
+     * @param token:        the access token, which becomes the connection token.
+     * @param refreshToken: the rotated refresh token, or null when there is nothing to store: it did not change, or
+     *                      the exchange persisted the rotation itself under its own lock.
+     * @param graceSeconds: how long the issuer keeps accepting the refresh token this exchange consumed, in seconds,
+     *                      or -1 when the issuer publishes none. Above 300 it is clamped to 300.
+     */
+    public TokenExchangeResult(String token, String refreshToken, int graceSeconds) {
         this.token = token;
         this.refreshToken = refreshToken;
+        this.graceSeconds = graceSeconds;
     }
 
 
@@ -29,5 +43,11 @@ public final class TokenExchangeResult {
     /** The rotated refresh token, or null when the issuer did not rotate it. */
     public String getRefreshToken() {
         return refreshToken;
+    }
+
+
+    /** The grace the issuer published with this exchange, in seconds, or -1 when it did not. */
+    public int getGrace() {
+        return graceSeconds;
     }
 }

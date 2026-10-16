@@ -1,5 +1,8 @@
 package io.github.centrifugal.centrifuge;
 
+import java.util.Collections;
+import java.util.Set;
+
 
 /**
  * Lets the client obtain and renew its connection token itself, over the connection, from a refresh
@@ -32,8 +35,31 @@ public abstract class TokenExchange {
 
     /**
      * Exchanges the refresh token for an access token. The callback is called once, from any thread.
-     * Fail it with {@link UnauthorizedException} when the issuer refused the refresh token: the session
-     * is then dead. Any other failure is reported to the listener and retried with backoff.
+     * Fail it with {@link UnauthorizedException} (or with the {@link TokenExchangeRefusedException} of
+     * {@link TokenExchangeEvent#rpc}) when the issuer refused the refresh token: the client presents the
+     * stored token again, with backoff, until the grace horizon has passed, and only then ends the session.
+     * Any other failure is reported to the listener and retried with backoff.
      */
     public abstract void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb);
+
+
+    /**
+     * Server error names ({@link ReplyError#getAppType}) that mean the issuer refused the refresh token. An
+     * rpc of {@link TokenExchangeEvent#rpc} rejected with one of them fails with
+     * {@link TokenExchangeRefusedException}. The match is exact and the error code is never consulted.
+     * Default: empty, so the application decides what a refusal is.
+     */
+    public Set<String> refusalTypes() {
+        return Collections.emptySet();
+    }
+
+
+    /**
+     * The grace in seconds: how long the issuer keeps accepting the refresh token an exchange consumed. It is
+     * the horizon of a refusal run, measured from the first refusal, and is used until the issuer publishes one in
+     * a {@link TokenExchangeResult}. Clamped to 0..300. Default 30.
+     */
+    public int grace() {
+        return 30;
+    }
 }
