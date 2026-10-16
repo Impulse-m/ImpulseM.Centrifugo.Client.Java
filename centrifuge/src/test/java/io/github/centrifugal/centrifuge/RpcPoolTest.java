@@ -95,7 +95,7 @@ public class RpcPoolTest extends RpcTestBase {
         RpcPool pool = build(builder());
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().affinity("hint-1").build(), into(future));
-        assertEquals(ReplyError.BAD_CONFIGURATION, replyErrorOf(future).getCode());
+        assertEquals(RpcPool.BAD_CONFIGURATION, replyErrorOf(future).getCode());
         assertEquals("nothing is sent for a refused call", 0, sentRpcRequests().size());
     }
 
@@ -105,7 +105,7 @@ public class RpcPoolTest extends RpcTestBase {
         RpcPool pool = build(new RpcPool.Builder(endpointKey -> Collections.<String>emptyList()).random(maximumDraws()));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
-        assertEquals(ReplyError.BAD_CONFIGURATION, replyErrorOf(future).getCode());
+        assertEquals(RpcPool.BAD_CONFIGURATION, replyErrorOf(future).getCode());
     }
 
 

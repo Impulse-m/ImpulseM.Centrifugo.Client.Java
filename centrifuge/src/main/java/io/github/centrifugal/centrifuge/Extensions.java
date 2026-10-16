@@ -2,8 +2,6 @@ package io.github.centrifugal.centrifuge;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.ThreadFactory;
 import java.util.regex.Pattern;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
@@ -115,19 +113,9 @@ final class Extensions {
     }
 
 
-    /**
-     * A scheduler of one thread, whose cancelled timers leave its queue at once. Otherwise a cancelled rpc deadline
-     * keeps its call alive until its delay ends. The policy is missing below Android API 21, where the cancelled
-     * timers stay queued.
-     */
-    static ScheduledThreadPoolExecutor newScheduler(ThreadFactory factory) {
-        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, factory);
-        try {
-            scheduler.setRemoveOnCancelPolicy(true);
-        } catch (NoSuchMethodError e) {
-            // The policy is not in this platform's runtime: the cancelled timers stay queued until their delay ends.
-        }
-        return scheduler;
+    /** The retry value of an error of a reply, or null when the server set none: the same rule as {@link #retrySignal(Protocol.Error)}. */
+    static String retrySignal(ReplyError error) {
+        return error.getMetadata().get(RPC_RETRY_METADATA_KEY);
     }
 
 

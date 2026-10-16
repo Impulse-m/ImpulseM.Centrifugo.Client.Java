@@ -42,6 +42,18 @@ import okhttp3.Response;
  */
 public final class RpcPool {
 
+    /**
+     * Client-local code of a call which the pool refuses: a bad option, a header the pool sets itself, or an endpoint key
+     * which resolves to no endpoint. A server never sends this code.
+     */
+    public static final int BAD_CONFIGURATION = 12;
+
+    /**
+     * Client-local code of a redirect which could not be fetched: a network failure, a status which is not 2xx, a body over
+     * its limit, or a URL the endpoint does not allow. A server never sends this code.
+     */
+    public static final int REDIRECT_FAILED = 18;
+
     /** Resolves an endpoint key to the endpoints of its connections. */
     public interface EndpointResolver {
         /**
@@ -550,9 +562,28 @@ public final class RpcPool {
             poolThread.set(thread);
             return thread;
         };
-        ScheduledThreadPoolExecutor executor = Extensions.newScheduler(factory);
+        ScheduledThreadPoolExecutor executor = newScheduler(factory);
         executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         return executor;
+    }
+
+
+    // A scheduler of one thread, whose cancelled timers leave its queue at once: a cancelled deadline must not keep its call
+    // alive until its delay ends. The policy is missing below Android API 21, where the cancelled timers stay queued.
+    private static ScheduledThreadPoolExecutor newScheduler(ThreadFactory factory) {
+        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, factory);
+        try {
+            scheduler.setRemoveOnCancelPolicy(true);
+        } catch (NoSuchMethodError e) {
+            // The policy is not in this platform's runtime: the cancelled timers stay queued until their delay ends.
+        }
+        return scheduler;
+    }
+
+
+    // The error of a call which the client cancelled: the same error on every path of the pool.
+    private static ReplyError cancelled() {
+        return new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false);
     }
 
 
@@ -572,7 +603,7 @@ public final class RpcPool {
         CallOptions opts = callOptions != null ? callOptions : CallOptions.NONE;
         long timeout = opts.getTimeout() > 0 ? opts.getTimeout() : options.getTimeout();
         final RpcPoolCall call = new RpcPoolCall(method, data, opts.getEndpointKey(), opts.getHeaders(), opts.getAffinity(), timeout, cb);
-        Extensions.submitOrRun(executor, () -> start(call), () -> call.callback.onDone(ReplyError.cancelled(), null));
+        Extensions.submitOrRun(executor, () -> start(call), () -> call.callback.onDone(cancelled(), null));
         return new Call(this, call);
     }
 
@@ -608,7 +639,7 @@ public final class RpcPool {
 
     // Called on the pool's thread by a call's cancel.
     void cancel(RpcPoolCall call) {
-        Extensions.submitOrIgnore(executor, () -> settle(call, null, ReplyError.cancelled()));
+        Extensions.submitOrIgnore(executor, () -> settle(call, null, cancelled()));
     }
 
 
@@ -714,7 +745,7 @@ public final class RpcPool {
 
     private void start(RpcPoolCall call) {
         if (closed) {
-            settle(call, null, ReplyError.cancelled());
+            settle(call, null, cancelled());
             return;
         }
         if (call.affinity != null && affinityHeader == null) {
@@ -931,7 +962,7 @@ public final class RpcPool {
 
     private void onReplyError(RpcPoolCall call, ReplyError error) {
         if (canResend(call)) {
-            if (Extensions.RPC_RETRY_LATER.equals(error.getMetadata().get(Extensions.RPC_RETRY_METADATA_KEY))) {
+            if (Extensions.RPC_RETRY_LATER.equals(Extensions.retrySignal(error))) {
                 scheduleLater(call);
                 return;
             }
@@ -1002,7 +1033,7 @@ public final class RpcPool {
 
     private void startRedirect(RpcPoolCall call, RpcPool.Redirect target) {
         if (!RpcPoolRedirect.allowed(call.endpointUrl, target.getUrl())) {
-            settle(call, null, new ReplyError(ReplyError.REDIRECT_FAILED, "redirect url is not allowed for the endpoint", false));
+            settle(call, null, new ReplyError(REDIRECT_FAILED, "redirect url is not allowed for the endpoint", false));
             return;
         }
         call.redirect = target;
@@ -1047,7 +1078,7 @@ public final class RpcPool {
             call.redirectCall = RpcPoolRedirect.enqueue(fetchClient(), call.redirect, callback);
         } catch (IllegalArgumentException e) {
             redirectsInflight--;
-            settle(call, null, new ReplyError(ReplyError.REDIRECT_FAILED, "redirect could not be requested", false));
+            settle(call, null, new ReplyError(REDIRECT_FAILED, "redirect could not be requested", false));
             startWaitingRedirects();
         }
     }
@@ -1058,7 +1089,7 @@ public final class RpcPool {
         call.redirectCall = null;
         if (!call.settled) {
             if (failure != null) {
-                settle(call, null, new ReplyError(ReplyError.REDIRECT_FAILED, "redirect failed: " + failure.getMessage(), false));
+                settle(call, null, new ReplyError(REDIRECT_FAILED, "redirect failed: " + failure.getMessage(), false));
             } else {
                 RPCResult result = new RPCResult();
                 result.setData(body);
@@ -1160,8 +1191,8 @@ public final class RpcPool {
         return code != ReplyError.UNSUPPORTED
                 && code != ReplyError.LIMIT_EXCEEDED
                 && code != ReplyError.CANCELLED
-                && code != ReplyError.BAD_CONFIGURATION
-                && code != ReplyError.REDIRECT_FAILED;
+                && code != BAD_CONFIGURATION
+                && code != REDIRECT_FAILED;
     }
 
 
@@ -1214,7 +1245,7 @@ public final class RpcPool {
             if (call.connection != null) {
                 settle(call, null, new IOException("rpc pool closed"));
             } else {
-                settle(call, null, ReplyError.cancelled());
+                settle(call, null, cancelled());
             }
         }
         for (RpcPoolEndpoint endpoint : endpoints.values()) {
@@ -1262,7 +1293,7 @@ public final class RpcPool {
 
 
     private static ReplyError badConfiguration(String message) {
-        return new ReplyError(ReplyError.BAD_CONFIGURATION, message, false);
+        return new ReplyError(BAD_CONFIGURATION, message, false);
     }
 
 

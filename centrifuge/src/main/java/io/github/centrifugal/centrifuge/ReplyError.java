@@ -26,26 +26,7 @@ public class ReplyError extends Throwable {
      */
     public static final int CANCELLED = 17;
 
-    /**
-     * Client-local code of a call the client did not send, because an option of it is refused: a bad
-     * endpoint or header of an {@link RpcPool}, or an endpoint the pool cannot resolve. A server never
-     * sends this code.
-     */
-    public static final int BAD_CONFIGURATION = 12;
-
-    /**
-     * Client-local code of a call of an {@link RpcPool} whose redirect could not be fetched: a network
-     * failure, a status which is not 2xx, a body over the limit, or a URL the endpoint does not allow.
-     * A server never sends this code.
-     */
-    public static final int REDIRECT_FAILED = 18;
-
     private int code;
-
-    // The error of a call which the client cancelled: the same error on every path of the client.
-    static ReplyError cancelled() {
-        return new ReplyError(CANCELLED, "rpc call cancelled", false);
-    }
 
     public ReplyError(int code, String message, boolean temporary) {
         this(code, message, temporary, 0, "", Collections.<String, String>emptyMap());

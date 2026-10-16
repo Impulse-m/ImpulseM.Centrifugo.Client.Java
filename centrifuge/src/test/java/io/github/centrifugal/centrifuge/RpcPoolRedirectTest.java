@@ -64,7 +64,7 @@ public class RpcPoolRedirectTest extends RpcTestBase {
     public void aRedirectBodyOverItsBoundFailsWithRedirectFailed() throws Exception {
         blobs.enqueue(new MockResponse().setBody("too-long-body"));
         pool = redirectingPool(RpcPool.Redirect.builder(blobs.url("/blob").toString()).maxBytes(4).build());
-        assertEquals(ReplyError.REDIRECT_FAILED, failureOf().getCode());
+        assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
     }
 
 
@@ -72,7 +72,7 @@ public class RpcPoolRedirectTest extends RpcTestBase {
     public void aRedirectAnsweredWithAnErrorStatusFailsWithRedirectFailed() throws Exception {
         blobs.enqueue(new MockResponse().setResponseCode(404));
         pool = redirectingPool(RpcPool.Redirect.builder(blobs.url("/blob").toString()).build());
-        assertEquals(ReplyError.REDIRECT_FAILED, failureOf().getCode());
+        assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
     }
 
 
@@ -80,7 +80,7 @@ public class RpcPoolRedirectTest extends RpcTestBase {
     public void aRedirectToAUrlTheEndpointDoesNotAllowFailsWithRedirectFailed() throws Exception {
         // The endpoint is a plain ws:// URL, so the redirect to a non-web scheme is refused before any fetch.
         pool = redirectingPool(RpcPool.Redirect.builder("ftp://blobs.example/blob").build());
-        assertEquals(ReplyError.REDIRECT_FAILED, failureOf().getCode());
+        assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
         assertEquals("no fetch was started", 0, blobs.getRequestCount());
     }
 
@@ -99,7 +99,7 @@ public class RpcPoolRedirectTest extends RpcTestBase {
                     .okHttpClient(trustingClient(tls, store))
                     .redirect((reply, error) -> reply != null ? RpcPool.Redirect.builder(secure.url("/blob").toString()).build() : null)
                     .build();
-            assertEquals(ReplyError.REDIRECT_FAILED, failureOf().getCode());
+            assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
             assertEquals("the plain hop is never requested", 0, blobs.getRequestCount());
         } finally {
             secure.shutdown();

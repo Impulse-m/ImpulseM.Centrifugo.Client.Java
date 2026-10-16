@@ -267,10 +267,8 @@ package io.github.centrifugal.centrifuge {
     method public void setCode(int);
     method public void setMessage(String);
     method public void setTemporary(boolean);
-    field public static final int BAD_CONFIGURATION = 12; // 0xc
     field public static final int CANCELLED = 17; // 0x11
     field public static final int LIMIT_EXCEEDED = 16; // 0x10
-    field public static final int REDIRECT_FAILED = 18; // 0x12
     field public static final int UNSUPPORTED = 15; // 0xf
   }
 
@@ -298,6 +296,8 @@ package io.github.centrifugal.centrifuge {
     method public void close();
     method public io.github.centrifugal.centrifuge.RpcPool.Call! rpc(String, byte[]!, io.github.centrifugal.centrifuge.RpcPool.CallOptions!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.RPCResult!>!);
     method public io.github.centrifugal.centrifuge.RpcPool.Stats! stats();
+    field public static final int BAD_CONFIGURATION = 12; // 0xc
+    field public static final int REDIRECT_FAILED = 18; // 0x12
   }
 
   public static final class RpcPool.Builder {

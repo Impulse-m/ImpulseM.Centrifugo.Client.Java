@@ -170,7 +170,7 @@ final class RpcSession {
         stopResend(call);
         if (!call.everSent) {
             queue.remove(call);
-            call.future.completeExceptionally(ReplyError.cancelled());
+            call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
             return;
         }
         if (!host.hasInstance()) {
@@ -182,7 +182,7 @@ final class RpcSession {
         if (call.resendAsNew) {
             // The new msg_id is still queued, never written: nothing reached the server under it, whatever the connection.
             queue.remove(call);
-            call.future.completeExceptionally(ReplyError.cancelled());
+            call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false));
             return;
         }
         if (host.state() == ClientState.CONNECTED && !host.hasRpcOptions()) {
@@ -193,7 +193,7 @@ final class RpcSession {
         queue.remove(call);
         // The call is completed first: when the deadline settled it meanwhile, the deadline sends the cancel, and nothing
         // is sent here. A call whose current msg_id was never written (a new msg_id still queued) has nothing to cancel.
-        if (call.future.completeExceptionally(ReplyError.cancelled()) && call.wireTracked) {
+        if (call.future.completeExceptionally(new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false)) && call.wireTracked) {
             sendCancel(call.msgId);
         }
     }
@@ -319,7 +319,7 @@ final class RpcSession {
     // is cancelled: nothing reached the server. Any other call was written, so its connection is gone.
     private Throwable closedError(RpcCall call) {
         if (host.hasInstance() && (!call.everSent || call.resendAsNew)) {
-            return ReplyError.cancelled();
+            return new ReplyError(ReplyError.CANCELLED, "rpc call cancelled", false);
         }
         return new IOException();
     }
