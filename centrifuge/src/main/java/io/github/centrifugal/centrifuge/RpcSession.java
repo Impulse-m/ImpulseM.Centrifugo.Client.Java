@@ -18,6 +18,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.google.protobuf.UnsafeByteOperations;
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
 import java8.util.concurrent.CompletableFuture;
@@ -464,7 +465,7 @@ final class RpcSession {
 
     private static Protocol.RPCRequest buildRpcRequest(RpcCall call, boolean tracked, List<Long> acks) {
         Protocol.RPCRequest.Builder req = Protocol.RPCRequest.newBuilder()
-                .setData(com.google.protobuf.ByteString.copyFrom(call.data))
+                .setData(UnsafeByteOperations.unsafeWrap(call.data))
                 .setMethod(call.method)
                 .putAllHeaders(call.headers);
         if (tracked) {
