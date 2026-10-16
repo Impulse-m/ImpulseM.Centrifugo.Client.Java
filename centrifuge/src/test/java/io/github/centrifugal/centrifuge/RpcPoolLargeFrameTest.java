@@ -19,8 +19,8 @@ import static org.junit.Assert.assertTrue;
  * and the calls in flight never exceed the window.
  */
 public class RpcPoolLargeFrameTest extends RpcTestBase {
-    private static final int CHUNK_BYTES = 1024 * 1024;
-    private static final int CHUNKS = 4;
+    private static final int PART_BYTES = 1024 * 1024;
+    private static final int PARTS = 4;
 
 
     @Test
@@ -40,23 +40,23 @@ public class RpcPoolLargeFrameTest extends RpcTestBase {
         RpcPool pool = new RpcPool.Builder(endpointKey -> Collections.singletonList(server.url()))
                 .maxConnectionsPerEndpoint(1)
                 .maxInflightPerConnection(2)
-                .maxQueued(CHUNKS)
+                .maxQueued(PARTS)
                 .build();
         try {
-            byte[] chunk = new byte[CHUNK_BYTES];
+            byte[] part = new byte[PART_BYTES];
             List<CompletableFuture<RPCResult>> futures = new ArrayList<>();
-            for (int i = 0; i < CHUNKS; i++) {
+            for (int i = 0; i < PARTS; i++) {
                 CompletableFuture<RPCResult> future = new CompletableFuture<>();
-                pool.rpc("blob.writePart", chunk, null, into(future));
+                pool.rpc("svc.writePart", part, null, into(future));
                 futures.add(future);
             }
             for (CompletableFuture<RPCResult> future : futures) {
                 future.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
                 assertTrue("the window is never exceeded", pool.stats().getInflight() <= 2);
             }
-            assertEquals(CHUNKS, receivedSizes.size());
+            assertEquals(PARTS, receivedSizes.size());
             for (Integer size : receivedSizes) {
-                assertEquals("each frame arrives whole", CHUNK_BYTES, size.intValue());
+                assertEquals("each frame arrives whole", PART_BYTES, size.intValue());
             }
         } finally {
             pool.close();

@@ -44,7 +44,7 @@ public class RpcPoolTest extends RpcTestBase {
         answerRpcs("payload");
         RpcPool pool = build(builder());
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
         assertEquals("payload", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
         List<Protocol.RPCRequest> requests = sentRpcRequests();
         assertEquals(1, requests.size());
@@ -71,8 +71,8 @@ public class RpcPoolTest extends RpcTestBase {
         RpcPool pool = build(builder().maxConnectionsPerEndpoint(1).maxQueued(1));
         CompletableFuture<RPCResult> first = new CompletableFuture<>();
         CompletableFuture<RPCResult> second = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(first));
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(second));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(first));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(second));
         assertEquals(ReplyError.LIMIT_EXCEEDED, replyErrorOf(second).getCode());
         awaitAll(Collections.singletonList(first), true);
     }
@@ -84,7 +84,7 @@ public class RpcPoolTest extends RpcTestBase {
         answerRpcs("ok");
         RpcPool pool = build(builder().affinityHeader(AFFINITY_HEADER));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().affinity("hint-1").build(), into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().affinity("hint-1").build(), into(future));
         future.get(5, TimeUnit.SECONDS);
         assertEquals("hint-1", sentRpcRequests().get(0).getHeadersMap().get(AFFINITY_HEADER));
     }
@@ -94,7 +94,17 @@ public class RpcPoolTest extends RpcTestBase {
     public void anAffinityWithoutTheHeaderOptionIsBadConfiguration() throws Exception {
         RpcPool pool = build(builder());
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().affinity("hint-1").build(), into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().affinity("hint-1").build(), into(future));
+        assertEquals(RpcPool.BAD_CONFIGURATION, replyErrorOf(future).getCode());
+        assertEquals("nothing is sent for a refused call", 0, sentRpcRequests().size());
+    }
+
+
+    @Test
+    public void theAffinityHeaderAsAPlainHeaderIsBadConfigurationWithoutAnAffinity() throws Exception {
+        RpcPool pool = build(builder().affinityHeader(AFFINITY_HEADER));
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().header(AFFINITY_HEADER, "hint-1").build(), into(future));
         assertEquals(RpcPool.BAD_CONFIGURATION, replyErrorOf(future).getCode());
         assertEquals("nothing is sent for a refused call", 0, sentRpcRequests().size());
     }
@@ -104,7 +114,7 @@ public class RpcPoolTest extends RpcTestBase {
     public void anEndpointKeyWhichResolvesToNothingIsBadConfiguration() throws Exception {
         RpcPool pool = build(new RpcPool.Builder(endpointKey -> Collections.<String>emptyList()).random(maximumDraws()));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
         assertEquals(RpcPool.BAD_CONFIGURATION, replyErrorOf(future).getCode());
     }
 
@@ -123,7 +133,7 @@ public class RpcPoolTest extends RpcTestBase {
         };
         RpcPool pool = build(builder());
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
         assertEquals("ok", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
         assertEquals(2, sentRpcRequests().size());
     }
@@ -134,7 +144,7 @@ public class RpcPoolTest extends RpcTestBase {
         server.onCommand = cmd -> cmd.hasRpc() ? laterReply(cmd.getId()) : null;
         RpcPool pool = build(builder().retries(2));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
         ReplyError error = replyErrorOf(future);
         assertEquals(111, error.getCode());
         assertEquals("one send and two resends", 3, sentRpcRequests().size());
@@ -156,7 +166,7 @@ public class RpcPoolTest extends RpcTestBase {
         };
         RpcPool pool = build(builder());
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
         assertEquals("ok", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
         assertEquals(2, sentRpcRequests().size());
     }
@@ -170,13 +180,13 @@ public class RpcPoolTest extends RpcTestBase {
                 return null;
             }
             if (calls.incrementAndGet() == 1) {
-                return moveReply(cmd.getId(), "eu-2");
+                return moveReply(cmd.getId(), "other-key");
             }
             return rpcReply(cmd.getId(), "ok");
         };
         RpcPool pool = build(builder().reroute(error -> error.getMetadata().get("x-example-relocate")));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
         assertEquals("ok", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
         assertEquals(2, sentRpcRequests().size());
     }
@@ -184,10 +194,10 @@ public class RpcPoolTest extends RpcTestBase {
 
     @Test
     public void aRerouteWhichAlwaysMovesIsBoundedByTheRetries() throws Exception {
-        server.onCommand = cmd -> cmd.hasRpc() ? moveReply(cmd.getId(), "eu-2") : null;
-        RpcPool pool = build(builder().retries(2).reroute(error -> "eu-2"));
+        server.onCommand = cmd -> cmd.hasRpc() ? moveReply(cmd.getId(), "other-key") : null;
+        RpcPool pool = build(builder().retries(2).reroute(error -> "other-key"));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
         assertEquals(111, replyErrorOf(future).getCode());
         assertEquals("one send and two moves", 3, sentRpcRequests().size());
     }
@@ -199,7 +209,7 @@ public class RpcPoolTest extends RpcTestBase {
             if (!cmd.hasRpc()) {
                 return null;
             }
-            if ("blob.write".equals(cmd.getRpc().getMethod())) {
+            if ("svc.write".equals(cmd.getRpc().getMethod())) {
                 server.disconnect(1009, "message too big");
                 return null;
             }
@@ -211,15 +221,15 @@ public class RpcPoolTest extends RpcTestBase {
             }
         }));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.write", EMPTY_PAYLOAD, null, into(future));
+        pool.rpc("svc.write", EMPTY_PAYLOAD, null, into(future));
         assertTrue("the call fails", failsWithIOException(future));
         synchronized (errorEndpoints) {
             assertEquals("the close is reported before the call settles", 1, errorEndpoints.size());
         }
         CompletableFuture<RPCResult> next = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(next));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(next));
         assertEquals("ok", new String(next.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
-        assertEquals("the failed call is not sent again: the next request is the next call", Arrays.asList("blob.write", "blob.read"), sentMethods());
+        assertEquals("the failed call is not sent again: the next request is the next call", Arrays.asList("svc.write", "svc.read"), sentMethods());
     }
 
 
@@ -234,7 +244,7 @@ public class RpcPoolTest extends RpcTestBase {
             if (!cmd.hasRpc()) {
                 return null;
             }
-            if ("blob.write".equals(cmd.getRpc().getMethod())) {
+            if ("svc.write".equals(cmd.getRpc().getMethod())) {
                 server.disconnect(1009, "message too big");
                 return null;
             }
@@ -242,7 +252,7 @@ public class RpcPoolTest extends RpcTestBase {
         };
         RpcPool pool = build(builder());
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.write", EMPTY_PAYLOAD, null, into(future));
+        pool.rpc("svc.write", EMPTY_PAYLOAD, null, into(future));
         assertTrue("the call fails", failsWithIOException(future));
         assertEquals("the call is settled by the close, and sent once", 1, sentRpcRequests().size());
         assertEquals("the close opens no replacement connection", 1, connects.get());
@@ -251,11 +261,11 @@ public class RpcPoolTest extends RpcTestBase {
 
     @Test
     public void aCallOverItsDeadlineIsNotSentAgain() throws Exception {
-        server.onCommand = cmd -> cmd.hasRpc() && "blob.read".equals(cmd.getRpc().getMethod()) ? rpcReply(cmd.getId(), "ok") : null;
-        server.deferCommand = cmd -> cmd.hasRpc() && "blob.hold".equals(cmd.getRpc().getMethod());
+        server.onCommand = cmd -> cmd.hasRpc() && "svc.read".equals(cmd.getRpc().getMethod()) ? rpcReply(cmd.getId(), "ok") : null;
+        server.deferCommand = cmd -> cmd.hasRpc() && "svc.hold".equals(cmd.getRpc().getMethod());
         RpcPool pool = build(builder());
         CompletableFuture<RPCResult> held = new CompletableFuture<>();
-        pool.rpc("blob.hold", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(200L).build(), into(held));
+        pool.rpc("svc.hold", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(200L).build(), into(held));
         try {
             held.get(5, TimeUnit.SECONDS);
             fail("the call must time out");
@@ -263,9 +273,9 @@ public class RpcPoolTest extends RpcTestBase {
             assertTrue("a timeout", e.getCause() instanceof TimeoutException);
         }
         CompletableFuture<RPCResult> next = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(next));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(next));
         next.get(5, TimeUnit.SECONDS);
-        assertEquals("the timed-out call is not sent again: the next request is the next call", Arrays.asList("blob.hold", "blob.read"), sentMethods());
+        assertEquals("the timed-out call is not sent again: the next request is the next call", Arrays.asList("svc.hold", "svc.read"), sentMethods());
     }
 
 
@@ -275,8 +285,8 @@ public class RpcPoolTest extends RpcTestBase {
         RpcPool pool = build(builder().maxConnectionsPerEndpoint(1).maxQueued(8));
         CompletableFuture<RPCResult> first = new CompletableFuture<>();
         CompletableFuture<RPCResult> second = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(first));
-        RpcPool.Call call = pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(second));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(first));
+        RpcPool.Call call = pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(second));
         call.cancel();
         assertEquals(ReplyError.CANCELLED, replyErrorOf(second).getCode());
         awaitAll(Collections.singletonList(first), true);
@@ -290,8 +300,8 @@ public class RpcPoolTest extends RpcTestBase {
         RpcPool pool = build(builder().maxConnectionsPerEndpoint(1).maxQueued(8));
         CompletableFuture<RPCResult> onWire = new CompletableFuture<>();
         CompletableFuture<RPCResult> waiting = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(onWire));
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(waiting));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(onWire));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(waiting));
         awaitCondition("one call on the wire", () -> pool.stats().getInflight() == 1);
         pool.close();
         assertEquals(ReplyError.CANCELLED, replyErrorOf(waiting).getCode());
@@ -304,7 +314,7 @@ public class RpcPoolTest extends RpcTestBase {
         answerRpcs("ok");
         RpcPool pool = build(builder().idleTimeout(100L));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
         future.get(5, TimeUnit.SECONDS);
         awaitCondition("the connection is closed", () -> pool.stats().getConnections() == 0);
     }
@@ -322,10 +332,10 @@ public class RpcPoolTest extends RpcTestBase {
         };
         RpcPool pool = build(builder().idleTimeout(0L));
         CompletableFuture<RPCResult> first = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(first));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(first));
         first.get(5, TimeUnit.SECONDS);
         CompletableFuture<RPCResult> second = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(second));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(second));
         second.get(5, TimeUnit.SECONDS);
         assertEquals("both calls went over the one connection, which was not closed", 1, connects.get());
         assertEquals(1, pool.stats().getConnections());
@@ -337,7 +347,7 @@ public class RpcPoolTest extends RpcTestBase {
         answerRpcs("ok");
         RpcPool pool = build(builder().maxQueued(0));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
         assertEquals("ok", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
     }
 
@@ -353,13 +363,13 @@ public class RpcPoolTest extends RpcTestBase {
         CompletableFuture<RPCResult> waiting = new CompletableFuture<>();
         CompletableFuture<RPCResult> refused = new CompletableFuture<>();
         CompletableFuture<RPCResult> other = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("a").build(), into(first));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("a").build(), into(first));
         awaitCondition("the first call on the wire", () -> pool.stats().getInflight() == 1);
-        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("a").build(), into(waiting));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("a").build(), into(waiting));
         awaitCondition("the queue of key a is full", () -> pool.stats().getQueued() == 1);
-        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("a").build(), into(refused));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("a").build(), into(refused));
         assertEquals(ReplyError.LIMIT_EXCEEDED, replyErrorOf(refused).getCode());
-        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("b").timeout(5_000L).build(), into(other));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("b").timeout(5_000L).build(), into(other));
         awaitCondition("a connection is opened for the other key", () -> pool.stats().getConnections() == 2);
         assertTrue("the call of the other key is not refused", !other.isDone());
         awaitAll(Collections.singletonList(first), true);
@@ -372,7 +382,7 @@ public class RpcPoolTest extends RpcTestBase {
                 .random(maximumDraws())
                 .idleTimeout(100L));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(50L).build(), into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(50L).build(), into(future));
         try {
             future.get(5, TimeUnit.SECONDS);
             fail("the call must time out");
@@ -399,7 +409,7 @@ public class RpcPoolTest extends RpcTestBase {
             }
         }));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(1_000L).build(), into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(1_000L).build(), into(future));
         try {
             future.get(5, TimeUnit.SECONDS);
             fail("the call must time out");
@@ -443,7 +453,7 @@ public class RpcPoolTest extends RpcTestBase {
         List<CompletableFuture<RPCResult>> futures = new ArrayList<>();
         for (int i = 0; i < count; i++) {
             CompletableFuture<RPCResult> future = new CompletableFuture<>();
-            pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
+            pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
             futures.add(future);
         }
         return futures;

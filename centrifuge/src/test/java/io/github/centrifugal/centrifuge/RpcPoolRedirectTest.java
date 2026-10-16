@@ -30,14 +30,14 @@ import static org.junit.Assert.fail;
 public class RpcPoolRedirectTest extends RpcTestBase {
     private static final char[] TEST_PASSWORD = "changeit".toCharArray();
 
-    private MockWebServer blobs;
+    private MockWebServer redirects;
     private RpcPool pool;
 
 
     @Before
     public void startBlobs() throws Exception {
-        blobs = new MockWebServer();
-        blobs.start();
+        redirects = new MockWebServer();
+        redirects.start();
         answerRpcs("ref");
     }
 
@@ -47,31 +47,31 @@ public class RpcPoolRedirectTest extends RpcTestBase {
         if (pool != null) {
             pool.close();
         }
-        blobs.shutdown();
+        redirects.shutdown();
     }
 
 
     @Test
     public void aRedirectIsFetchedAndDeliveredAsTheResult() throws Exception {
-        blobs.enqueue(new MockResponse().setBody("chunk-bytes"));
-        pool = redirectingPool(RpcPool.Redirect.builder(blobs.url("/blob").toString()).build());
+        redirects.enqueue(new MockResponse().setBody("chunk-bytes"));
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).build());
         call();
-        assertEquals("/blob", blobs.takeRequest(5, TimeUnit.SECONDS).getPath());
+        assertEquals("/data", redirects.takeRequest(5, TimeUnit.SECONDS).getPath());
     }
 
 
     @Test
     public void aRedirectBodyOverItsBoundFailsWithRedirectFailed() throws Exception {
-        blobs.enqueue(new MockResponse().setBody("too-long-body"));
-        pool = redirectingPool(RpcPool.Redirect.builder(blobs.url("/blob").toString()).maxBytes(4).build());
+        redirects.enqueue(new MockResponse().setBody("too-long-body"));
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).maxBytes(4).build());
         assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
     }
 
 
     @Test
     public void aRedirectAnsweredWithAnErrorStatusFailsWithRedirectFailed() throws Exception {
-        blobs.enqueue(new MockResponse().setResponseCode(404));
-        pool = redirectingPool(RpcPool.Redirect.builder(blobs.url("/blob").toString()).build());
+        redirects.enqueue(new MockResponse().setResponseCode(404));
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).build());
         assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
     }
 
@@ -79,9 +79,9 @@ public class RpcPoolRedirectTest extends RpcTestBase {
     @Test
     public void aRedirectToAUrlTheEndpointDoesNotAllowFailsWithRedirectFailed() throws Exception {
         // The endpoint is a plain ws:// URL, so the redirect to a non-web scheme is refused before any fetch.
-        pool = redirectingPool(RpcPool.Redirect.builder("ftp://blobs.example/blob").build());
+        pool = redirectingPool(RpcPool.Redirect.builder("ftp://host.example/blob").build());
         assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
-        assertEquals("no fetch was started", 0, blobs.getRequestCount());
+        assertEquals("no fetch was started", 0, redirects.getRequestCount());
     }
 
 
@@ -93,14 +93,14 @@ public class RpcPoolRedirectTest extends RpcTestBase {
         secure.useHttps(tls.getSocketFactory(), false);
         secure.start();
         try {
-            secure.enqueue(new MockResponse().setResponseCode(302).setHeader("Location", blobs.url("/blob").toString()));
+            secure.enqueue(new MockResponse().setResponseCode(302).setHeader("Location", redirects.url("/data").toString()));
             pool = new RpcPool.Builder(endpointKey -> Collections.singletonList(server.url()))
                     .random(maximumDraws())
                     .okHttpClient(trustingClient(tls, store))
-                    .redirect((reply, error) -> reply != null ? RpcPool.Redirect.builder(secure.url("/blob").toString()).build() : null)
+                    .redirect((reply, error) -> reply != null ? RpcPool.Redirect.builder(secure.url("/data").toString()).build() : null)
                     .build();
             assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
-            assertEquals("the plain hop is never requested", 0, blobs.getRequestCount());
+            assertEquals("the plain hop is never requested", 0, redirects.getRequestCount());
         } finally {
             secure.shutdown();
         }
@@ -109,33 +109,33 @@ public class RpcPoolRedirectTest extends RpcTestBase {
 
     @Test
     public void theRedirectFetchesHoldTheSlotsOfThePool() throws Exception {
-        blobs.enqueue(new MockResponse().setBody("one").setBodyDelay(300L, TimeUnit.MILLISECONDS));
-        blobs.enqueue(new MockResponse().setBody("two").setBodyDelay(300L, TimeUnit.MILLISECONDS));
+        redirects.enqueue(new MockResponse().setBody("one").setBodyDelay(300L, TimeUnit.MILLISECONDS));
+        redirects.enqueue(new MockResponse().setBody("two").setBodyDelay(300L, TimeUnit.MILLISECONDS));
         pool = new RpcPool.Builder(endpointKey -> Collections.singletonList(server.url()))
                 .random(maximumDraws())
                 .maxRedirectsInflight(1)
-                .redirect((reply, error) -> reply != null ? RpcPool.Redirect.builder(blobs.url("/blob").toString()).build() : null)
+                .redirect((reply, error) -> reply != null ? RpcPool.Redirect.builder(redirects.url("/data").toString()).build() : null)
                 .build();
         CompletableFuture<RPCResult> first = new CompletableFuture<>();
         CompletableFuture<RPCResult> second = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(first));
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(second));
-        awaitCondition("the first fetch is on the wire", () -> blobs.getRequestCount() == 1);
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(first));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(second));
+        awaitCondition("the first fetch is on the wire", () -> redirects.getRequestCount() == 1);
         assertEquals("one fetch in flight", 1, pool.stats().getRedirects());
-        assertEquals("the second fetch waits for the slot", 1, blobs.getRequestCount());
+        assertEquals("the second fetch waits for the slot", 1, redirects.getRequestCount());
         assertEquals("one", new String(first.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
         assertEquals("two", new String(second.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
-        assertEquals(2, blobs.getRequestCount());
+        assertEquals(2, redirects.getRequestCount());
     }
 
 
     @Test
     public void theAllowedSchemesFollowTheEndpoint() {
-        assertTrue(RpcPoolRedirect.allowed("ws://host/connection/websocket", "http://blobs.example/x"));
-        assertTrue(RpcPoolRedirect.allowed("ws://host/connection/websocket", "https://blobs.example/x"));
-        assertTrue(RpcPoolRedirect.allowed("wss://host/connection/websocket", "https://blobs.example/x"));
-        assertFalse("a secure endpoint takes no plain http redirect", RpcPoolRedirect.allowed("wss://host/connection/websocket", "http://blobs.example/x"));
-        assertFalse(RpcPoolRedirect.allowed("ws://host/connection/websocket", "ftp://blobs.example/x"));
+        assertTrue(RpcPoolRedirect.allowed("ws://host/connection/websocket", "http://host.example/x"));
+        assertTrue(RpcPoolRedirect.allowed("ws://host/connection/websocket", "https://host.example/x"));
+        assertTrue(RpcPoolRedirect.allowed("wss://host/connection/websocket", "https://host.example/x"));
+        assertFalse("a secure endpoint takes no plain http redirect", RpcPoolRedirect.allowed("wss://host/connection/websocket", "http://host.example/x"));
+        assertFalse(RpcPoolRedirect.allowed("ws://host/connection/websocket", "ftp://host.example/x"));
     }
 
 
@@ -179,7 +179,7 @@ public class RpcPoolRedirectTest extends RpcTestBase {
 
     private RPCResult call() throws Exception {
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
         RPCResult result = future.get(5, TimeUnit.SECONDS);
         assertEquals("chunk-bytes", new String(result.getData(), StandardCharsets.UTF_8));
         return result;
@@ -188,7 +188,7 @@ public class RpcPoolRedirectTest extends RpcTestBase {
 
     private ReplyError failureOf() throws Exception {
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
-        pool.rpc("blob.read", EMPTY_PAYLOAD, null, into(future));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
         try {
             future.get(5, TimeUnit.SECONDS);
         } catch (ExecutionException e) {
