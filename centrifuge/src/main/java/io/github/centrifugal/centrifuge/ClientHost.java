@@ -1,6 +1,5 @@
 package io.github.centrifugal.centrifuge;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
@@ -9,7 +8,6 @@ import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
 import java8.util.concurrent.CompletableFuture;
 import okhttp3.WebSocket;
-import okio.ByteString;
 
 
 /**
@@ -83,13 +81,11 @@ final class ClientHost {
 
     /**
      * Sends the command on the current transport. Returns whether the transport took it. Throws when the
-     * command cannot be encoded, so that only the call of the command fails. The encoding mirrors
-     * Client.serializeCommand, which swallows the failure: a copy here, so the failure reaches the call.
+     * command cannot be encoded, so that only the call of the command fails. The frame is the one
+     * Client.serializeCommand writes, without the copies of its stream: see {@link FrameEncoder}.
      */
     boolean sendCommand(Protocol.Command cmd) throws IOException {
-        ByteArrayOutputStream stream = new ByteArrayOutputStream();
-        cmd.writeDelimitedTo(stream);
-        return client.ws.send(ByteString.of(stream.toByteArray()));
+        return client.ws.send(FrameEncoder.encode(cmd));
     }
 
 
