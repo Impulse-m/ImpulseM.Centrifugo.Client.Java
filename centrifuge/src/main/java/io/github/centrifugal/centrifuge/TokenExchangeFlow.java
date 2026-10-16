@@ -104,6 +104,8 @@ final class TokenExchangeFlow {
     // The refusal run: the deadline of its horizon, null when no run is open, and the refused attempts of the run.
     private ScheduledFuture<?> horizon;
     private int refusals = 0;
+    // The changed refresh tokens presented in the run, see mayPresentChanged.
+    private int changedPresents = 0;
 
 
     /**
@@ -437,6 +439,10 @@ final class TokenExchangeFlow {
             return;
         }
         if (!again.equals(refreshToken)) {
+            if (!mayPresentChanged()) {
+                endBootstrapSession();
+                return;
+            }
             runExchange(b, again);
             return;
         }
@@ -476,13 +482,25 @@ final class TokenExchangeFlow {
     }
 
 
-    // Ends the refusal run: its horizon is cancelled and its count of refused attempts starts again at zero.
+    // Whether a changed refresh token may be presented at once. The first one of a run always may, as a grace of zero
+    // needs it; later ones only while the horizon is open, so a storage which keeps changing cannot extend the run.
+    private boolean mayPresentChanged() {
+        if (changedPresents > 0 && horizonPassed()) {
+            return false;
+        }
+        changedPresents++;
+        return true;
+    }
+
+
+    // Ends the refusal run: its horizon is cancelled and its counts of refused and changed attempts start again at zero.
     private void closeRefusalRun() {
         if (horizon != null) {
             horizon.cancel(false);
             horizon = null;
         }
         refusals = 0;
+        changedPresents = 0;
     }
 
 
@@ -739,8 +757,12 @@ final class TokenExchangeFlow {
                     });
                 } else {
                     host.runOrInline(() -> {
-                        if (err == null) {
+                        Throwable failure = Extensions.unwrapCompletion(err);
+                        if (failure == null) {
                             acceptedExchange(result);
+                        } else if (failure instanceof UnauthorizedException) {
+                            // A refusal which arrives after the deadline starts the run too, as one within the deadline does.
+                            openRefusalRun();
                         }
                         storeAbandonedRotation(result, refreshToken);
                     });
@@ -803,6 +825,11 @@ final class TokenExchangeFlow {
                 return;
             }
             if (!again.equals(refreshToken)) {
+                if (!mayPresentChanged()) {
+                    closeRefusalRun();
+                    cb.Done(new UnauthorizedException(), null);
+                    return;
+                }
                 runRenewal(transport, cb, again, generation);
                 return;
             }
