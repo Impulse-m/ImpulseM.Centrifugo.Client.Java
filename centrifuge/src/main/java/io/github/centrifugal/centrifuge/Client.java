@@ -1,6 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -757,7 +758,13 @@ public class Client {
     }
 
     private byte[] serializeCommand(Protocol.Command cmd) {
-        return ClientHost.serialize(cmd);
+        ByteArrayOutputStream stream = new ByteArrayOutputStream();
+        try {
+            cmd.writeDelimitedTo(stream);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return stream.toByteArray();
     }
 
     private Subscription getSub(String channel) {

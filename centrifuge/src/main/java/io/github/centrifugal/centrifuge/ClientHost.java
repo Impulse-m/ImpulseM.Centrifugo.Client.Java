@@ -150,17 +150,6 @@ final class ClientHost {
     }
 
 
-    /** Encodes a command as the client writes it. A failure is printed, as the client has always printed it. */
-    static byte[] serialize(Protocol.Command cmd) {
-        try {
-            return encode(cmd);
-        } catch (IOException e) {
-            e.printStackTrace();
-            return new byte[0];
-        }
-    }
-
-
     void addFuture(int id, CompletableFuture<Protocol.Reply> future) {
         client.futures.put(id, future);
     }
