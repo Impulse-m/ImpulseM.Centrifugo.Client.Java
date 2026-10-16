@@ -1,0 +1,2 @@
+# The fossil delta test data is byte-exact: a checkout must not convert its line endings.
+centrifuge/src/test/resources/data/** -text
