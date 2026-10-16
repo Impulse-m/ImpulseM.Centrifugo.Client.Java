@@ -349,7 +349,7 @@ public class TokenExchangeTest extends RpcTestBase {
         Storage storage = new Storage("refresh-1");
         answerExchanges("access-1|refresh-2");
         answerIdentity(true, TTL_SECONDS);
-        newClientOnClock(exchangeOptions(storage), clock);
+        newExchangeClient(exchangeOptions(storage), clock);
         client.connect();
         awaitCondition("connected", () -> connected.size() == 1);
         long delay = renewalDelay(clock);
@@ -375,7 +375,7 @@ public class TokenExchangeTest extends RpcTestBase {
         answerIdentity(true, TTL_SECONDS);
         for (int run = 0; run < 20; run++) {
             ManualScheduler clock = new ManualScheduler();
-            newClientOnClock(exchangeOptions(new Storage("refresh-1")), clock);
+            newExchangeClient(exchangeOptions(new Storage("refresh-1")), clock);
             client.connect();
             final int expected = run + 1;
             awaitCondition("connected", () -> connected.size() == expected);
@@ -396,7 +396,7 @@ public class TokenExchangeTest extends RpcTestBase {
                 cb.onDone(new UnauthorizedException(), null);
             }
         };
-        newClientOnClock(exchangeOptions(storage), clock);
+        newExchangeClient(exchangeOptions(storage), clock);
 
         client.connect();
 
@@ -419,7 +419,7 @@ public class TokenExchangeTest extends RpcTestBase {
                 cb.onDone(new CompletionException(new UnauthorizedException()), null);
             }
         };
-        newClientOnClock(exchangeOptions(storage), clock);
+        newExchangeClient(exchangeOptions(storage), clock);
 
         client.connect();
 
@@ -442,7 +442,7 @@ public class TokenExchangeTest extends RpcTestBase {
                 event.rpc(METHOD, null, (Throwable err, RPCResult result) -> cb.onDone(err, null));
             }
         };
-        newClientOnClock(exchangeOptions(storage), clock);
+        newExchangeClient(exchangeOptions(storage), clock);
 
         client.connect();
 
@@ -462,7 +462,7 @@ public class TokenExchangeTest extends RpcTestBase {
         ManualScheduler clock = new ManualScheduler();
         Options options = exchangeOptions(storage);
         options.setTimeout(1000);
-        newClientOnClock(options, clock);
+        newExchangeClient(options, clock);
         client.connect();
         awaitCondition("first exchange started", () -> storage.held != null);
         int delaysBefore = clock.requestedDelays().size();
@@ -490,7 +490,7 @@ public class TokenExchangeTest extends RpcTestBase {
         Storage storage = new Storage("refresh-1");
         Options options = exchangeOptions(storage);
         options.setTimeout(200);
-        newClientOnClock(options, clock);
+        newExchangeClient(options, clock);
         client.connect();
         awaitCondition("refresh sent", () -> refreshTokens().size() == 1);
         int delaysBefore = clock.requestedDelays().size();
@@ -530,6 +530,36 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
+    public void pingDuringBootstrapDoesNotDropTheConnectedConnection() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        server.connectResult = Protocol.ConnectResult.newBuilder()
+                .setClient("fake-client").setVersion("0.0.0").setPing(25).setPong(true).build();
+        answerIdentity(false, 0);
+        StallingStorage storage = new StallingStorage("refresh-1");
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("exchange started", () -> storage.held != null);
+        server.sendPing();
+        awaitCondition("pong sent during the bootstrap", () -> countPongs() == 1);
+        storage.held.onDone(null, new TokenExchangeResult("access-1", null));
+        awaitCondition("connected", () -> connected.size() == 1);
+
+        // The server pings on schedule after the connect. Each ping is answered, and the connection stays up past the
+        // deadline of the ping timer which the bootstrap ping started.
+        for (int round = 2; round <= 4; round++) {
+            clock.advance(25000);
+            drainExecutor();
+            server.sendPing();
+            final int expected = round;
+            awaitCondition("pong " + round, () -> countPongs() == expected);
+        }
+        drainExecutor();
+        assertEquals(ClientState.CONNECTED, client.getState());
+        assertTrue("no disconnect", disconnects.isEmpty());
+    }
+
+
+    @Test
     public void abandonedBootstrapKeepsItsBackoffOnTheNextConnect() throws Exception {
         ManualScheduler clock = new ManualScheduler();
         answerExchanges("access-1|refresh-2");
@@ -550,7 +580,7 @@ public class TokenExchangeTest extends RpcTestBase {
         options.setTimeout(1000);
         options.setMinReconnectDelay(RETRY_MIN_MILLIS);
         options.setMaxReconnectDelay(RETRY_MAX_MILLIS);
-        newClientOnClock(options, clock);
+        newExchangeClient(options, clock);
         client.connect();
         // Three failed exchanges: the retry after the third one is pending when the connection drops.
         for (int retry = 1; retry <= 2; retry++) {
@@ -606,7 +636,7 @@ public class TokenExchangeTest extends RpcTestBase {
         answerIdentity(false, 0);
         Storage storage = new Storage("refresh-1");
         storage.failNext.set(true);
-        newClientOnClock(exchangeOptions(storage), clock);
+        newExchangeClient(exchangeOptions(storage), clock);
 
         client.connect();
 
@@ -625,7 +655,7 @@ public class TokenExchangeTest extends RpcTestBase {
         answerExchanges("access-1|refresh-2");
         answerIdentity(true, TTL_SECONDS);
         Storage storage = new Storage("refresh-1");
-        newClientOnClock(exchangeOptions(storage), clock);
+        newExchangeClient(exchangeOptions(storage), clock);
         client.connect();
         awaitCondition("connected", () -> connected.size() == 1);
         long delay = renewalDelay(clock);
@@ -648,7 +678,7 @@ public class TokenExchangeTest extends RpcTestBase {
         answerExchanges("access-1|refresh-2");
         answerIdentity(true, TTL_SECONDS);
         Options options = exchangeOptions(new Storage("refresh-1"));
-        newClientOnClock(options, clock);
+        newExchangeClient(options, clock);
         client.connect();
         awaitCondition("connected", () -> connected.size() == 1);
         long delay = renewalDelay(clock);
@@ -686,7 +716,7 @@ public class TokenExchangeTest extends RpcTestBase {
         };
         Options options = exchangeOptions(storage);
         options.setTimeout(1000);
-        newClientOnClock(options, clock);
+        newExchangeClient(options, clock);
         client.connect();
         // One failed exchange, then the retry is refused: the session ends, and the backoff of the bootstrap ends with it.
         awaitCondition("retry scheduled", () -> bootstrapDelays(clock).size() == 1);
@@ -713,7 +743,7 @@ public class TokenExchangeTest extends RpcTestBase {
             }
             return null;
         };
-        newClientOnClock(exchangeOptions(new Storage("refresh-1")), clock);
+        newExchangeClient(exchangeOptions(new Storage("refresh-1")), clock);
 
         client.connect();
 
@@ -737,7 +767,7 @@ public class TokenExchangeTest extends RpcTestBase {
             return null;
         };
         Storage storage = new Storage("refresh-1");
-        newClientOnClock(exchangeOptions(storage), clock);
+        newExchangeClient(exchangeOptions(storage), clock);
 
         client.connect();
 
@@ -850,7 +880,7 @@ public class TokenExchangeTest extends RpcTestBase {
         answerIdentity(false, 0);
         StallingStorage storage = new StallingStorage("refresh-1");
         ManualScheduler clock = new ManualScheduler();
-        newClientOnClock(exchangeOptions(storage), clock);
+        newExchangeClient(exchangeOptions(storage), clock);
         client.connect();
         awaitCondition("first exchange started", () -> storage.held != null);
         int delaysBefore = clock.requestedDelays().size();
@@ -878,7 +908,7 @@ public class TokenExchangeTest extends RpcTestBase {
         ManualScheduler clock = new ManualScheduler();
         Options options = exchangeOptions(storage);
         options.setTimeout(1000);
-        newClientOnClock(options, clock);
+        newExchangeClient(options, clock);
         client.connect();
         awaitCondition("first exchange started", () -> storage.held != null);
 
@@ -900,7 +930,7 @@ public class TokenExchangeTest extends RpcTestBase {
         ManualScheduler clock = new ManualScheduler();
         Options options = exchangeOptions(storage);
         options.setTimeout(1000);
-        newClientOnClock(options, clock);
+        newExchangeClient(options, clock);
         client.connect();
         awaitCondition("connected", () -> connected.size() == 1);
         clock.advance(renewalDelay(clock));
@@ -927,7 +957,7 @@ public class TokenExchangeTest extends RpcTestBase {
         ManualScheduler clock = new ManualScheduler();
         Options options = exchangeOptions(storage);
         options.setTimeout(1000);
-        newClientOnClock(options, clock);
+        newExchangeClient(options, clock);
         client.connect();
         awaitCondition("connected", () -> connected.size() == 1);
         clock.advance(renewalDelay(clock));
@@ -953,7 +983,7 @@ public class TokenExchangeTest extends RpcTestBase {
         answerIdentity(true, TTL_SECONDS);
         StallingStorage storage = new StallingStorage("refresh-1", 2);
         ManualScheduler clock = new ManualScheduler();
-        newClientOnClock(exchangeOptions(storage), clock);
+        newExchangeClient(exchangeOptions(storage), clock);
         client.connect();
         awaitCondition("connected", () -> connected.size() == 1);
         clock.advance(renewalDelay(clock));
@@ -1024,7 +1054,7 @@ public class TokenExchangeTest extends RpcTestBase {
         answerIdentity(false, 0);
         StallingStorage storage = new StallingStorage("refresh-1");
         ManualScheduler clock = new ManualScheduler();
-        newClientOnClock(exchangeOptions(storage), clock);
+        newExchangeClient(exchangeOptions(storage), clock);
         client.connect();
         awaitCondition("exchange started", () -> storage.held != null);
         int delaysBefore = clock.requestedDelays().size();
@@ -1070,7 +1100,7 @@ public class TokenExchangeTest extends RpcTestBase {
         answerExchanges("access-1|refresh-2");
         answerIdentity(true, TTL_SECONDS);
         Storage storage = new Storage("refresh-1");
-        newClientOnClock(exchangeOptions(storage), clock);
+        newExchangeClient(exchangeOptions(storage), clock);
         client.connect();
         awaitCondition("connected", () -> connected.size() == 1);
 
@@ -1242,8 +1272,8 @@ public class TokenExchangeTest extends RpcTestBase {
     }
 
 
-    @Override
-    protected Client newClientOnClock(Options options, ManualScheduler clock) {
+    // The client on the manual clock, with this test's listener. Named apart from the base helper, which is protected.
+    private Client newExchangeClient(Options options, ManualScheduler clock) {
         client = new Client(server.url(), options, listener(), RETRY_MIN_MILLIS, RETRY_MAX_MILLIS, clock);
         return client;
     }
@@ -1441,6 +1471,12 @@ public class TokenExchangeTest extends RpcTestBase {
             Thread.sleep(5);
         }
         awaitCondition(what, condition);
+    }
+
+
+    // The empty commands the client sent: its answers to the pings of the server.
+    private long countPongs() {
+        return server.received().stream().filter(Protocol.Command.getDefaultInstance()::equals).count();
     }
 
 
