@@ -616,6 +616,47 @@ public class TokenExchangeTest extends FakeServerTestBase {
 
 
     @Test
+    public void bootstrapEndedByARefusalStartsTheBackoffAfreshOnTheNextConnect() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        server.onCommand = (Protocol.Command cmd) -> {
+            if (cmd.hasRefresh()) {
+                return refusal(cmd, CODE_PERMISSION_DENIED);
+            }
+            return null;
+        };
+        AtomicBoolean failing = new AtomicBoolean(true);
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                if (failing.getAndSet(false)) {
+                    exchanged.add(event.getRefreshToken());
+                    cb.onDone(new IOException("exchange failed"), null);
+                    return;
+                }
+                super.exchange(event, cb);
+            }
+        };
+        Options options = exchangeOptions(storage);
+        options.setTimeout(1000);
+        newClientOnClock(options, clock);
+        client.connect();
+        // One failed exchange, then the retry is refused: the session ends, and the backoff of the bootstrap ends with it.
+        awaitUntil("retry scheduled", () -> bootstrapDelays(clock).size() == 1);
+        clock.advance(60000);
+        awaitUntil("disconnected", () -> disconnects.size() == 1);
+        assertEquals(CODE_PERMISSION_DENIED, disconnects.get(0).getCode());
+        assertEquals(0, ((Integer) fieldOf(fieldOf(fieldOf(client, "auth"), "flow"), "bootstrapAttempt")).intValue());
+
+        // A new connect starts at the first step of the backoff again: its first retry is at most the first step.
+        failing.set(true);
+        client.connect();
+        awaitUntil("retry of the new connect scheduled", () -> bootstrapDelays(clock).size() == 2);
+        assertTrue(bootstrapDelays(clock).get(1) <= 2 * BOOTSTRAP_RETRY_MIN_MILLIS);
+    }
+
+
+    @Test
     public void bootstrapRefreshRefusedWithADisconnectCodeDisconnects() throws Exception {
         ManualScheduler clock = new ManualScheduler();
         answerExchanges("access-1|refresh-2");

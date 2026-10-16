@@ -199,7 +199,7 @@ final class TokenExchangeFlow {
 
     /**
      * The connection is gone: the bootstrap is abandoned and its retry is cancelled. The backoff of the bootstrap
-     * attempts goes on, it restarts when a bootstrap completes. The expiry record is kept.
+     * attempts goes on, it restarts when a bootstrap completes or ends the session. The expiry record is kept.
      */
     void reset() {
         if (bootstrap != null) {
@@ -332,6 +332,7 @@ final class TokenExchangeFlow {
     // else ends the session.
     private void reloadAfterRefusal(Bootstrap b, String refreshToken, boolean reloaded) {
         if (reloaded) {
+            bootstrapAttempt = 0;
             host.failUnauthorized();
             return;
         }
@@ -343,6 +344,7 @@ final class TokenExchangeFlow {
             return;
         }
         if (again == null) {
+            bootstrapAttempt = 0;
             host.failUnauthorized();
             return;
         }
@@ -403,6 +405,7 @@ final class TokenExchangeFlow {
             scheduleBootstrapRetry(b);
             return;
         }
+        bootstrapAttempt = 0;
         host.disconnect(replyError.getCode(), replyError.getMessage());
     }
 
