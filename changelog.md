@@ -15,6 +15,8 @@ Unreleased
 * An rpc call cancelled before it was sent is rejected with `CANCELLED` on every connection. It was `UNSUPPORTED` on a connection without the capability. A call whose resend with a new msg_id is still queued is `CANCELLED` too.
 * An rpc call with an instance whose msg_id was never written is rejected with `CANCELLED` when the client closes or disconnects for good. A call which was written fails with `IOException`, and the server still gets its cancel with the next connect which carries cancels.
 * A timer refresh token whose fetch is superseded by a `refresh()` call is not sent. A token fetched while disconnected, on the connection it was for, is the token of the next connect.
+* The connect listener callbacks (`onConnected`, `onAuth`, `onSubscribed`, `onPublication`, `onUnsubscribed`) run after the connect reply has armed the timers and flushed the queued calls. A callback which throws a `RuntimeException` is reported to `onError` after the handshake, and the handshake goes on.
+* A cancel whose send fails is kept for the next connect, and reported to `onError` as an `UnclassifiedError`, after the connect reply is handled.
 * An rpc call with a null method or data throws `NullPointerException` at the call.
 * The instance is read when the client is created. A reply which arrives after the call deadline is acknowledged.
 
