@@ -927,10 +927,8 @@ public class Client {
         event.setUser(result.getUser());
         event.setAuthClass(result.getAuthClass());
         this.setState(ClientState.CONNECTED);
-        // The listener hears the connect after the handshake has written its state, so a callback which disconnects
-        // or queues a call finds the timers armed and the queued calls written. A failure of a callback is reported
-        // after the handshake, and the callbacks which follow it still run.
-        List<Runnable> notices = new ArrayList<>();
+        // The callbacks below run after the handshake, see ConnectNotices.
+        ConnectNotices notices = new ConnectNotices(this.host);
         notices.add(() -> this.listener.onConnected(this, event));
         notices.add(() -> this.auth.applyAuth(result.getUser(), result.getAuthClass(), true));
         this.pingInterval = result.getPing() * 1000;
@@ -986,8 +984,7 @@ public class Client {
         while (it.hasNext()) {
             Map.Entry<String, ServerSubscription> entry = it.next();
             if (!result.getSubsMap().containsKey(entry.getKey())) {
-                String unsubscribed = entry.getKey();
-                notices.add(() -> this.listener.onUnsubscribed(this, new ServerUnsubscribedEvent(unsubscribed)));
+                notices.add(() -> this.listener.onUnsubscribed(this, new ServerUnsubscribedEvent(entry.getKey())));
                 it.remove();
             }
         }
@@ -1028,9 +1025,7 @@ public class Client {
 
         this.auth.scheduleExpiry(result.getExpires(), result.getTtl());
 
-        for (Runnable notice : notices) {
-            this.host.reporting(notice).run();
-        }
+        notices.run();
     }
 
     private void sendConnect() {
