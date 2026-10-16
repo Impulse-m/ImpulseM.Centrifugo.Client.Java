@@ -1238,7 +1238,9 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     public void laterDelayAcrossADroppedTransportIsResentOnReconnect() throws Exception {
         enableRpcOptions();
         refuseCalls(1, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
-        Client c = newClient();
+        // The resend waits its whole 250 ms bound, so the transport drops while the delay runs. A jittered draw
+        // near zero would resend on the old transport first and count a third request.
+        Client c = newClientWithMaximumDraws(instanceOptions());
         connect(c);
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         c.rpcCall("later", EMPTY_PAYLOAD, into(future));

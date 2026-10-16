@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
@@ -132,6 +133,16 @@ abstract class RpcTestBase extends FakeServerTestBase {
      */
     protected Client newClientOnClock(Options options, ManualScheduler clock, int retryMinMillis, int retryMaxMillis, Random resendDraws) {
         client = new Client(server.url(), options, signallingListener(), retryMinMillis, retryMaxMillis, clock, resendDraws);
+        return client;
+    }
+
+
+    /**
+     * Creates the client for the fake server with the options, on real time, whose rpc resends draw the top
+     * of their range, so a later resend waits its whole bound. The client is not connected yet.
+     */
+    protected Client newClientWithMaximumDraws(Options options) {
+        client = new Client(server.url(), options, signallingListener(), AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, new ScheduledThreadPoolExecutor(1), maximumDraws());
         return client;
     }
 
