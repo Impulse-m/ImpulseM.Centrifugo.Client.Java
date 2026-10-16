@@ -545,55 +545,54 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     private static WebSocket.Factory failingSends(WebSocket.Factory factory, Throwable failure, boolean cancelSend) {
         AtomicBoolean armed = new AtomicBoolean(true);
         return (Request request, WebSocketListener listener) -> {
-            AtomicReference<WebSocket> transport = new AtomicReference<>();
-            WebSocket real = factory.newWebSocket(request, new WebSocketListener() {
-                @Override
-                public void onOpen(WebSocket webSocket, Response response) {
-                    listener.onOpen(transport.get(), response);
-                }
-
-
-                @Override
-                public void onMessage(WebSocket webSocket, String text) {
-                    listener.onMessage(transport.get(), text);
-                }
-
-
-                @Override
-                public void onMessage(WebSocket webSocket, ByteString bytes) {
-                    listener.onMessage(transport.get(), bytes);
-                }
-
-
-                @Override
-                public void onClosing(WebSocket webSocket, int code, String reason) {
-                    listener.onClosing(transport.get(), code, reason);
-                }
-
-
-                @Override
-                public void onClosed(WebSocket webSocket, int code, String reason) {
-                    listener.onClosed(transport.get(), code, reason);
-                }
-
-
-                @Override
-                public void onFailure(WebSocket webSocket, Throwable cause, Response response) {
-                    listener.onFailure(transport.get(), cause, response);
-                }
-            });
+            AtomicReference<WebSocket> real = new AtomicReference<>();
             InvocationHandler handler = (Object proxy, Method method, Object[] args) -> {
                 if (method.getName().equals("send") && isTargetPayload(args[0], cancelSend) && armed.getAndSet(false)) {
                     throw failure;
                 }
                 try {
-                    return method.invoke(real, args);
+                    return method.invoke(real.get(), args);
                 } catch (InvocationTargetException e) {
                     throw e.getCause();
                 }
             };
             WebSocket proxy = (WebSocket) Proxy.newProxyInstance(WebSocket.class.getClassLoader(), new Class<?>[] {WebSocket.class}, handler);
-            transport.set(proxy);
+            real.set(factory.newWebSocket(request, new WebSocketListener() {
+                @Override
+                public void onOpen(WebSocket webSocket, Response response) {
+                    listener.onOpen(proxy, response);
+                }
+
+
+                @Override
+                public void onMessage(WebSocket webSocket, String text) {
+                    listener.onMessage(proxy, text);
+                }
+
+
+                @Override
+                public void onMessage(WebSocket webSocket, ByteString bytes) {
+                    listener.onMessage(proxy, bytes);
+                }
+
+
+                @Override
+                public void onClosing(WebSocket webSocket, int code, String reason) {
+                    listener.onClosing(proxy, code, reason);
+                }
+
+
+                @Override
+                public void onClosed(WebSocket webSocket, int code, String reason) {
+                    listener.onClosed(proxy, code, reason);
+                }
+
+
+                @Override
+                public void onFailure(WebSocket webSocket, Throwable cause, Response response) {
+                    listener.onFailure(proxy, cause, response);
+                }
+            }));
             return proxy;
         };
     }
