@@ -16,6 +16,7 @@ import javax.net.ssl.X509TrustManager;
 import okhttp3.OkHttpClient;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
+import okhttp3.mockwebserver.RecordedRequest;
 
 import org.junit.After;
 import org.junit.Before;
@@ -23,11 +24,13 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 
 public class RpcPoolRedirectTest extends RpcTestBase {
+    // The password of the test keystore, which holds a self-signed certificate for localhost and its key. A test fixture only.
     private static final char[] TEST_PASSWORD = "changeit".toCharArray();
 
     private MockWebServer redirects;
@@ -101,6 +104,70 @@ public class RpcPoolRedirectTest extends RpcTestBase {
                     .build();
             assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
             assertEquals("the plain hop is never requested", 0, redirects.getRequestCount());
+        } finally {
+            secure.shutdown();
+        }
+    }
+
+
+    @Test
+    public void aRedirectHopToAnotherOriginIsRequestedWithoutTheApplicationHeaders() throws Exception {
+        MockWebServer other = new MockWebServer();
+        other.start();
+        try {
+            redirects.enqueue(new MockResponse().setResponseCode(302).setHeader("Location", "/moved"));
+            redirects.enqueue(new MockResponse().setResponseCode(302).setHeader("Location", other.url("/final").toString()));
+            other.enqueue(new MockResponse().setBody("chunk-bytes"));
+            pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).header("x-example-key", "secret").build());
+            call();
+            assertEquals("the first hop carries the header", "secret", redirects.takeRequest(5, TimeUnit.SECONDS).getHeader("x-example-key"));
+            assertEquals("a hop on the same origin carries it too", "secret", redirects.takeRequest(5, TimeUnit.SECONDS).getHeader("x-example-key"));
+            RecordedRequest hop = other.takeRequest(5, TimeUnit.SECONDS);
+            assertEquals("/final", hop.getPath());
+            assertNull("another origin gets no application header", hop.getHeader("x-example-key"));
+        } finally {
+            other.shutdown();
+        }
+    }
+
+
+    @Test
+    public void aRedirectChainLongerThanTheHopBoundFailsWithRedirectFailed() throws Exception {
+        for (int hop = 0; hop <= RpcPoolRedirect.MAX_HOPS; hop++) {
+            redirects.enqueue(new MockResponse().setResponseCode(302).setHeader("Location", "/data"));
+        }
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).build());
+        assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
+        assertEquals("the hop after the bound is not requested", RpcPoolRedirect.MAX_HOPS + 1, redirects.getRequestCount());
+    }
+
+
+    @Test
+    public void aRedirectWithoutALocationFailsWithRedirectFailed() throws Exception {
+        redirects.enqueue(new MockResponse().setResponseCode(302));
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).build());
+        assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
+        assertEquals(1, redirects.getRequestCount());
+    }
+
+
+    @Test
+    public void aLaterHopFromHttpsToHttpIsNotFollowed() throws Exception {
+        KeyStore store = testKeyStore();
+        SSLContext tls = testTls(store);
+        MockWebServer secure = new MockWebServer();
+        secure.useHttps(tls.getSocketFactory(), false);
+        secure.start();
+        try {
+            secure.enqueue(new MockResponse().setResponseCode(302).setHeader("Location", "/moved"));
+            secure.enqueue(new MockResponse().setResponseCode(302).setHeader("Location", redirects.url("/data").toString()));
+            pool = new RpcPool.Builder(endpointKey -> Collections.singletonList(server.url()))
+                    .random(maximumDraws())
+                    .okHttpClient(trustingClient(tls, store))
+                    .redirect((reply, error) -> reply != null ? RpcPool.Redirect.builder(secure.url("/data").toString()).build() : null)
+                    .build();
+            assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
+            assertEquals("the plain hop after the secure one is never requested", 0, redirects.getRequestCount());
         } finally {
             secure.shutdown();
         }
