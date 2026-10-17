@@ -664,48 +664,16 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
-    public void changingStoredTokenIsPresentedOnlyWhileTheHorizonIsOpen() throws Exception {
-        // The storage alternates between two values the issuer refuses. Each attempt moves the clock on by a second.
+    public void everyChangedStoredTokenIsPresentedAtOnce() throws Exception {
+        // The storage moves on twice more after the first change, then holds still. The clock does not move: the second and
+        // the third changed values are presented at once too, and only the unchanged last one waits for the backoff.
         ManualScheduler clock = new ManualScheduler();
+        List<String> values = Arrays.asList("refresh-1", "refresh-2", "refresh-3", "refresh-4");
         AtomicInteger loads = new AtomicInteger();
-        Storage storage = new Storage("refresh-a") {
-            @Override
-            public int grace() {
-                return 3;
-            }
-
+        Storage storage = new Storage("refresh-1") {
             @Override
             public String load() {
-                return loads.incrementAndGet() % 2 == 0 ? "refresh-a" : "refresh-b";
-            }
-
-            @Override
-            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
-                exchanged.add(event.getRefreshToken());
-                clock.advance(1000);
-                cb.onDone(new UnauthorizedException(), null);
-            }
-        };
-        newExchangeClient(exchangeOptions(storage), clock);
-
-        client.connect();
-        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1);
-        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
-        // The first changed token is presented at once; the later ones wait for the backoff, which the clock moves past.
-        assertTrue(storage.exchanged.size() <= 4);
-    }
-
-
-    @Test
-    public void changedValuesAfterTheFirstWaitForTheBackoffWhileTheClockStands() throws Exception {
-        // The storage returns a new value on every read and the issuer refuses each attempt at once. The clock does not
-        // move: only the first changed value is presented at once, and the next one waits for the backoff of the run.
-        ManualScheduler clock = new ManualScheduler();
-        AtomicInteger loads = new AtomicInteger();
-        Storage storage = new Storage("refresh-0") {
-            @Override
-            public String load() {
-                return "refresh-" + loads.incrementAndGet();
+                return values.get(Math.min(loads.getAndIncrement(), values.size() - 1));
             }
 
             @Override
@@ -719,14 +687,49 @@ public class TokenExchangeTest extends RpcTestBase {
         client.connect();
         awaitCondition("refusal reported", () -> !errors.isEmpty());
         drainExecutor();
-        assertEquals(Arrays.asList("refresh-1", "refresh-2"), storage.exchanged);
+        assertEquals(values, storage.exchanged);
         assertTrue(disconnects.isEmpty());
 
-        // The retry comes after the backoff, and presents the value read then, once more and no sooner.
+        // The retry comes after the backoff, and presents the unchanged value once more and no sooner.
         clock.advance(2000);
         drainExecutor();
-        assertEquals(3, storage.exchanged.size());
+        assertEquals(5, storage.exchanged.size());
+        assertEquals("refresh-4", storage.exchanged.get(4));
         assertTrue(disconnects.isEmpty());
+    }
+
+
+    @Test
+    public void newestChangedStoredTokenIsPresentedAtTheHorizonAttempt() throws Exception {
+        // With no grace the horizon has passed at the first refusal. The changed values are still presented at once, the
+        // newest one at the attempt which closes the run, and the session ends only on the value which did not change.
+        ManualScheduler clock = new ManualScheduler();
+        List<String> values = Arrays.asList("refresh-1", "refresh-2", "refresh-3");
+        AtomicInteger loads = new AtomicInteger();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public int grace() {
+                return 0;
+            }
+
+            @Override
+            public String load() {
+                return values.get(Math.min(loads.getAndIncrement(), values.size() - 1));
+            }
+
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                exchanged.add(event.getRefreshToken());
+                cb.onDone(new UnauthorizedException(), null);
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+
+        client.connect();
+        awaitCondition("disconnected", () -> disconnects.size() == 1);
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        assertEquals(values, storage.exchanged);
+        assertTrue(storage.stored.isEmpty());
     }
 
 

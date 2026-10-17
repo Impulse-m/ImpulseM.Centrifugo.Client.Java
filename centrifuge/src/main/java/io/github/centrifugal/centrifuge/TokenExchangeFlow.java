@@ -104,8 +104,6 @@ final class TokenExchangeFlow {
     // The refusal run: the deadline of its horizon, null when no run is open, and the refused attempts of the run.
     private ScheduledFuture<?> horizon;
     private int refusals = 0;
-    // The changed refresh tokens presented in the run, see mayPresentChanged.
-    private int changedPresents = 0;
 
 
     /**
@@ -439,7 +437,7 @@ final class TokenExchangeFlow {
             endBootstrapSession();
             return;
         }
-        if (!again.equals(refreshToken) && mayPresentChanged()) {
+        if (!again.equals(refreshToken)) {
             runExchange(b, again);
             return;
         }
@@ -481,26 +479,13 @@ final class TokenExchangeFlow {
     }
 
 
-    // Whether a changed refresh token may be presented at once. Only the first one of a run may: the winner/loser race
-    // needs that one. Later changed values wait for the backoff like an unchanged one, so a storage which keeps changing
-    // cannot make the run exchange back to back within the grace.
-    private boolean mayPresentChanged() {
-        if (changedPresents > 0) {
-            return false;
-        }
-        changedPresents++;
-        return true;
-    }
-
-
-    // Ends the refusal run: its horizon is cancelled and its counts of refused and changed attempts start again at zero.
+    // Ends the refusal run: its horizon is cancelled and its count of refused attempts starts again at zero.
     private void closeRefusalRun() {
         if (horizon != null) {
             horizon.cancel(false);
             horizon = null;
         }
         refusals = 0;
-        changedPresents = 0;
     }
 
 
@@ -827,7 +812,7 @@ final class TokenExchangeFlow {
                 cb.Done(new UnauthorizedException(), null);
                 return;
             }
-            if (!again.equals(refreshToken) && mayPresentChanged()) {
+            if (!again.equals(refreshToken)) {
                 runRenewal(transport, cb, again, generation);
                 return;
             }
