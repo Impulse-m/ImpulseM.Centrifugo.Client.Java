@@ -1163,6 +1163,56 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
+    public void constructorRejectsANegativeGrace() throws Exception {
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public int grace() {
+                return -1;
+            }
+        };
+
+        try {
+            new Client(server.url(), exchangeOptions(storage), listener(), RETRY_MIN_MILLIS, RETRY_MAX_MILLIS, new ManualScheduler(), new Random());
+            fail("the client must not be created with a negative grace");
+        } catch (IllegalArgumentException e) {
+            assertNotNull(e.getMessage());
+        }
+    }
+
+
+    @Test
+    public void emptyAccessTokenDoesNotCloseTheRefusalRun() throws Exception {
+        // The second exchange resolves with an empty access token, which is a failed exchange: the run stays open, so the
+        // third exchange, a refusal of the unchanged value, is the verdict.
+        ManualScheduler clock = new ManualScheduler();
+        AtomicInteger calls = new AtomicInteger();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public int grace() {
+                return 300;
+            }
+
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                exchanged.add(event.getRefreshToken());
+                if (calls.incrementAndGet() == 2) {
+                    cb.onDone(null, new TokenExchangeResult("", null));
+                    return;
+                }
+                cb.onDone(new UnauthorizedException(), null);
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+
+        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1, 1000, 600);
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        assertEquals(3, storage.exchanged.size());
+        assertNull(horizonOf());
+    }
+
+
+    @Test
     public void refusalIsClassifiedByTheListedErrorName() throws Exception {
         ManualScheduler clock = new ManualScheduler();
         rejectExchangeRpc("REFRESH_TOKEN_REFUSED");
@@ -2314,6 +2364,8 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     // The delays of the bootstrap retries scheduled so far. The exchange timeouts and the reconnects are shorter.
+    // Only the failure backoff is at least BOOTSTRAP_RETRY_MIN_MILLIS: a refusal retry is drawn from the remaining
+    // grace and can be shorter, so a test which waits for a refusal retry must count the delays another way.
     private static List<Long> bootstrapDelays(ManualScheduler clock) {
         List<Long> delays = new ArrayList<>();
         for (long delay : clock.requestedDelays()) {
