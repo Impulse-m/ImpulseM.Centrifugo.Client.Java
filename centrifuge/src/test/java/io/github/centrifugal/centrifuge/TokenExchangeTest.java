@@ -159,6 +159,28 @@ public class TokenExchangeTest extends RpcTestBase {
     }
 
 
+    // An exchange the test answers itself: the first one is held, every later one is refused at once.
+    private static class HoldingThenRefusing extends Storage {
+        volatile ResultCallback<TokenExchangeResult> held;
+
+
+        HoldingThenRefusing(String refreshToken) {
+            super(refreshToken);
+        }
+
+
+        @Override
+        public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+            exchanged.add(event.getRefreshToken());
+            if (held == null) {
+                held = cb;
+                return;
+            }
+            cb.onDone(new UnauthorizedException(), null);
+        }
+    }
+
+
     @Test
     public void bootstrapCompletesTheAnonymousConnectOverTheSameSocket() throws Exception {
         Storage storage = new Storage("refresh-1");
@@ -734,6 +756,97 @@ public class TokenExchangeTest extends RpcTestBase {
         awaitCondition("refusal of the new run reported", () -> errors.size() == 2);
         assertNotNull(horizonOf());
         assertNotSame(horizon, horizonOf());
+    }
+
+
+    @Test
+    public void lateRefusalOfAnAbandonedBootstrapOpensNoRunAtTheReconnect() throws Exception {
+        // The refusal arrives after its connection went away, so it belongs to no session and opens no run. The reconnect
+        // runs after the grace has passed: its first refusal of the same value opens the run, and gets its one re-presentation.
+        ManualScheduler clock = new ManualScheduler();
+        HoldingThenRefusing storage = new HoldingThenRefusing("refresh-1");
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("first exchange started", () -> storage.held != null);
+        int delaysBefore = clock.requestedDelays().size();
+
+        server.closeConnection();
+        awaitCondition("connection lost", () -> clock.requestedDelays().size() > delaysBefore);
+        storage.held.onDone(new UnauthorizedException(), null);
+        drainExecutor();
+        assertNull(horizonOf());
+        assertTrue(errors.isEmpty());
+
+        clock.advance(DEFAULT_GRACE_MILLIS + 1000L);
+        awaitCondition("first refusal of the reconnect reported", () -> errors.size() == 1);
+        assertTrue(disconnects.isEmpty());
+        assertNotNull(horizonOf());
+
+        pumpUntil(clock, "verdict", () -> disconnects.size() == 1, 500, 100);
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        assertEquals(Arrays.asList("refresh-1", "refresh-1", "refresh-1"), storage.exchanged);
+        assertEquals(1, errors.size());
+    }
+
+
+    @Test
+    public void userReplyToATokenlessConnectKeepsTheRefusalRun() throws Exception {
+        // The connect which carries no token is answered with a user by a connect proxy: the server accepted no token, so the
+        // refusal run opened by the refused renewal stays open.
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        AtomicBoolean refusing = new AtomicBoolean();
+        AtomicBoolean expired = new AtomicBoolean();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                if (refusing.get()) {
+                    exchanged.add(event.getRefreshToken());
+                    cb.onDone(new UnauthorizedException(), null);
+                    return;
+                }
+                super.exchange(event, cb);
+            }
+        };
+        server.onCommand = (Protocol.Command cmd) -> {
+            if (expired.get() && cmd.hasConnect() && !cmd.getConnect().getToken().isEmpty()) {
+                return Protocol.Reply.newBuilder()
+                        .setId(cmd.getId())
+                        .setError(Protocol.Error.newBuilder().setCode(CODE_TOKEN_EXPIRED).setMessage("expired"))
+                        .build();
+            }
+            return null;
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("connected", () -> connected.size() == 1);
+        long delay = renewalDelay(clock);
+
+        refusing.set(true);
+        clock.advance(delay);
+        awaitCondition("refusal reported", () -> errors.size() == 1);
+        awaitCondition("retry armed", () -> {
+            long last = lastRequestedDelay(clock);
+            return last >= RETRY_MIN_MILLIS && last <= RETRY_MAX_MILLIS;
+        });
+        assertNotNull(horizonOf());
+
+        // The transport is lost before the retry fires, so the retry is cancelled and no exchange runs until the reconnect.
+        refusing.set(false);
+        expired.set(true);
+        server.connectResult = server.connectResult.toBuilder()
+                .setUser("proxy-user")
+                .setAuthClass("authenticated")
+                .build();
+        server.closeConnection();
+        awaitCondition("transport lost", () -> client.getState() == ClientState.CONNECTING);
+        pumpUntil(clock, "connected by the proxy", () -> connected.size() == 2);
+
+        assertEquals("", connectTokens().get(connectTokens().size() - 1));
+        assertEquals("proxy-user", connected.get(1).getUser());
+        assertEquals(Arrays.asList("refresh-1", "refresh-2"), storage.exchanged);
+        assertNotNull(horizonOf());
     }
 
 
@@ -1793,6 +1906,31 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
+    public void renewalRotationAfterLogoutIsNotStored() throws Exception {
+        // The application cleared its storage while the renewal was in flight, without disconnecting: the rotation of the
+        // renewal is not written back, so the storage holds no refresh token after the logout.
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        StallingStorage storage = new StallingStorage("refresh-1", 2);
+        ManualScheduler clock = new ManualScheduler();
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("connected", () -> connected.size() == 1);
+        clock.advance(renewalDelay(clock));
+        awaitCondition("renewal exchange started", () -> storage.held != null);
+
+        storage.refreshToken = "";
+        storage.held.onDone(null, new TokenExchangeResult("access-2", "refresh-3"));
+        drainExecutor();
+
+        assertEquals(Arrays.asList("refresh-2"), storage.stored);
+        assertEquals("", storage.load());
+        assertEquals(1, connected.size());
+        assertTrue(errors.isEmpty());
+    }
+
+
+    @Test
     public void renewalLateAfterItsTimeoutIsNotStoredAfterLogout() throws Exception {
         answerExchanges("access-1|refresh-2");
         answerIdentity(true, TTL_SECONDS);
@@ -1821,7 +1959,7 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
-    public void renewalRefusedAfterItsTimeoutOpensTheRefusalRun() throws Exception {
+    public void renewalRefusedAfterItsTimeoutOpensNoRun() throws Exception {
         answerExchanges("access-1|refresh-2");
         answerIdentity(true, TTL_SECONDS);
         StallingStorage storage = new StallingStorage("refresh-1", 2);
@@ -1837,11 +1975,11 @@ public class TokenExchangeTest extends RpcTestBase {
         clock.advance(options.getTimeout());
         awaitCondition("timeout reported", () -> !errors.isEmpty());
         assertNull(horizonOf());
-        // The refusal arrives late: the horizon counts from it, as it does for a refusal within the deadline.
+        // The refusal arrives late: it is the outcome of a stale attempt, so it opens no run and ends nothing.
         storage.held.onDone(new UnauthorizedException(), null);
         drainExecutor();
 
-        assertNotNull(horizonOf());
+        assertNull(horizonOf());
         assertTrue(disconnects.isEmpty());
         assertEquals(1, connected.size());
     }

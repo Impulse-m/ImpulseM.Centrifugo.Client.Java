@@ -100,6 +100,8 @@ final class TokenExchangeFlow {
     private Expiry expiry;
     // Set by beforeConnect: the next connect reply is bootstrapped when it is anonymous.
     private boolean anonymousConnect = false;
+    // Set by beforeConnect: the connect carries the access token, so a reply with a user is the server's acceptance of it.
+    private boolean connectSentToken = false;
     private Bootstrap bootstrap;
     private int bootstrapAttempt = 0;
     // The grace in seconds: the exchange's, then the one the latest accepted exchange published.
@@ -170,6 +172,7 @@ final class TokenExchangeFlow {
             expiry = null;
         }
         anonymousConnect = true;
+        connectSentToken = !isEmptyToken(host.connectionToken());
     }
 
 
@@ -184,8 +187,13 @@ final class TokenExchangeFlow {
             return false;
         }
         anonymousConnect = false;
+        boolean sentToken = connectSentToken;
+        connectSentToken = false;
         if (!reply.getConnect().getUser().isEmpty()) {
-            tokenAccepted();
+            // A user reply to a connect without a token is the server's doing (a connect proxy), not an acceptance of one.
+            if (sentToken) {
+                tokenAccepted();
+            }
             return false;
         }
         // A token the connect sent was refused by an anonymous reply, so none is kept: it is stored again once the exchange stores one.
@@ -319,25 +327,8 @@ final class TokenExchangeFlow {
                         .setData(com.google.protobuf.ByteString.copyFrom(data)));
         final ResultCallback<RPCResult> classified = classifyRefusal(cb, refusalTypes);
         writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> {
-            host.runOrInline(() -> deliverRpc(host, classified, reply, err));
+            host.runOrInline(() -> RpcSession.deliver(host, classified, reply, err));
         });
-    }
-
-
-    // Hands the outcome of a plain rpc to its callback, as RpcSession hands a call's outcome to its callback.
-    private static void deliverRpc(ClientHost host, ResultCallback<RPCResult> cb, Protocol.Reply reply, Throwable err) {
-        if (reply == null) {
-            cb.onDone(Extensions.unwrapCompletion(err), null);
-            return;
-        }
-        if (reply.getError().getCode() != 0) {
-            cb.onDone(host.replyError(reply), null);
-            return;
-        }
-        RPCResult result = new RPCResult();
-        result.setData(reply.getRpc().getData().toByteArray());
-        result.setCached(reply.getRpc().getCached());
-        cb.onDone(null, result);
     }
 
 
@@ -393,7 +384,6 @@ final class TokenExchangeFlow {
     // Runs one exchange of the bootstrap. The callback hops back to the client's executor.
     private void runExchange(final Bootstrap b, final String refreshToken) {
         final AtomicBoolean called = new AtomicBoolean();
-        final long generation = host.refreshGeneration();
         try {
             b.exchangeTimeout = host.scheduler().schedule(
                     () -> Extensions.submitOrIgnore(host.executor(), () -> onExchangeTimeout(b, called)),
@@ -402,13 +392,13 @@ final class TokenExchangeFlow {
             exchange.exchange(new TokenExchangeEvent(host, b.transport, refreshToken, refusalTypes), (Throwable err, TokenExchangeResult result) -> {
                 if (called.compareAndSet(false, true)) {
                     host.runOrInline(() -> {
-                        onExchanged(b, refreshToken, generation, Extensions.unwrapCompletion(err), result);
+                        onExchanged(b, refreshToken, Extensions.unwrapCompletion(err), result);
                     });
                 }
             });
         } catch (RuntimeException e) {
             if (called.compareAndSet(false, true)) {
-                onExchanged(b, refreshToken, generation, e, null);
+                onExchanged(b, refreshToken, e, null);
             } else {
                 host.reportError(new TokenError(e));
             }
@@ -432,23 +422,27 @@ final class TokenExchangeFlow {
     private void onExchanged(
             Bootstrap b,
             String refreshToken,
-            long generation,
             Throwable err,
             TokenExchangeResult result
     ) {
         cancelTimer(b);
-        if (err == null && isAccepted(result)) {
-            acceptedExchange(result);
-        } else if (err instanceof UnauthorizedException) {
-            // A refusal which arrives after its connection went away starts the run too: the horizon counts from it.
-            openRefusalRun();
-        }
-        // A result which arrives after its connection went away, or after the bootstrap gave up, does not bootstrap.
+        // A result which arrives after its connection went away, or after the bootstrap gave up, does not bootstrap, and its
+        // outcome changes no run: only its rotation is stored.
         if (!isCurrent(b)) {
             storeAbandonedRotation(result, refreshToken);
             return;
         }
-        storeRotationSince(result, refreshToken, generation);
+        if (err == null && isAccepted(result)) {
+            acceptedExchange(result);
+        } else if (err instanceof UnauthorizedException) {
+            openRefusalRun();
+        }
+        try {
+            storeRotation(result, refreshToken);
+        } catch (UnauthorizedException e) {
+            endBootstrapSession();
+            return;
+        }
         if (err instanceof UnauthorizedException) {
             reloadAfterRefusal(b, refreshToken);
             return;
@@ -508,11 +502,10 @@ final class TokenExchangeFlow {
 
 
     // Opens the refusal run at its first refusal. Its horizon is the grace, timed on the scheduler's own monotonic clock.
-    // Only a refusal of a connection which is still going on opens one: the state is CONNECTING after a transport loss,
-    // and a refusal which arrives after the application disconnected or closed the client belongs to a session that ended.
+    // Called for a current attempt only: a refusal of a connection which went away, or which arrives after the application
+    // disconnected or closed the client, belongs to no session and opens no run.
     private void openRefusalRun() {
-        ClientState state = host.state();
-        if (horizon == null && (state == ClientState.CONNECTING || state == ClientState.CONNECTED)) {
+        if (horizon == null) {
             horizon = host.scheduler().schedule(() -> {}, graceSeconds, TimeUnit.SECONDS);
         }
     }
@@ -701,25 +694,27 @@ final class TokenExchangeFlow {
     }
 
 
-    // The rotation of an exchange started at the given refresh generation. A refresh(token) call since then holds a newer
-    // refresh token, so the rotation is stored only while the application still holds the one the exchange used.
-    private void storeRotationSince(TokenExchangeResult result, String refreshToken, long generation) {
-        if (generation == host.refreshGeneration()) {
-            storeRotation(result, refreshToken);
-        } else {
-            storeAbandonedRotation(result, refreshToken);
-        }
-    }
-
-
-    // Hands a rotated refresh token to the application, before the access token of the result is used. A failure
-    // is reported and the exchange goes on: the issuer already consumed the pair.
-    private void storeRotation(TokenExchangeResult result, String refreshToken) {
+    // Hands a rotated refresh token to the application, before the access token of the result is used. The rotation is
+    // stored only while the application still holds the refresh token the exchange used: a newer token from another
+    // exchange or from the application, and a logout which cleared the storage, are never overwritten by it. A failed read
+    // or store is reported and the exchange goes on: the issuer already consumed the pair. An UnauthorizedException of the
+    // read is thrown, and ends the session of a current attempt.
+    private void storeRotation(TokenExchangeResult result, String refreshToken) throws UnauthorizedException {
         if (result == null) {
             return;
         }
         String rotated = result.getRefreshToken();
         if (rotated == null || rotated.isEmpty() || rotated.equals(refreshToken)) {
+            return;
+        }
+        String current;
+        try {
+            current = exchange.load();
+        } catch (RuntimeException e) {
+            host.reportError(new TokenError(e));
+            return;
+        }
+        if (!refreshToken.equals(current)) {
             return;
         }
         try {
@@ -730,25 +725,14 @@ final class TokenExchangeFlow {
     }
 
 
-    // The rotation of an exchange whose connection went away, or which timed out. It is stored only while the application
-    // still holds the refresh token the exchange used: a newer token, from another exchange or from the application, is
-    // never overwritten by a late result. The access token of such a result is not used.
+    // The rotation of a stale attempt: an exchange whose connection went away, which timed out, or which a newer attempt
+    // superseded. It is stored by the rule of storeRotation, and its access token is not used. An UnauthorizedException of
+    // the read is dropped with the outcome: a stale attempt never ends the session.
     private void storeAbandonedRotation(TokenExchangeResult result, String refreshToken) {
-        if (result == null || result.getRefreshToken() == null) {
-            return;
-        }
-        String current;
         try {
-            current = exchange.load();
+            storeRotation(result, refreshToken);
         } catch (UnauthorizedException e) {
             // A stale attempt does not end the session: its rotation is dropped with its outcome.
-            return;
-        } catch (RuntimeException e) {
-            host.reportError(new TokenError(e));
-            return;
-        }
-        if (refreshToken.equals(current)) {
-            storeRotation(result, refreshToken);
         }
     }
 
@@ -756,7 +740,6 @@ final class TokenExchangeFlow {
     // The connection token of the timer refresh: an exchange over the connected socket. Runs on the executor.
     private void renew(TokenCallback cb) {
         WebSocket transport = host.transport();
-        final long generation = host.refreshGeneration();
         String refreshToken;
         try {
             refreshToken = exchange.load();
@@ -773,17 +756,16 @@ final class TokenExchangeFlow {
             cb.Done(new UnauthorizedException(), null);
             return;
         }
-        runRenewal(transport, cb, refreshToken, generation);
+        runRenewal(transport, cb, refreshToken);
     }
 
 
     // Runs one renewal exchange. The client timeout is its deadline: a result which comes after it is not delivered to the
-    // callback, its rotation is stored as an abandoned one's, see storeAbandonedRotation.
+    // callback, and changes no run; its rotation is stored as an abandoned one's, see storeAbandonedRotation.
     private void runRenewal(
             final WebSocket transport,
             final TokenCallback cb,
-            final String refreshToken,
-            final long generation
+            final String refreshToken
     ) {
         final Renewal renewal = new Renewal();
         try {
@@ -799,27 +781,18 @@ final class TokenExchangeFlow {
                                 transport,
                                 cb,
                                 refreshToken,
-                                generation,
                                 Extensions.unwrapCompletion(err),
                                 result
                         );
                     });
                 } else {
-                    host.runOrInline(() -> {
-                        Throwable failure = Extensions.unwrapCompletion(err);
-                        if (failure == null && isAccepted(result)) {
-                            acceptedExchange(result);
-                        } else if (failure instanceof UnauthorizedException) {
-                            // A refusal which arrives after the deadline starts the run too, as one within the deadline does.
-                            openRefusalRun();
-                        }
-                        storeAbandonedRotation(result, refreshToken);
-                    });
+                    // A late result is a stale attempt: its outcome changes no run, and only its rotation is stored.
+                    host.runOrInline(() -> storeAbandonedRotation(result, refreshToken));
                 }
             });
         } catch (RuntimeException e) {
             if (renewal.called.compareAndSet(false, true)) {
-                onRenewed(renewal, transport, cb, refreshToken, generation, e, null);
+                onRenewed(renewal, transport, cb, refreshToken, e, null);
             } else {
                 host.reportError(new TokenError(e));
             }
@@ -840,25 +813,31 @@ final class TokenExchangeFlow {
             WebSocket transport,
             TokenCallback cb,
             String refreshToken,
-            long generation,
             Throwable err,
             TokenExchangeResult result
     ) {
         if (renewal.deadline != null) {
             renewal.deadline.cancel(false);
         }
-        if (err == null && isAccepted(result)) {
-            acceptedExchange(result);
-        } else if (err instanceof UnauthorizedException) {
-            openRefusalRun();
-        }
-        // The renewal result of a connection which went away is not used, but its rotation is stored as the bootstrap's is.
+        // The renewal result of a connection which went away is not used, and its outcome changes no run; its rotation is
+        // stored as the bootstrap's is.
         if (transport != host.transport() || host.state() != ClientState.CONNECTED) {
             storeAbandonedRotation(result, refreshToken);
             cb.Done(new IOException("connection lost"), null);
             return;
         }
-        storeRotationSince(result, refreshToken, generation);
+        if (err == null && isAccepted(result)) {
+            acceptedExchange(result);
+        } else if (err instanceof UnauthorizedException) {
+            openRefusalRun();
+        }
+        try {
+            storeRotation(result, refreshToken);
+        } catch (UnauthorizedException e) {
+            closeRefusalRun();
+            cb.Done(e, null);
+            return;
+        }
         if (err instanceof UnauthorizedException) {
             String again;
             try {
@@ -877,7 +856,7 @@ final class TokenExchangeFlow {
                 return;
             }
             if (!again.equals(refreshToken)) {
-                runRenewal(transport, cb, again, generation);
+                runRenewal(transport, cb, again);
                 return;
             }
             if (horizonPassed() || refusals >= REFUSAL_RETRIES) {
