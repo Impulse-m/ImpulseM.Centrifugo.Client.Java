@@ -2105,6 +2105,26 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
+    public void bootstrapRotationIsNotStoredAfterALogoutDuringTheExchange() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        StallingStorage storage = new StallingStorage("refresh-1");
+        newClient(exchangeOptions(storage));
+        client.connect();
+        awaitCondition("exchange started", () -> storage.held != null);
+
+        // Another tab logs out while the exchange runs: the storage is cleared, and the rotation must not return to it.
+        storage.refreshToken = null;
+        storage.held.onDone(null, new TokenExchangeResult("access-1", "refresh-2"));
+
+        awaitCondition("connected", () -> connected.size() == 1);
+        assertTrue(storage.stored.isEmpty());
+        assertNull(storage.load());
+        assertTrue(errors.isEmpty());
+    }
+
+
+    @Test
     public void bootstrapRotationIsStoredWhileTheAppHoldsTheUsedTokenAfterARefreshCall() throws Exception {
         answerExchanges("access-1|refresh-2");
         answerIdentity(false, 0);
