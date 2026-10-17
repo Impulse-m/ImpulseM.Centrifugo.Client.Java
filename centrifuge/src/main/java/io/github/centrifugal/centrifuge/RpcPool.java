@@ -64,7 +64,7 @@ public final class RpcPool {
         /**
          * The endpoints of the key, each a {@code ws://} or {@code wss://} URL, at least one. The pool
          * calls it on its thread once per key, until the pool is closed, and a key which resolves to
-         * nothing rejects its calls with {@link ReplyError#BAD_CONFIGURATION}.
+         * nothing rejects its calls with {@link RpcPool#BAD_CONFIGURATION}.
          */
         List<String> endpoints(String endpointKey);
     }
@@ -834,15 +834,21 @@ public final class RpcPool {
     }
 
 
-    // Sends the queued calls, in order, to the connections with room, and opens the connections they need.
+    // Sends the queued calls, in order, to the connections with room, and opens the connections they need. Nothing in one pass
+    // frees room, so a key which finds no room and no endpoint to open has none for its later calls either: they are skipped
+    // without a search. A pool with no room at all is not searched, so a reply costs the connections of the pool, not the queue.
     private void pump() {
-        if (closed) {
+        if (closed || !anyRoom()) {
             return;
         }
+        Set<String> blocked = new HashSet<>();
         for (RpcPoolCall call : new ArrayList<>(queue)) {
             if (call.settled) {
                 queue.remove(call);
                 call.queued = false;
+                continue;
+            }
+            if (blocked.contains(call.endpointKey)) {
                 continue;
             }
             List<RpcPoolEndpoint> eps;
@@ -857,9 +863,30 @@ public final class RpcPool {
                 continue;
             }
             if (!tryAssign(call, eps)) {
-                openFor(eps);
+                RpcPoolEndpoint endpoint = openable(eps);
+                if (endpoint == null) {
+                    blocked.add(call.endpointKey);
+                } else {
+                    open(endpoint);
+                }
             }
         }
+    }
+
+
+    // Whether a connection has room for a call, or an endpoint may open one: when neither holds, no queued call can be sent.
+    private boolean anyRoom() {
+        for (RpcPoolEndpoint endpoint : endpoints.values()) {
+            if (mayOpen(endpoint)) {
+                return true;
+            }
+            for (RpcPoolConnection conn : endpoint.connections()) {
+                if (conn.calls.size() < maxInflightPerConnection) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
 
@@ -917,23 +944,19 @@ public final class RpcPool {
     }
 
 
-    // Opens a connection to the first endpoint which has room for one and has none connecting: the opens of an endpoint are serialised.
-    private void openFor(List<RpcPoolEndpoint> eps) {
-        RpcPoolEndpoint endpoint = openable(eps);
-        if (endpoint != null) {
-            open(endpoint);
-        }
-    }
-
-
-    // The first endpoint of the list which may open a connection now, or null when none may.
+    // The first endpoint of the list which may open a connection now, or null when none may. The opens of an endpoint are serialised.
     private RpcPoolEndpoint openable(List<RpcPoolEndpoint> eps) {
         for (RpcPoolEndpoint endpoint : eps) {
-            if (endpoint.connections().size() < maxConnectionsPerEndpoint && !endpoint.hasConnecting() && !endpoint.isHeld()) {
+            if (mayOpen(endpoint)) {
                 return endpoint;
             }
         }
         return null;
+    }
+
+
+    private boolean mayOpen(RpcPoolEndpoint endpoint) {
+        return endpoint.connections().size() < maxConnectionsPerEndpoint && !endpoint.hasConnecting() && !endpoint.isHeld();
     }
 
 
@@ -1031,8 +1054,8 @@ public final class RpcPool {
         int draws = Math.min(call.laterResends, RpcSession.LATER_RESENDS - 1);
         call.resends++;
         call.laterResends++;
-        long delayMillis = Math.min(RpcSession.laterDelayMillis(random, draws), TimeUnit.NANOSECONDS.toMillis(call.remainingNanos()));
-        call.resendTask = executor.schedule(() -> onResendDue(call), delayMillis, TimeUnit.MILLISECONDS);
+        long delayNanos = RpcSession.laterResendDelayNanos(random, draws, call.remainingNanos());
+        call.resendTask = executor.schedule(() -> onResendDue(call), delayNanos, TimeUnit.NANOSECONDS);
     }
 
 
@@ -1242,8 +1265,10 @@ public final class RpcPool {
             call.redirectCall.cancel();
             call.redirectCall = null;
         }
+        ResultCallback<RPCResult> callback = call.callback;
+        call.release();
         try {
-            call.callback.onDone(error, result);
+            callback.onDone(error, result);
         } catch (RuntimeException e) {
             report(call.endpointUrl != null ? call.endpointUrl : "", e);
         }

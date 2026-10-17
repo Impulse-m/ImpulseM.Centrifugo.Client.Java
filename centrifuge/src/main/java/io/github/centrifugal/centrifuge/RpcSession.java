@@ -592,7 +592,7 @@ final class RpcSession {
         if (Extensions.RPC_RETRY_LATER.equals(signal) && call.laterResends < LATER_RESENDS) {
             // The delay is capped at the remaining deadline, so a resend due after the deadline falls on the deadline
             // itself: the deadline then rejects the call with a timeout and cancels it, as it does for a sent call.
-            long delayNanos = Math.min(TimeUnit.MILLISECONDS.toNanos(laterDelayMillis(random, call.laterResends)), remainingNanos);
+            long delayNanos = laterResendDelayNanos(random, call.laterResends, remainingNanos);
             call.laterResends++;
             scheduleResend(call, delayNanos);
             return true;
@@ -628,6 +628,13 @@ final class RpcSession {
     static long laterDelayMillis(Random random, int resends) {
         int boundMillis = (int) (LATER_BASE_MILLIS << resends);
         return random.nextInt(boundMillis + 1);
+    }
+
+
+    // The delay of a later resend in nanoseconds, capped at the time left to the deadline: a resend due after the deadline
+    // falls on the deadline. The main client and the RPC pool take the later rule from here, so the two cannot disagree.
+    static long laterResendDelayNanos(Random random, int resends, long remainingNanos) {
+        return Math.min(TimeUnit.MILLISECONDS.toNanos(laterDelayMillis(random, resends)), remainingNanos);
     }
 
 

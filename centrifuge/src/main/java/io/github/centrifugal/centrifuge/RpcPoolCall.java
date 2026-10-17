@@ -11,10 +11,11 @@ import java.util.concurrent.TimeUnit;
  */
 final class RpcPoolCall {
     final String method;
-    final byte[] data;
-    final Map<String, String> headers;
+    // The payload, the headers and the callback are released when the call settles: see release().
+    byte[] data;
+    Map<String, String> headers;
     final String affinity;
-    final ResultCallback<RPCResult> callback;
+    ResultCallback<RPCResult> callback;
     // The deadline on the nano clock. It starts at the submit, so it holds across resends and the redirect fetch.
     final long deadlineNanos;
     // The endpoint key the call goes to now: the key of the call, or the key a reroute named.
@@ -58,6 +59,16 @@ final class RpcPoolCall {
         this.affinity = affinity;
         this.callback = callback;
         this.deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+    }
+
+
+    // Drops what a settled call holds. The deadline task of the call keeps the call alive until the deadline on a scheduler
+    // which keeps cancelled tasks (below Android API 21), so the payload must not wait there with it.
+    void release() {
+        data = null;
+        headers = null;
+        callback = null;
+        redirect = null;
     }
 
 

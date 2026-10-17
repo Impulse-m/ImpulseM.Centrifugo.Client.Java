@@ -1,6 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -360,6 +361,24 @@ public class RpcPoolTest extends RpcTestBase {
         assertEquals("one connection, kept open", 1, pool.stats().getConnections());
         assertEquals("one idle check for all the calls, not one cancelled timer per call", 1,
                 timersLongerThan(pool, TimeUnit.MINUTES.toNanos(30L)));
+    }
+
+
+    @Test
+    public void aSettledCallLetsGoOfItsPayloadOnTheFallbackScheduler() throws Exception {
+        answerRpcs("ok");
+        // The cancelled deadline of the call stays queued on this scheduler until its ten seconds are over.
+        RpcPool pool = build(builder().removeCancelledTimers(false));
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        byte[] payload = new byte[1 << 20];
+        WeakReference<byte[]> released = new WeakReference<>(payload);
+        pool.rpc("svc.read", payload, RpcPool.CallOptions.builder().timeout(10_000L).build(), into(future));
+        future.get(5, TimeUnit.SECONDS);
+        payload = null;
+        awaitCondition("the payload of the settled call is released", () -> {
+            System.gc();
+            return released.get() == null;
+        });
     }
 
 
