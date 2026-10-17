@@ -799,6 +799,45 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
+    public void invalidNegativeGraceOfAResultKeepsTheGraceInUse() throws Exception {
+        // The first result publishes a grace of 300 s, the second publishes -5: an invalid value keeps the 300 s in use,
+        // it does not fall back to the option's 7 s.
+        ManualScheduler clock = new ManualScheduler();
+        answerIdentity(false, 0);
+        AtomicInteger calls = new AtomicInteger();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public int grace() {
+                return 7;
+            }
+
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                exchanged.add(event.getRefreshToken());
+                int call = calls.incrementAndGet();
+                if (call == 1) {
+                    cb.onDone(null, new TokenExchangeResult("access-1", "refresh-2", 300));
+                    return;
+                }
+                if (call == 2) {
+                    cb.onDone(null, new TokenExchangeResult("access-2", "refresh-3", -5));
+                    return;
+                }
+                cb.onDone(new UnauthorizedException(), null);
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("connected", () -> connected.size() == 1);
+
+        server.closeConnection();
+        pumpUntil(clock, "second connected", () -> connected.size() == 2);
+        server.closeConnection();
+        pumpUntil(clock, "horizon of the published grace", () -> clock.requestedDelays().contains(300000L));
+    }
+
+
+    @Test
     public void twoClientsSharingOneStorageStoreTheSameRotationWithTheirOwnAccessTokens() throws Exception {
         // Both clients read the token before either stores its rotation. The issuer answers each exchange with the
         // same rotated refresh token and a fresh access token, as it does inside the grace.

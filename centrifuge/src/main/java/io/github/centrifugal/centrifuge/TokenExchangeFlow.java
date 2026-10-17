@@ -42,6 +42,8 @@ final class TokenExchangeFlow {
     private static final int REFUSAL_RETRY_MIN_MILLIS = 1000;
     private static final int REFUSAL_RETRY_MAX_MILLIS = 8000;
     private static final int GRACE_MAX_SECONDS = 300;
+    // The grace of a result which publishes none, see TokenExchangeResult.getGrace.
+    private static final int ABSENT_GRACE = -1;
     // The cause of the retry of a refused refresh token, reported as an error. It names no token.
     private static final String REFUSED_RETRY_MESSAGE = "refresh token refused, retrying within the grace";
 
@@ -490,13 +492,14 @@ final class TokenExchangeFlow {
 
 
     // An accepted exchange ends the refusal run. The grace is the one the result published, kept for the next run; a result
-    // without one (a negative value is the absent marker) falls back to the option's grace, not to the last published one.
+    // without one (the absent marker) falls back to the option's grace, not to the last published one. Any other negative
+    // value is invalid and keeps the grace in use.
     private void acceptedExchange(TokenExchangeResult result) {
         closeRefusalRun();
-        if (result != null && result.getGrace() >= 0) {
-            graceSeconds = clampGrace(result.getGrace());
-        } else {
+        if (result == null || result.getGrace() == ABSENT_GRACE) {
             graceSeconds = clampGrace(exchange.grace());
+        } else if (result.getGrace() >= 0) {
+            graceSeconds = clampGrace(result.getGrace());
         }
     }
 
