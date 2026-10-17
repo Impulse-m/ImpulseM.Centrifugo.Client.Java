@@ -344,7 +344,7 @@ final class AuthRefresh {
             }
             // The session is over whatever asked for the token: the application removed its refresh token, or the issuer
             // refused it past the grace horizon. A refresh() which waits for this fetch does not keep the session.
-            if (err instanceof UnauthorizedException) {
+            if (flow != null && err instanceof UnauthorizedException) {
                 host.failUnauthorized();
                 return;
             }

@@ -465,6 +465,38 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
+    public void anonymousReplyDropsTheSentTokenWhenItsRefreshIsRefused() throws Exception {
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public int grace() {
+                return 0;
+            }
+
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                exchanged.add(event.getRefreshToken());
+                cb.onDone(new UnauthorizedException(), null);
+            }
+        };
+        answerIdentity(false, 0);
+        Options options = exchangeOptions(storage);
+        options.setToken("cached-token");
+        newClient(options);
+
+        client.connect();
+
+        awaitCondition("disconnected", () -> disconnects.size() == 1);
+        assertEquals(Arrays.asList("cached-token"), connectTokens());
+
+        // The anonymous reply refused the token the connect sent, so the next connect sends none.
+        client.connect();
+
+        awaitCondition("second connect", () -> connectTokens().size() == 2);
+        assertEquals("", connectTokens().get(1));
+    }
+
+
+    @Test
     public void wrappedUnauthorizedAtBootstrapIsRetriedWithinTheGrace() throws Exception {
         ManualScheduler clock = new ManualScheduler();
         Storage storage = new Storage("refresh-1") {

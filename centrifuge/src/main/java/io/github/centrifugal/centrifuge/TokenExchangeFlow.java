@@ -182,6 +182,8 @@ final class TokenExchangeFlow {
             tokenAccepted();
             return false;
         }
+        // A token the connect sent was refused by an anonymous reply, so none is kept: it is stored again once the exchange stores one.
+        host.storeToken("");
         // The server pings the connection from now on, during the bootstrap too: the ping is answered as a connected one is.
         host.applyPing(reply.getConnect());
         Bootstrap started = new Bootstrap(host.transport(), reply);
