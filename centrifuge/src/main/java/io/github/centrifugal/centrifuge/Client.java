@@ -1355,8 +1355,6 @@ public class Client {
     /**
      * Send RPC with method to server, process result in callback.
      *
-     * The array must not change until the callback: the call may wait before it is sent.
-     *
      * @param method: of RPC call.
      * @param data:   a custom payload for RPC call.
      * @param cb:     will be called as soon as rpc response received or error happened.

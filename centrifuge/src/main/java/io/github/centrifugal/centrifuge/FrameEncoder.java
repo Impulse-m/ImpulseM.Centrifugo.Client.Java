@@ -14,6 +14,8 @@ import okio.ByteString;
  * so a payload is copied from the command into the frame once, and the frame is copied once more into
  * the {@link ByteString} the socket takes. The stream of {@code writeDelimitedTo} grew its buffer as it
  * wrote, and copied it again on {@code toByteArray}: two copies of the frame fewer than before.
+ * {@link Client} keeps the stream of {@code writeDelimitedTo} for its other sends, so the layout written here
+ * must stay identical to what {@code Client.serializeCommand} writes.
  */
 final class FrameEncoder {
     private FrameEncoder() {
