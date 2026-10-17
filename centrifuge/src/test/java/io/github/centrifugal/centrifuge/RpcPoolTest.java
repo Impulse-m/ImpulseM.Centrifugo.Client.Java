@@ -450,6 +450,35 @@ public class RpcPoolTest extends RpcTestBase {
 
 
     @Test
+    public void aSaturatedKeyDoesNotHoldBackTheQueueOfAnotherKey() throws Exception {
+        server.deferCommand = cmd -> cmd.hasRpc();
+        FakeCentrifugoServer other = new FakeCentrifugoServer();
+        other.start();
+        try {
+            RpcPool pool = build(new RpcPool.Builder(endpointKey -> Collections.singletonList("a".equals(endpointKey) ? server.url() : other.url()))
+                    .random(maximumDraws())
+                    .maxConnectionsPerEndpoint(1)
+                    .maxQueued(4));
+            CompletableFuture<RPCResult> onWire = new CompletableFuture<>();
+            CompletableFuture<RPCResult> queued = new CompletableFuture<>();
+            CompletableFuture<RPCResult> otherKey = new CompletableFuture<>();
+            pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("a").build(), into(onWire));
+            awaitCondition("the first call of key a is on the wire", () -> pool.stats().getInflight() == 1);
+            pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("a").build(), into(queued));
+            awaitCondition("the second call of key a waits", () -> pool.stats().getQueued() == 1);
+            // Key a is saturated: its connection is at its window and it may open no other. Key b has its own endpoint.
+            pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("b").timeout(5_000L).build(), into(otherKey));
+            otherKey.get(5, TimeUnit.SECONDS);
+            assertTrue("the waiting call of key a is still waiting", !queued.isDone());
+            assertEquals(1, pool.stats().getQueued());
+            awaitAll(Arrays.asList(onWire, queued), true);
+        } finally {
+            other.stop();
+        }
+    }
+
+
+    @Test
     public void aConnectionOpenedForCallsWhichTimeOutWhileQueuedIsClosedAfterTheIdleTimeout() throws Exception {
         RpcPool pool = build(new RpcPool.Builder(endpointKey -> Collections.singletonList(UNREACHABLE_URL))
                 .random(maximumDraws())

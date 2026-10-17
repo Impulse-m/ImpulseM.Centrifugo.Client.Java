@@ -66,7 +66,11 @@ final class TokenSource {
      */
     void token(Object requester, String refused, Callback callback) {
         Extensions.submitOrRun(host.executor(), () -> {
-            waiting.put(requester, new Waiter(refused, callback));
+            Waiter replaced = waiting.put(requester, new Waiter(refused, callback));
+            if (replaced != null) {
+                // The request it replaces is given up here, so that its callback settles and no connection waits on it.
+                replaced.callback.done(new UnauthorizedException(), null, generation);
+            }
             evaluate();
         }, () -> callback.done(new UnauthorizedException(), null, generation));
     }
@@ -102,19 +106,23 @@ final class TokenSource {
             renewedFor = null;
         }
         observe(user, authClass);
+        if (!always) {
+            refusedAgain();
+        }
         evaluate();
     }
 
 
     // The main client disconnected. A terminal unauthorized disconnect ends the session: the generation moves on and the
-    // identity is forgotten, so the next session records its identity without counting it.
+    // identity is forgotten, so the next session records its identity without counting it. The client sets its state
+    // after this hook, so the requests are evaluated against the state the disconnect leads to.
     void onDisconnect(int code, boolean terminal) {
         if (terminal && code == Client.DISCONNECTED_UNAUTHORIZED) {
             ended = true;
             generation++;
             observed = false;
         }
-        evaluate();
+        evaluate(terminal ? ClientState.DISCONNECTED : ClientState.CONNECTING);
     }
 
 
@@ -134,24 +142,47 @@ final class TokenSource {
     }
 
 
-    // Answers the waiting requests which the main client's state allows to answer now. The others keep waiting.
+    // A refresh accepted with the token a waiting request was refused gave that token back, which no request can use: those
+    // requests fail as unauthorized now. Waiting for the next event would wait up to a whole token ttl.
+    private void refusedAgain() {
+        String token = host.connectionToken();
+        if (token.isEmpty()) {
+            return;
+        }
+        Iterator<Waiter> iterator = waiting.values().iterator();
+        while (iterator.hasNext()) {
+            Waiter waiter = iterator.next();
+            if (waiter.refused.equals(token)) {
+                iterator.remove();
+                fail(waiter);
+            }
+        }
+    }
+
+
     private void evaluate() {
+        evaluate(host.state());
+    }
+
+
+    // Answers the waiting requests which the state of the main client allows to answer now. A token is lent only while the
+    // client is connected, so that its identity is confirmed. The others keep waiting, or fail when the client is gone.
+    private void evaluate(ClientState state) {
         if (waiting.isEmpty()) {
             return;
         }
         String token = host.connectionToken();
-        ClientState state = host.state();
         Iterator<Waiter> iterator = waiting.values().iterator();
         while (iterator.hasNext()) {
             Waiter waiter = iterator.next();
             if (ended) {
                 iterator.remove();
                 fail(waiter);
-            } else if (usable(token, waiter.refused)) {
-                iterator.remove();
-                deliver(waiter, token);
             } else if (state == ClientState.CONNECTED) {
                 if (token.isEmpty()) {
+                    iterator.remove();
+                    deliver(waiter, token);
+                } else if (usable(token, waiter.refused)) {
                     iterator.remove();
                     deliver(waiter, token);
                 } else if (!auth.canRenew()) {
@@ -176,10 +207,9 @@ final class TokenSource {
     }
 
 
+    // Called only while the client is connected: the identity is observed before the token is lent with its generation.
     private void deliver(Waiter waiter, String token) {
-        if (host.state() == ClientState.CONNECTED) {
-            observe(auth.currentUser(), auth.currentAuthClass());
-        }
+        observe(auth.currentUser(), auth.currentAuthClass());
         waiter.callback.done(null, token, generation);
     }
 

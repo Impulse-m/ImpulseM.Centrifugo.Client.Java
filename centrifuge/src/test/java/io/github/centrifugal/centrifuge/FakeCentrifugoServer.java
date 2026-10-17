@@ -89,6 +89,9 @@ public final class FakeCentrifugoServer {
 
     private final List<Protocol.Command> deferredCommands = Collections.synchronizedList(new ArrayList<>());
 
+    // The socket each held command arrived on, in the order of deferredCommands.
+    private final List<WebSocket> deferredSockets = Collections.synchronizedList(new ArrayList<>());
+
     /**
      * Answers the commands no other hook answers, before the default replies. Null by default. Returns null
      * to fall through to the default handling.
@@ -212,7 +215,10 @@ public final class FakeCentrifugoServer {
         }
 
         if (deferCommand != null && Boolean.TRUE.equals(deferCommand.apply(cmd))) {
-            deferredCommands.add(cmd);
+            synchronized (deferredCommands) {
+                deferredCommands.add(cmd);
+                deferredSockets.add(webSocket);
+            }
             return;
         }
 
@@ -233,10 +239,29 @@ public final class FakeCentrifugoServer {
         synchronized (deferredCommands) {
             pending = new ArrayList<>(deferredCommands);
             deferredCommands.clear();
+            deferredSockets.clear();
         }
         WebSocket s = currentSocket.get();
         for (Protocol.Command cmd : pending) {
             replyDefault(s, cmd);
+        }
+    }
+
+    /**
+     * Answers the commands held by {@link #deferCommand}, in the order received, each on the socket it arrived on. Unlike
+     * {@link #releaseDeferredCommands()}, a command of a connection the client has since replaced still gets its answer.
+     */
+    public void releaseDeferredCommandsOnTheirSockets() {
+        List<Protocol.Command> pending;
+        List<WebSocket> sockets;
+        synchronized (deferredCommands) {
+            pending = new ArrayList<>(deferredCommands);
+            sockets = new ArrayList<>(deferredSockets);
+            deferredCommands.clear();
+            deferredSockets.clear();
+        }
+        for (int i = 0; i < pending.size(); i++) {
+            replyDefault(sockets.get(i), pending.get(i));
         }
     }
 
