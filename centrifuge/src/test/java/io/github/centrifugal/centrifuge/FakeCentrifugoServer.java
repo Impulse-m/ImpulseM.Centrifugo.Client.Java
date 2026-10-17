@@ -89,6 +89,15 @@ public final class FakeCentrifugoServer {
 
     private final List<Protocol.Command> deferredCommands = Collections.synchronizedList(new ArrayList<>());
 
+    /**
+     * Answers the commands no other hook answers, before the default replies. Null by default. Returns null
+     * to fall through to the default handling.
+     */
+    public Function<Protocol.Command, Protocol.Reply> onUnhandled;
+
+    /** Completes the close handshake which a client starts, as a server does. Off by default. */
+    public boolean completeClose = false;
+
     public void start() throws IOException {
         server.setDispatcher(new Dispatcher() {
             @Override
@@ -168,6 +177,13 @@ public final class FakeCentrifugoServer {
         }
 
         @Override
+        public void onClosing(WebSocket webSocket, int code, String reason) {
+            if (completeClose) {
+                webSocket.close(code, reason);
+            }
+        }
+
+        @Override
         public void onMessage(WebSocket webSocket, ByteString bytes) {
             InputStream stream = new ByteArrayInputStream(bytes.toByteArray());
             try {
@@ -198,6 +214,14 @@ public final class FakeCentrifugoServer {
         if (deferCommand != null && Boolean.TRUE.equals(deferCommand.apply(cmd))) {
             deferredCommands.add(cmd);
             return;
+        }
+
+        if (onUnhandled != null) {
+            Protocol.Reply reply = onUnhandled.apply(cmd);
+            if (reply != null) {
+                send(webSocket, reply);
+                return;
+            }
         }
 
         replyDefault(webSocket, cmd);
@@ -248,6 +272,14 @@ public final class FakeCentrifugoServer {
             throw new RuntimeException(e);
         }
         webSocket.send(ByteString.of(out.toByteArray()));
+    }
+
+    /** Send a ping to the active connection: an empty reply, which is a single zero length byte. */
+    public void sendPing() {
+        WebSocket s = currentSocket.get();
+        if (s != null) {
+            s.send(ByteString.of((byte) 0));
+        }
     }
 
     /** Send a raw reply to the active connection. */

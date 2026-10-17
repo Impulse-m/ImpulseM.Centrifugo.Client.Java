@@ -72,12 +72,12 @@ public class Client {
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final ScheduledExecutorService scheduler;
-    private int pingInterval;
-    private boolean sendPong;
-    private ScheduledFuture<?> pingTask;
+    int pingInterval;
+    boolean sendPong;
+    ScheduledFuture<?> pingTask;
     private ScheduledFuture<?> reconnectTask;
     private int reconnectAttempts = 0;
-    private boolean refreshRequired = false;
+    boolean refreshRequired = false;
     // Confirmed by the connect reply of the current transport, cleared when it closes.
     volatile boolean rpcOptionsSupported = false;
     // Server clock minus local clock, from the last reply that carried a server time.
@@ -334,7 +334,7 @@ public class Client {
             this.pingTask.cancel(true);
             this.pingTask = null;
         }
-        this.auth.onDisconnect();
+        this.auth.onDisconnect(code, !shouldReconnect);
         if (this.reconnectTask != null) {
             this.reconnectTask.cancel(true);
             this.reconnectTask = null;
@@ -622,6 +622,7 @@ public class Client {
         if (this.getState() != ClientState.CONNECTING) {
             return;
         }
+        this.auth.beforeConnect();
         if (this.refreshRequired || (this.token.equals("") && this.opts.getTokenGetter() != null)) {
             ConnectionTokenEvent connectionTokenEvent = new ConnectionTokenEvent();
             if (this.opts.getTokenGetter() == null) {
@@ -905,7 +906,7 @@ public class Client {
         this.executor.submit(Client.this::_waitServerPing);
     }
 
-    private void handleConnectReply(Protocol.Reply reply) {
+    void handleConnectReply(Protocol.Reply reply) {
         if (this.getState() != ClientState.CONNECTING) {
             return;
         }
@@ -923,6 +924,9 @@ public class Client {
         }
         Protocol.ConnectResult result = reply.getConnect();
         this.rpcOptionsSupported = Extensions.hasFlag(result.getFlag(), Extensions.RPC_OPTIONS_FLAG);
+        if (this.auth.interceptConnect(reply)) {
+            return;
+        }
         ConnectedEvent event = new ConnectedEvent();
         event.setClient(result.getClient());
         event.setData(result.getData().toByteArray());
@@ -1232,6 +1236,9 @@ public class Client {
     }
 
     private void handlePush(Protocol.Push push) throws Exception {
+        if (this.auth.holdPush(push)) {
+            return;
+        }
         String channel = push.getChannel();
         // Channel compaction: pub/join/leave pushes may carry a numeric channel ID
         // instead of the channel name. Other push types always carry the channel.

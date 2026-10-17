@@ -223,6 +223,197 @@ The refresh timer runs before the token expires. Its errors follow the upstream 
 | 103 permission denied | reported as an `ErrorEvent`, the connection and its identity are kept, and there is no retry. **Deviation:** upstream disconnects with 103. The server refused the identity change of the token the getter returned, and the same token would be refused again. The server ends the connection at its expiry, and the reconnect fetches a token from the getter, so the identity changes then. An application which needs the change now calls `refresh()` and handles 103. |
 | anything else | the connection is disconnected with the server's code, and does not reconnect (upstream) |
 
+### Token exchange over the connection
+
+Instead of a connection token, the application can hand the client a long-lived refresh token, once, and let the client obtain and renew the short access token itself, over the same socket. The application persists the refresh token and supplies three callbacks through `TokenExchange`: `load` reads it, `store` persists a rotated one, and `exchange` trades it for an access token. `Options.setTokenExchange` turns the feature on; it is exclusive with `setTokenGetter`, and a client created with both throws `IllegalArgumentException`.
+
+```java
+Path tokenFile = Paths.get(dataDir, "refresh_token");
+
+TokenExchange exchange = new TokenExchange() {
+    @Override
+    public String load() {
+        return readToken(tokenFile);
+    }
+
+    @Override
+    public void store(String refreshToken) {
+        writeToken(tokenFile, refreshToken);
+    }
+
+    @Override
+    public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+        // Encode the request with your own codec. The rpc goes over the connection the exchange runs on.
+        event.rpc("auth.exchange", encodeRequest(event.getRefreshToken()), (Throwable err, RPCResult result) -> {
+            if (err != null) {
+                // A refusal arrives as TokenExchangeRefusedException, because its app type is in refusalTypes().
+                cb.onDone(err, null);
+                return;
+            }
+            // Decode the reply with your own codec: the access token, the rotated refresh token if there is one,
+            // and the grace in seconds the issuer keeps the consumed refresh token for.
+            cb.onDone(null, decodeReply(result.getData()));
+        });
+    }
+
+    @Override
+    public Set<String> refusalTypes() {
+        // The app type your backend sets on a refused refresh token, see below. Any name the backend sends.
+        return Collections.singleton("REFRESH_TOKEN_REFUSED");
+    }
+
+    @Override
+    public int grace() {
+        // Used until the issuer publishes one in a result. The default is 30 seconds.
+        return 30;
+    }
+};
+
+Options options = new Options();
+options.setTokenExchange(exchange);
+Client client = new Client(endpoint, options, listener);
+client.connect();
+```
+
+The backend answers a refused refresh token with an error whose app type is `REFRESH_TOKEN_REFUSED` (any gRPC status; the app type goes in the `app-type` trailer). The client classifies a refusal by that name, from `refusalTypes()`, and never by the error code or the HTTP status. An rpc rejected with a name in the list fails with `TokenExchangeRefusedException` (an `UnauthorizedException`, with the server error as `getReplyError()`); an rpc rejected with any other name is an ordinary error, and the exchange is retried with backoff. The list is empty by default: the client then classifies nothing, and your `exchange` may throw `UnauthorizedException` itself, for a refusal it finds in the reply body.
+
+The flow: when the connect reply is anonymous (no user), whether the connect sent a token or not, the client runs the exchange on the new socket before it reports the connection as connected. It then sets the access token as the connection token and sends a `refresh` command with it, which binds the connection to the user. The `connected` event fires once, with that user. Every rotated refresh token goes to `store` before the access token issued with it is used. The client renews the access token over the connected socket at a random moment between 70% and 90% of its TTL, so a fleet which connected together spreads its renewals. Without the option, the refresh timer runs at the full TTL, as before.
+
+Several tabs or processes of one installation can share one refresh token, with no lock in the client. The client reads `load` immediately before each exchange and stores the rotated token immediately after. The backend keeps a grace for the previous refresh token, so two clients which exchange the same token inside the grace both get the same rotated refresh token, and each its own access token: each client binds its own connection with its own access token, and both store the same rotated refresh token.
+
+#### Refusal run and grace
+
+A refused refresh token is not the end of the session at once. When the issuer refuses the token the client presented, a refusal run starts: the client reads `load` again, presents the token it finds at once when it changed (another client rotated it meanwhile), and presents the same token again once otherwise: while connecting at a random moment inside the remaining grace, while renewing after the refresh retry delay. A second refusal of a token that did not change ends the session, and so does any refusal at the horizon. Every changed value is presented at once, with no limit per run; the horizon is checked only when the token read is the one refused. The run ends with an accepted exchange, with a connect which carried the access token and got a user back, with an accepted `refresh` call (the server accepted the token the connection holds), with the session's end, or with `disconnect()`. A transport loss does not end it: a client which reconnects in a loop still ends the session at the second refusal of an unchanged value, at the latest at the horizon. The outcome of an exchange which was superseded, abandoned by a transport loss, or late past its timeout opens and ends no run: its refusal is dropped, and only its rotation is stored, while the storage still holds the token it used.
+
+The horizon is the grace, measured from the first refusal of the run on the scheduler's monotonic clock; the wall clock does not move it. The grace is in seconds. An accepted result publishes it (`new TokenExchangeResult(token, refreshToken, graceSeconds)`; the two-argument constructor publishes none), and `TokenExchange.grace()` gives it until the first one arrives, and again after an accepted result which publishes none (the absent value -1 counts as none; another negative value is invalid and keeps the grace in use). A value above 300 is clamped to 300. The session is dead at the second refusal of a token that did not change, at a refusal at the horizon, or when `load` returns nothing. The client does not reconnect then, and reports the `DisconnectedEvent` with code 1.
+
+Within the run a refusal is reported as an `ErrorEvent` with `TokenError`, with the message `refresh token refused, retrying within the grace`, which names no token. A dead session costs two exchanges: its first refusal and one re-presentation; the changed values of other clients are presented on top, each once.
+
+#### Several processes: the file lock
+
+The client holds no lock, and that is enough for a rotation which the next attempt can recover from. An installation whose processes must not present different refresh tokens (one live refresh token per installation) puts the whole rotation inside `exchange`, under a lock of the storage. The lock is taken before the stored token is read, and released after the rotated token is written, so that no other process reads or writes between them. The recipe, with `java.nio` only:
+
+```java
+private static final ConcurrentMap<Path, Semaphore> PROCESS_LOCKS = new ConcurrentHashMap<>();
+private final Path lockFile = Paths.get(dataDir, "refresh_token.lock");
+
+@Override
+public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+    // Both waits end at the client timeout, the deadline of the rpc. A failure of either fails the callback.
+    Semaphore processLock = PROCESS_LOCKS.computeIfAbsent(lockFile.toAbsolutePath(), (Path path) -> new Semaphore(1));
+    FileLock fileLock;
+    try {
+        fileLock = acquire(processLock, lockFile, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis));
+    } catch (IOException | InterruptedException e) {
+        cb.onDone(e, null);
+        return;
+    }
+    // Another process may have rotated the token since load: present what the storage holds under the lock.
+    String presented;
+    try {
+        presented = readToken(tokenFile);
+    } catch (IOException e) {
+        release(processLock, fileLock.channel());
+        cb.onDone(e, null);
+        return;
+    }
+    if (presented == null) {
+        release(processLock, fileLock.channel());
+        cb.onDone(new UnauthorizedException(), null);
+        return;
+    }
+    // Any failure before the rpc is accepted releases the locks and fails the callback: a lock left held blocks every later exchange of the JVM.
+    try {
+        // The callback runs once, on the thread which completes the rpc: after close that is not the client's thread.
+        // A semaphore may be released on any thread, so the callback releases the locks wherever it runs.
+        event.rpc("auth.exchange", encodeRequest(presented), (Throwable err, RPCResult result) -> {
+            Throwable failure = err;
+            TokenExchangeResult outcome = null;
+            try {
+                if (err == null) {
+                    TokenExchangeResult reply = decodeReply(result.getData());
+                    if (reply.getRefreshToken() != null) {
+                        // A temporary file and a rename: another process never reads a torn value.
+                        writeTokenAtomically(tokenFile, reply.getRefreshToken());
+                    }
+                    // Written under the lock, so the result carries no refresh token: the client stores nothing after it.
+                    outcome = new TokenExchangeResult(reply.getToken(), null, reply.getGrace());
+                }
+            } catch (IOException | RuntimeException e) {
+                failure = e;
+            } finally {
+                release(processLock, fileLock.channel());
+            }
+            cb.onDone(failure, outcome);
+        });
+    } catch (RuntimeException e) {
+        release(processLock, fileLock.channel());
+        cb.onDone(e, null);
+    }
+}
+
+// Takes the process lock, then the file lock, both before the deadline. A failure leaves no lock taken. The file lock is
+// polled, so the deadline ends the wait.
+private static FileLock acquire(Semaphore processLock, Path file, long deadline) throws IOException, InterruptedException {
+    if (!processLock.tryAcquire(deadline - System.nanoTime(), TimeUnit.NANOSECONDS)) {
+        throw new IOException("the process lock timed out");
+    }
+    FileChannel channel = null;
+    try {
+        channel = FileChannel.open(file, CREATE, READ, WRITE);
+        while (true) {
+            FileLock fileLock = channel.tryLock();
+            if (fileLock != null) {
+                return fileLock;
+            }
+            if (System.nanoTime() >= deadline) {
+                throw new IOException("the file lock timed out");
+            }
+            Thread.sleep(20);
+        }
+    } catch (OverlappingFileLockException e) {
+        release(processLock, channel);
+        throw new IOException("the lock file is held by this process", e);
+    } catch (IOException | InterruptedException | RuntimeException e) {
+        release(processLock, channel);
+        throw e;
+    }
+}
+
+// Closes the channel, which releases its file lock, and then releases the process lock. Null channel: only the process lock.
+private static void release(Semaphore processLock, FileChannel channel) {
+    try {
+        if (channel != null) {
+            channel.close();
+        }
+    } catch (IOException e) {
+        // The lock is gone with the channel: nothing else to undo.
+    } finally {
+        processLock.release();
+    }
+}
+```
+
+The store of the client runs after `exchange` returns, outside the lock, and writes without comparing: the recipe therefore never returns a refresh token it has written itself. The alternative is a `store` which takes the same lock and writes only when the file still holds the token the exchange presented. `load` reads without the lock: the rename makes it atomic. The lock is held for at most the client timeout, since the rpc fails at it. The wait for the lock runs on the client executor, because `exchange` is invoked there: while another process holds the lock, the client does no other work, pings included, for at most the client timeout. An application which cannot accept that waits on its own thread, and calls the callback from there. A client timeout above the ping delay which the server allows can therefore drop the connection with no ping, so it stays below that delay, or the wait moves to an application thread. The process lock is a `Semaphore` and not a `ReentrantLock`, because the callback releases it on the thread which completes the rpc, and only the owner thread may release a `ReentrantLock`.
+
+The process lock is shared by every client of the process which names the same lock file, so two clients of one JVM wait for each other: a second `FileChannel` lock in one JVM would throw `OverlappingFileLockException`, which the recipe reports as an `IOException`. A client closed during an exchange is safe: its callback still runs once and releases both locks, and a client which then uses the same `TokenExchange` takes them as usual.
+
+#### The attribution claim (`meta`)
+
+The access token is a connection JWT. Its `meta` claim is the issuer's attribution of the connection, for example an installation or a device. The server stores it at connect, and replaces it at every renewal and rebind whose access token carries the claim; a token without it keeps the attribution the connection has. An issuer which wants a stable attribution keeps `meta` the same across the access tokens of one session. An issuer which wants to drop the attribution sends an empty object (`"meta": {}`), which replaces it. The client never reads the claim.
+
+On logout, disconnect or close the client before clearing the stored refresh token: a renewal still in flight while the client stays connected stores its rotated token when it completes.
+
+| Event | When |
+|---|---|
+| `ConnectedEvent` with an empty user | `load` returned no refresh token: the connection stays anonymous |
+| `ErrorEvent` with `TokenError` | an exchange or `store` failed; the exchange is retried with backoff, or the connection goes on. A refused refresh token inside the grace is reported with the message `refresh token refused, retrying within the grace`, and retried. A bootstrap refresh which timed out or failed to write has an unknown outcome: the connection is closed and the client reconnects |
+| `ErrorEvent` with `RefreshError` | a renewal refresh was refused; the error table of the timer refresh applies |
+| `ErrorEvent` with `ReplyError` | a bootstrap refresh was refused with a temporary error, an error below 100 or 109: the exchange is retried with backoff |
+| `DisconnectedEvent` with code 1 (`unauthorized`) | the session is dead: a second refusal of a token that did not change, a refusal at the grace horizon of the refusal run, `load` threw `UnauthorizedException`, or `load` returned nothing at renewal or after a refusal (at bootstrap an empty `load` connects anonymously). The client does not reconnect |
+
+The server must accept a connection without a token (`client.allow_anonymous_connect_without_token: true`), must allow a refresh which changes the user (`client.rebind.enabled: true`), and the exchange method must be callable by an anonymous connection: a registry entry with `auth_class: anonymous`. The calls of that method carry no connection token, so the issuer authenticates the request by the refresh token alone. The access token is the connection token: the usual `client.token` verification applies, and its `exp` drives the renewal.
+
 ## Client error codes
 
 The client reports the calls it did not send, or cancelled, with the codes of `ReplyError`. They are client-local, and the server never sends them:

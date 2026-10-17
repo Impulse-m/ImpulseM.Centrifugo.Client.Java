@@ -59,6 +59,12 @@ final class ManualScheduler extends AbstractExecutorService implements Scheduled
     }
 
 
+    /** The time the clock has moved since it was created, in milliseconds. */
+    public synchronized long elapsedMillis() {
+        return TimeUnit.NANOSECONDS.toMillis(nowNanos);
+    }
+
+
     @Override
     public synchronized ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
         return add(Executors.callable(command), delay, unit);

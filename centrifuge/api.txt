@@ -192,6 +192,7 @@ package io.github.centrifugal.centrifuge {
     method public String getProxyPassword();
     method public int getTimeout();
     method public String getToken();
+    method public io.github.centrifugal.centrifuge.TokenExchange! getTokenExchange();
     method public io.github.centrifugal.centrifuge.ConnectionTokenGetter! getTokenGetter();
     method public String getVersion();
     method public void setData(byte[]!);
@@ -207,6 +208,7 @@ package io.github.centrifugal.centrifuge {
     method public void setProxyCredentials(String, String);
     method public void setTimeout(int);
     method public void setToken(String);
+    method public void setTokenExchange(io.github.centrifugal.centrifuge.TokenExchange!);
     method public void setTokenGetter(io.github.centrifugal.centrifuge.ConnectionTokenGetter!);
     method public void setVersion(String);
   }
@@ -523,6 +525,32 @@ package io.github.centrifugal.centrifuge {
 
   public class TokenError {
     method public Throwable getError();
+  }
+
+  public abstract class TokenExchange {
+    ctor public TokenExchange();
+    method public abstract void exchange(io.github.centrifugal.centrifuge.TokenExchangeEvent!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.TokenExchangeResult!>!);
+    method public int grace();
+    method public abstract String load() throws io.github.centrifugal.centrifuge.UnauthorizedException;
+    method public Set<String> refusalTypes();
+    method public abstract void store(String);
+  }
+
+  public final class TokenExchangeEvent {
+    method public String getRefreshToken();
+    method public void rpc(String, byte[]!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.RPCResult!>!);
+  }
+
+  public final class TokenExchangeRefusedException {
+    method public io.github.centrifugal.centrifuge.ReplyError! getReplyError();
+  }
+
+  public final class TokenExchangeResult {
+    ctor public TokenExchangeResult(String, String);
+    ctor public TokenExchangeResult(String, String, int);
+    method public int getGrace();
+    method public String getRefreshToken();
+    method public String getToken();
   }
 
   public class UnauthorizedException {

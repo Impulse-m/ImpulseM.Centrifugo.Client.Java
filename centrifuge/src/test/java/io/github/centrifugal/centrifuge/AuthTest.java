@@ -292,6 +292,29 @@ public class AuthTest extends RpcTestBase {
 
 
     @Test
+    public void timerFetchFailingWithUnauthorizedEndsTheSessionWithoutARetry() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        Options options = new Options();
+        options.setToken("token-initial");
+        options.setTokenGetter(new ConnectionTokenGetter() {
+            @Override
+            public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
+                cb.Done(new UnauthorizedException(), null);
+            }
+        });
+        newAuthClient(options);
+        connect(client);
+
+        awaitCondition("disconnected", () -> !disconnectedEvents.isEmpty());
+
+        assertEquals(Client.DISCONNECTED_UNAUTHORIZED, disconnectedEvents.get(0).getCode());
+        assertEquals(ClientState.DISCONNECTED, client.getState());
+        assertTrue("no refresh is sent without a token", refreshTokens().isEmpty());
+        assertTrue("the session end is not reported as an error", errorEvents.isEmpty());
+    }
+
+
+    @Test
     public void timerRefreshWithAnExpiredTokenRetriesWithAFreshToken() throws Exception {
         server.connectResult = expiringResult("u1", "authenticated", 1);
         AtomicInteger fetches = new AtomicInteger();

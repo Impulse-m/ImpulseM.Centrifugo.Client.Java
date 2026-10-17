@@ -68,6 +68,8 @@ final class AuthRefresh {
     private final int retryMinMillis;
     private final int retryMaxMillis;
     private final Backoff backoff = new Backoff();
+    // Null without a token exchange option: the connection token is then fetched by the token getter.
+    private final TokenExchangeFlow flow;
     // The refresh in flight is the one which runs now. The refreshes waiting for it run in order.
     private boolean inFlight = false;
     // A refresh command awaits its reply. The rpc calls wait for it, and for a requested refresh which
@@ -104,6 +106,41 @@ final class AuthRefresh {
         this.host = host;
         this.retryMinMillis = retryMinMillis;
         this.retryMaxMillis = retryMaxMillis;
+        this.flow = TokenExchangeFlow.create(host);
+    }
+
+
+    /** Moves on with each refresh() call and each accepted token. */
+    long refreshGeneration() {
+        return refreshGeneration;
+    }
+
+
+    /** Called at the start of every connect attempt, before the connect command is built. */
+    void beforeConnect() {
+        if (flow != null) {
+            flow.beforeConnect();
+        }
+    }
+
+
+    /** Called with the connect reply before the connected state. Returns true when a token exchange took it over. */
+    boolean interceptConnect(Protocol.Reply reply) {
+        return flow != null && flow.interceptConnect(reply);
+    }
+
+
+    /** Called for every push. Returns true when the push was held by a token exchange which is connecting. */
+    boolean holdPush(Protocol.Push push) {
+        return flow != null && flow.holdPush(push);
+    }
+
+
+    /** Called when the server accepted a connection token of a refresh call or a connect: an open refusal run is over. */
+    void tokenAccepted() {
+        if (flow != null) {
+            flow.tokenAccepted();
+        }
     }
 
 
@@ -178,11 +215,26 @@ final class AuthRefresh {
      * not expire. Replaces the timer scheduled before, so one timer chain runs.
      */
     void scheduleExpiry(boolean expires, int ttl) {
+        observeExpiry(expires, ttl);
         if (expires) {
-            scheduleTimer(ttl, TimeUnit.SECONDS);
+            scheduleTimer(renewalDelayMillis(ttl), TimeUnit.MILLISECONDS);
         } else {
             cancelTimer();
         }
+    }
+
+
+    /** Records the expiry of the connection token for the token exchange, whatever the state of the client. */
+    void observeExpiry(boolean expires, int ttl) {
+        if (flow != null) {
+            flow.observe(expires, ttl);
+        }
+    }
+
+
+    // The delay of the refresh timer for a ttl in seconds: a random share of it with a token exchange, the ttl otherwise.
+    private long renewalDelayMillis(int ttl) {
+        return flow == null ? ttl * 1000L : flow.renewalDelayMillis(ttl);
     }
 
 
@@ -200,11 +252,16 @@ final class AuthRefresh {
      * The connection is gone. The timer is cancelled, and the command gate is reset: the refresh
      * command in flight fails with the connection, so nothing awaits its reply. The refresh in flight
      * is not reset here. Its callback completes it, and only then does a waiting refresh start.
+     * A disconnect the client was asked for, or a terminal one the server ended the session with, ends the
+     * session of the token exchange; a transport loss does not.
      */
-    void onDisconnect() {
+    void onDisconnect(int code, boolean terminal) {
         cancelTimer();
         commandInFlight = false;
         timerSuperseded = false;
+        if (flow != null) {
+            flow.reset(code, terminal);
+        }
     }
 
 
@@ -236,7 +293,7 @@ final class AuthRefresh {
 
     // The timer fired: fetch a token and refresh with it, under the single-flight gate.
     void onTimer(long generation) {
-        if (generation != timerGeneration || host.tokenGetter() == null) {
+        if (generation != timerGeneration || timerTokenGetter() == null) {
             return;
         }
         timer = null;
@@ -246,6 +303,12 @@ final class AuthRefresh {
         }
         inFlight = true;
         fetchAndRefresh();
+    }
+
+
+    // The getter of the timer refresh: the renewal of the token exchange, or else the token getter of the options.
+    private ConnectionTokenGetter timerTokenGetter() {
+        return flow == null ? host.tokenGetter() : flow.renewalGetter();
     }
 
 
@@ -260,7 +323,7 @@ final class AuthRefresh {
         // A getter which throws fails the fetch as an error does, so the refresh still completes.
         CompletableFuture<String> fetched = new CompletableFuture<>();
         try {
-            host.tokenGetter().getConnectionToken(new ConnectionTokenEvent(), (Throwable err, String token) -> {
+            timerTokenGetter().getConnectionToken(new ConnectionTokenEvent(), (Throwable err, String token) -> {
                 if (err != null) {
                     fetched.completeExceptionally(err);
                 } else {
@@ -280,6 +343,12 @@ final class AuthRefresh {
         boolean awaitingCommand = false;
         try {
             if (transport != host.transport() || host.state() == ClientState.CLOSED) {
+                return;
+            }
+            // The session is over whatever asked for the token: the application removed its refresh token, or the issuer
+            // refused it past the grace horizon. A refresh() which waits for this fetch does not keep the session.
+            if (flow != null && err instanceof UnauthorizedException) {
+                host.failUnauthorized();
                 return;
             }
             if (host.state() != ClientState.CONNECTED) {
@@ -351,6 +420,12 @@ final class AuthRefresh {
     }
 
 
+    /** Whether a refresh refused with this error is retried with a fresh token: a temporary error, a client error or an expired token. */
+    static boolean isRetryableRefresh(ReplyError replyError) {
+        return replyError.isTemporary() || replyError.getCode() < SERVER_ERROR_CODE_MIN || replyError.getCode() == ERROR_CODE_TOKEN_EXPIRED;
+    }
+
+
     // Decides on a failed timer refresh: retried with backoff, reported as a disconnect, or kept as it is.
     private void settleTimerError(Throwable error) {
         if (!(error instanceof ReplyError)) {
@@ -358,7 +433,7 @@ final class AuthRefresh {
             return;
         }
         ReplyError replyError = (ReplyError) error;
-        if (replyError.isTemporary() || replyError.getCode() < SERVER_ERROR_CODE_MIN || replyError.getCode() == ERROR_CODE_TOKEN_EXPIRED) {
+        if (isRetryableRefresh(replyError)) {
             scheduleRetry();
         } else if (replyError.getCode() != PERMISSION_DENIED) {
             host.disconnect(replyError.getCode(), replyError.getMessage());
@@ -380,8 +455,11 @@ final class AuthRefresh {
             connectTokenStored = false;
             timerSuperseded = false;
             refreshGeneration++;
+            tokenAccepted();
             if (host.state() == ClientState.CONNECTED) {
                 scheduleExpiry(result.getExpires(), result.getTtl());
+            } else {
+                observeExpiry(result.getExpires(), result.getTtl());
             }
             AuthResult authResult = new AuthResult(result.getUser(), result.getAuthClass(), result.getExpires(), result.getTtl());
             try {
@@ -453,8 +531,8 @@ final class AuthRefresh {
     // Runs the task on the executor. Once the executor is shut down, which is after the client closed, a late
     // completion runs the task inline on the completing thread instead, so the callbacks of the refresh still
     // run exactly once. The task then only settles the callbacks: the client is closed. A failure of an inline
-    // task goes to the listener.
-    private void runOnExecutorOrInline(Runnable task) {
+    // task goes to the listener. Package-private: the token exchange runs its callbacks the same way.
+    void runOnExecutorOrInline(Runnable task) {
         Runnable reported = host.reporting(task);
         Extensions.submitOrRun(host.executor(), reported, reported);
     }

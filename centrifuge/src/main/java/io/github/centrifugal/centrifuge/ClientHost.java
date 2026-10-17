@@ -54,8 +54,60 @@ final class ClientHost {
     }
 
 
+    boolean isRefreshRequired() {
+        return client.refreshRequired;
+    }
+
+
+    void setRefreshRequired(boolean refreshRequired) {
+        client.refreshRequired = refreshRequired;
+    }
+
+
+    Options options() {
+        return client.getOpts();
+    }
+
+
+    /** Handles the connect reply once a token exchange completed it: the connected state follows. */
+    void resumeConnect(Protocol.Reply reply) {
+        client.handleConnectReply(reply);
+    }
+
+
+    /** Sets the ping settings of a connect reply which is held by a token exchange, as the connected reply sets them. */
+    void applyPing(Protocol.ConnectResult result) {
+        client.pingInterval = result.getPing() * 1000;
+        client.sendPong = result.getPong();
+    }
+
+
+    /** Cancels the ping timer, which a ping during a token exchange of the connect may have scheduled. */
+    void cancelPing() {
+        if (client.pingTask != null) {
+            client.pingTask.cancel(true);
+            client.pingTask = null;
+        }
+    }
+
+
+    /** Moves on with each refresh() call and each accepted token, so a change since an exchange started is seen. */
+    long refreshGeneration() {
+        return client.auth.refreshGeneration();
+    }
+
+
     WebSocket transport() {
         return client.ws;
+    }
+
+
+    /**
+     * Cancels the transport, whose peer may be unresponsive: a graceful close waits for the peer's close frame, which a
+     * dead peer never sends, and the reconnect would wait for it too. The client reconnects when the transport fails.
+     */
+    void closeTransport() {
+        transport().cancel();
     }
 
 
@@ -177,5 +229,11 @@ final class ClientHost {
                 reportError(failure);
             }
         };
+    }
+
+
+    /** Runs the task on the executor, or inline once the client closed, see {@link AuthRefresh#runOnExecutorOrInline}. */
+    void runOrInline(Runnable task) {
+        client.auth.runOnExecutorOrInline(task);
     }
 }
