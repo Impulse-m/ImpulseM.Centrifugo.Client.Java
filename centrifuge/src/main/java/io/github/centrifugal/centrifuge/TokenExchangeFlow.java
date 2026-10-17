@@ -406,16 +406,36 @@ final class TokenExchangeFlow {
     }
 
 
-    // The bootstrap exchange got no callback within the client timeout. The connection is closed, as a connect which got
-    // no reply is: the reconnect bootstraps again on a new socket, which a silently dead one would never do. A callback
-    // which comes later does not bootstrap, but its rotation is still stored, see storeAbandonedRotation.
+    // The bootstrap exchange got no callback within the client timeout. The connection is closed after the failure backoff,
+    // so the reconnect bootstraps again on a new socket, which a silently dead one would never do. A callback which comes
+    // later does not bootstrap, but its rotation is still stored, see storeAbandonedRotation.
     private void onExchangeTimeout(Bootstrap b, AtomicBoolean called) {
         if (!isCurrent(b) || called.get()) {
             return;
         }
+        abandonAndClose(b, new TimeoutException("token exchange timed out"));
+    }
+
+
+    // Ends a bootstrap whose exchange stalled, or whose refresh outcome is unknown: the error is reported, and the
+    // connection is closed once the failure backoff has run, so the reconnect bootstraps again. The backoff escalates
+    // across reconnects, as the retries of a failed bootstrap do, and restarts with a bootstrap that completes or a
+    // disconnect the application asked for. The close is skipped when the connection went away or ended meanwhile.
+    private void abandonAndClose(Bootstrap b, Throwable err) {
         abandon(b);
-        host.reportError(new TokenError(new TimeoutException("token exchange timed out")));
-        host.closeTransport();
+        host.reportError(new TokenError(err));
+        final WebSocket transport = b.transport;
+        host.scheduler().schedule(
+                () -> Extensions.submitOrIgnore(host.executor(), () -> onAbandonedClose(transport)),
+                nextBootstrapBackoff(),
+                TimeUnit.MILLISECONDS);
+    }
+
+
+    private void onAbandonedClose(WebSocket transport) {
+        if (host.transport() == transport && host.state() == ClientState.CONNECTING) {
+            host.closeTransport();
+        }
     }
 
 
@@ -581,9 +601,8 @@ final class TokenExchangeFlow {
         host.storeToken("");
         if (!(failure instanceof ReplyError)) {
             // The outcome is unknown: the server may have bound the connection to the access token. The connection is
-            // closed, so the reconnect bootstraps on a socket which carries no identity.
-            host.reportError(new TokenError(failure));
-            host.closeTransport();
+            // closed after the backoff, so the reconnect bootstraps on a socket which carries no identity.
+            abandonAndClose(b, failure);
             return;
         }
         ReplyError replyError = (ReplyError) failure;
@@ -643,9 +662,15 @@ final class TokenExchangeFlow {
 
 
     private void scheduleBootstrapRetry(final Bootstrap b) {
+        scheduleRetry(b, nextBootstrapBackoff());
+    }
+
+
+    // The delay of the next failed bootstrap step, which counts one more step. The steps escalate across reconnects.
+    private long nextBootstrapBackoff() {
         long delay = backoff.duration(bootstrapAttempt, BOOTSTRAP_RETRY_MIN_MILLIS, BOOTSTRAP_RETRY_MAX_MILLIS);
         bootstrapAttempt++;
-        scheduleRetry(b, delay);
+        return delay;
     }
 
 

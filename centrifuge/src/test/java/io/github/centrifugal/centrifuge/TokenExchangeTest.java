@@ -1425,12 +1425,79 @@ public class TokenExchangeTest extends RpcTestBase {
         awaitCondition("timeout reported", () -> !errors.isEmpty());
         assertTrue(errors.get(0) instanceof TokenError);
         assertTrue(connected.isEmpty());
-        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() == delaysBefore + 1);
+        // The connection stays open for the failure backoff, and closes once it has run: its first step is 5 to 10 seconds.
+        awaitCondition("close scheduled", () -> clock.requestedDelays().size() == delaysBefore + 1);
+        assertEquals(1, kinds().stream().filter("connect"::equals).count());
+        long closeDelay = clock.requestedDelays().get(delaysBefore);
+        assertTrue(closeDelay >= BOOTSTRAP_RETRY_MIN_MILLIS && closeDelay <= 2 * BOOTSTRAP_RETRY_MIN_MILLIS);
+        clock.advance(closeDelay);
+        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() == delaysBefore + 2);
         clock.advance(60000);
         awaitCondition("connected", () -> connected.size() == 1);
         assertEquals(Arrays.asList("refresh-1", "refresh-1"), storage.exchanged);
         assertEquals(Arrays.asList("refresh-2"), storage.stored);
         assertEquals(2, kinds().stream().filter("connect"::equals).count());
+    }
+
+
+    @Test
+    public void stalledBootstrapsBackOffAndEscalateAcrossReconnects() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        AtomicBoolean stalling = new AtomicBoolean(true);
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                if (stalling.get()) {
+                    exchanged.add(event.getRefreshToken());
+                    return;
+                }
+                super.exchange(event, cb);
+            }
+        };
+        Options options = exchangeOptions(storage);
+        options.setTimeout(1000);
+        options.setMinReconnectDelay(RETRY_MIN_MILLIS);
+        options.setMaxReconnectDelay(RETRY_MAX_MILLIS);
+        newExchangeClient(options, clock);
+        client.connect();
+
+        // The first stall: the connection closes after the first step of the failure backoff, 5 to 10 seconds.
+        awaitCondition("first exchange started", () -> storage.exchanged.size() == 1);
+        final int firstStallFrom = clock.requestedDelays().size();
+        clock.advance(options.getTimeout());
+        // The error is reported before the close is scheduled, so the schedule is awaited.
+        awaitCondition("first close scheduled", () -> clock.requestedDelays().size() == firstStallFrom + 1);
+        assertEquals(1, tokenErrorCount());
+        long firstClose = lastDelay(clock);
+        assertTrue(firstClose >= BOOTSTRAP_RETRY_MIN_MILLIS && firstClose <= 2 * BOOTSTRAP_RETRY_MIN_MILLIS);
+        assertEquals(1, kinds().stream().filter("connect"::equals).count());
+        final int firstReconnectFrom = clock.requestedDelays().size();
+        clock.advance(firstClose);
+        awaitCondition("first close reconnects", () -> clock.requestedDelays().size() == firstReconnectFrom + 1);
+        clock.advance(RETRY_MAX_MILLIS);
+
+        // The second stall, on the next connect: the step escalates, so its backoff is 5 to 15 seconds.
+        awaitCondition("second exchange started", () -> storage.exchanged.size() == 2);
+        final int secondStallFrom = clock.requestedDelays().size();
+        clock.advance(options.getTimeout());
+        awaitCondition("second close scheduled", () -> clock.requestedDelays().size() == secondStallFrom + 1);
+        assertEquals(2, tokenErrorCount());
+        assertEquals(2, ((Integer) fieldOf(fieldOf(client.auth, "flow"), "bootstrapAttempt")).intValue());
+        long secondClose = lastDelay(clock);
+        assertTrue(secondClose >= BOOTSTRAP_RETRY_MIN_MILLIS && secondClose <= 3 * BOOTSTRAP_RETRY_MIN_MILLIS);
+        assertEquals(2, kinds().stream().filter("connect"::equals).count());
+
+        // The third connect succeeds: the completed bootstrap resets the escalation.
+        stalling.set(false);
+        final int secondReconnectFrom = clock.requestedDelays().size();
+        clock.advance(secondClose);
+        awaitCondition("second close reconnects", () -> clock.requestedDelays().size() == secondReconnectFrom + 1);
+        clock.advance(RETRY_MAX_MILLIS);
+        awaitCondition("connected", () -> connected.size() == 1);
+        assertEquals(0, ((Integer) fieldOf(fieldOf(client.auth, "flow"), "bootstrapAttempt")).intValue());
+        assertEquals(Arrays.asList("refresh-2"), storage.stored);
     }
 
 
@@ -1450,10 +1517,12 @@ public class TokenExchangeTest extends RpcTestBase {
 
         awaitCondition("timeout reported", () -> !errors.isEmpty());
         assertTrue(errors.get(0) instanceof TokenError);
-        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() > delaysBefore);
+        awaitCondition("close scheduled", () -> clock.requestedDelays().size() == delaysBefore + 1);
         assertTrue(connected.isEmpty());
         // The app logs out while the client waits: the next bootstrap finds no refresh token.
         storage.refreshToken = null;
+        clock.advance(clock.requestedDelays().get(delaysBefore));
+        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() == delaysBefore + 2);
         clock.advance(60000);
 
         awaitCondition("connected", () -> connected.size() == 1);
@@ -2077,7 +2146,10 @@ public class TokenExchangeTest extends RpcTestBase {
         assertTrue(errors.get(0) instanceof TokenError);
         assertTrue(refreshTokens().isEmpty());
         assertTrue(connected.isEmpty());
-        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() > delaysBefore);
+        // The connection stays open for the failure backoff, then closes, and the reconnect bootstraps again.
+        awaitCondition("close scheduled", () -> clock.requestedDelays().size() == delaysBefore + 1);
+        clock.advance(clock.requestedDelays().get(delaysBefore));
+        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() == delaysBefore + 2);
         clock.advance(60000);
 
         awaitCondition("connected", () -> connected.size() == 1);
@@ -2682,6 +2754,25 @@ public class TokenExchangeTest extends RpcTestBase {
     // The delays of the bootstrap retries scheduled so far. The exchange timeouts and the reconnects are shorter.
     // Only the failure backoff is at least BOOTSTRAP_RETRY_MIN_MILLIS: a refusal retry is drawn from the remaining
     // grace and can be shorter, so a test which waits for a refusal retry must count the delays another way.
+    // The number of token errors reported so far.
+    private int tokenErrorCount() {
+        int count = 0;
+        for (Throwable err : errors) {
+            if (err instanceof TokenError) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+
+    // The delay of the last task the clock was asked to run.
+    private static long lastDelay(ManualScheduler clock) {
+        List<Long> delays = clock.requestedDelays();
+        return delays.get(delays.size() - 1);
+    }
+
+
     private static List<Long> bootstrapDelays(ManualScheduler clock) {
         List<Long> delays = new ArrayList<>();
         for (long delay : clock.requestedDelays()) {
