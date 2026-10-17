@@ -398,10 +398,11 @@ public final class RpcPool {
 
         /**
          * The name of the header which carries {@link CallOptions#getAffinity()}. The header must be allow-listed
-         * for the method on the server. Without it a call may not pass an affinity.
+         * for the method on the server. Without it a call may not pass an affinity. The name is kept in lower case, as
+         * the server matches it.
          */
         public Builder affinityHeader(String affinityHeader) {
-            this.affinityHeader = Objects.requireNonNull(affinityHeader, "affinity header");
+            this.affinityHeader = Objects.requireNonNull(affinityHeader, "affinity header").toLowerCase(Locale.ROOT);
             return this;
         }
 

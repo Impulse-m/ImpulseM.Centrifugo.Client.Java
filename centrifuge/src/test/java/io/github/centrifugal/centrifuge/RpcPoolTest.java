@@ -91,6 +91,18 @@ public class RpcPoolTest extends RpcTestBase {
 
 
     @Test
+    public void anAffinityHeaderNameIsSentInLowerCase() throws Exception {
+        enableRpcOptions();
+        answerRpcs("ok");
+        RpcPool pool = build(builder().affinityHeader("X-Example-Affinity"));
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().affinity("hint-1").build(), into(future));
+        future.get(5, TimeUnit.SECONDS);
+        assertEquals("hint-1", sentRpcRequests().get(0).getHeadersMap().get(AFFINITY_HEADER));
+    }
+
+
+    @Test
     public void anAffinityWithoutTheHeaderOptionIsBadConfiguration() throws Exception {
         RpcPool pool = build(builder());
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
