@@ -427,7 +427,6 @@ final class TokenExchangeFlow {
     // presented at once, an empty one ends the session, and the same one is presented again after the backoff, until the
     // grace horizon has passed. A failed read throws.
     private void reloadAfterRefusal(Bootstrap b, String refreshToken) {
-        openRefusalRun();
         String again;
         try {
             again = exchange.load();
@@ -802,7 +801,6 @@ final class TokenExchangeFlow {
         }
         storeRotationSince(result, refreshToken, generation);
         if (err instanceof UnauthorizedException) {
-            openRefusalRun();
             String again;
             try {
                 again = exchange.load();
