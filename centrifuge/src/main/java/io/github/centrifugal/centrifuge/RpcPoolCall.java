@@ -14,7 +14,6 @@ final class RpcPoolCall {
     final byte[] data;
     final Map<String, String> headers;
     final String affinity;
-    final long timeoutMillis;
     final ResultCallback<RPCResult> callback;
     // The deadline on the nano clock. It starts at the submit, so it holds across resends and the redirect fetch.
     final long deadlineNanos;
@@ -57,7 +56,6 @@ final class RpcPoolCall {
         this.endpointKey = endpointKey;
         this.headers = headers;
         this.affinity = affinity;
-        this.timeoutMillis = timeoutMillis;
         this.callback = callback;
         this.deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
     }
