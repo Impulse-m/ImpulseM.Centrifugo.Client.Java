@@ -376,7 +376,7 @@ The process lock is shared by every client of the process which names the same l
 
 #### The attribution claim (`meta`)
 
-The access token is a connection JWT. Its `meta` claim is the issuer's attribution of the connection, for example an installation or a device. The server stores it at connect, and replaces it at every renewal, so the attribution follows the access token. An issuer which wants a stable attribution keeps `meta` the same across the access tokens of one session. The client never reads the claim.
+The access token is a connection JWT. Its `meta` claim is the issuer's attribution of the connection, for example an installation or a device. The server stores it at connect, and replaces it at every renewal and rebind whose access token carries the claim; a token without it keeps the attribution the connection has. An issuer which wants a stable attribution keeps `meta` the same across the access tokens of one session. An issuer which wants to drop the attribution sends an empty object (`"meta": {}`), which replaces it. The client never reads the claim.
 
 On logout, disconnect or close the client before clearing the stored refresh token: a renewal still in flight while the client stays connected stores its rotated token when it completes.
 
