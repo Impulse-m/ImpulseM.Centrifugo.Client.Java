@@ -24,8 +24,10 @@ final class RpcPoolCall {
     int resends;
     // The later refusals resent so far: the draw index of the delay of the next later resend, as the client counts them.
     int laterResends;
-    // The call waits in the queue for a connection with room.
-    boolean queued;
+    // The queue of the endpoint key the call waits in, and the calls before and after it there; null while it is not queued.
+    RpcPoolQueue queue;
+    RpcPoolCall previous;
+    RpcPoolCall next;
     // The call has its outcome: nothing runs for it any more, and its callback has been given the outcome.
     boolean settled;
     // The connection of the attempt in progress: on the wire, or lost and waiting for the connection's next event.

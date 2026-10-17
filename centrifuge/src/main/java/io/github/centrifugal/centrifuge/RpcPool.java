@@ -440,10 +440,16 @@ public final class RpcPool {
         }
 
 
-        /** Closes a connection with no call for this long, in milliseconds; 0 keeps it. Default 60000. */
+        /**
+         * Closes a connection with no call for this long, in milliseconds; 0 keeps it. At most 2147483647, the limit of
+         * a timer. Default 60000.
+         */
         public Builder idleTimeout(long idleTimeout) {
             if (idleTimeout < 0) {
                 throw new IllegalArgumentException("idleTimeout must not be negative");
+            }
+            if (idleTimeout > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("idleTimeout must be at most 2147483647");
             }
             this.idleTimeout = idleTimeout;
             return this;
@@ -555,7 +561,10 @@ public final class RpcPool {
     private final Random random;
 
     // The state below belongs to the pool's thread.
-    private final Deque<RpcPoolCall> queue = new ArrayDeque<>();
+    // The waiting calls, one queue per endpoint key which resolved; a queue is kept once made, as the keys are.
+    private final Map<String, RpcPoolQueue> queues = new HashMap<>();
+    // The calls waiting in all the queues, which the pool-wide bound counts.
+    private int queuedCount;
     // The calls which have no outcome yet, to settle them on close.
     private final Set<RpcPoolCall> unsettled = new HashSet<>();
     // The endpoints of the keys which resolved, by key: cached until the pool is closed.
@@ -636,7 +645,7 @@ public final class RpcPool {
         if (!conn.removed) {
             conn.connecting = true;
             releaseLost(conn);
-            pump();
+            pumpEndpoint(conn.endpoint);
         }
     }
 
@@ -646,7 +655,7 @@ public final class RpcPool {
             conn.connecting = false;
             conn.endpoint.closes = 0;
             releaseLost(conn);
-            pump();
+            pumpEndpoint(conn.endpoint);
             if (idle(conn)) {
                 markIdle(conn);
             }
@@ -674,7 +683,7 @@ public final class RpcPool {
             hold(conn.endpoint);
         }
         releaseLost(conn);
-        pump();
+        pumpEndpoint(conn.endpoint);
     }
 
 
@@ -695,7 +704,7 @@ public final class RpcPool {
                 finishAttempt(call, null, new IOException(conn.closeReason));
             } else if (canResend(call)) {
                 call.resends++;
-                enqueue(call);
+                enqueue(call, false);
             } else {
                 finishAttempt(call, null, new IOException("rpc connection lost"));
             }
@@ -779,7 +788,7 @@ public final class RpcPool {
 
     private void onHoldEnd(RpcPoolEndpoint endpoint) {
         endpoint.holdTask = null;
-        pump();
+        pumpEndpoint(endpoint);
     }
 
 
@@ -810,17 +819,18 @@ public final class RpcPool {
         unsettled.add(call);
         // The timer runs on the deadline of the call, which started at its submit: the time it waited for the pool's thread is spent.
         call.deadlineTask = executor.schedule(() -> onDeadline(call), call.remainingNanos(), TimeUnit.NANOSECONDS);
-        // A call goes out at once only when no call waits: the waiting calls are older, and go first.
-        if (queue.isEmpty() && tryAssign(call, eps)) {
+        // A call goes out at once only when no call of its key waits: the waiting calls are older, and go first.
+        RpcPoolQueue waiting = queues.get(call.endpointKey);
+        if ((waiting == null || waiting.isEmpty()) && tryAssign(call, eps)) {
             return;
         }
         // The queue bound applies to a call which cannot open a connection: a call which can is queued and opens one.
-        if (queue.size() >= maxQueued && openable(eps) == null) {
+        if (queuedCount >= maxQueued && openable(eps) == null) {
             settle(call, null, new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls are waiting", false));
             return;
         }
-        enqueue(call);
-        pump();
+        enqueue(call, false);
+        pumpKey(call.endpointKey);
     }
 
 
@@ -834,59 +844,38 @@ public final class RpcPool {
     }
 
 
-    // Sends the queued calls, in order, to the connections with room, and opens the connections they need. Nothing in one pass
-    // frees room, so a key which finds no room and no endpoint to open has none for its later calls either: they are skipped
-    // without a search. A pool with no room at all is not searched, so a reply costs the connections of the pool, not the queue.
-    private void pump() {
-        if (closed || !anyRoom()) {
-            return;
-        }
-        Set<String> blocked = new HashSet<>();
-        for (RpcPoolCall call : new ArrayList<>(queue)) {
-            if (call.settled) {
-                queue.remove(call);
-                call.queued = false;
-                continue;
-            }
-            if (blocked.contains(call.endpointKey)) {
-                continue;
-            }
-            List<RpcPoolEndpoint> eps;
-            try {
-                eps = resolveKey(call.endpointKey);
-            } catch (RuntimeException e) {
-                settle(call, null, e);
-                continue;
-            }
-            if (eps == null) {
-                settle(call, null, badConfiguration("endpoint key has no endpoint"));
-                continue;
-            }
-            if (!tryAssign(call, eps)) {
-                RpcPoolEndpoint endpoint = openable(eps);
-                if (endpoint == null) {
-                    blocked.add(call.endpointKey);
-                } else {
-                    open(endpoint);
-                }
-            }
+    // A connection event of an endpoint: only the queues of the keys which resolved to it can have a call to place.
+    // Index loop over the keys, which a call's resolution may extend, so nothing is allocated here.
+    private void pumpEndpoint(RpcPoolEndpoint endpoint) {
+        List<String> keys = endpoint.keys();
+        for (int i = 0; i < keys.size(); i++) {
+            pumpKey(keys.get(i));
         }
     }
 
 
-    // Whether a connection has room for a call, or an endpoint may open one: when neither holds, no queued call can be sent.
-    private boolean anyRoom() {
-        for (RpcPoolEndpoint endpoint : endpoints.values()) {
-            if (mayOpen(endpoint)) {
-                return true;
-            }
-            for (RpcPoolConnection conn : endpoint.connections()) {
-                if (conn.calls.size() < maxInflightPerConnection) {
-                    return true;
-                }
-            }
+    // Sends the waiting calls of one key, in order, to the connections with room, and opens the connections they need. The
+    // calls of a key share its endpoints, so the first call which finds no room and no endpoint to open ends the pass: none
+    // of the later calls of the key can go either. A key with an empty queue costs one map lookup.
+    private void pumpKey(String endpointKey) {
+        RpcPoolQueue queue = queues.get(endpointKey);
+        // A queued call's key has resolved: it resolved when the call was started or rerouted, and the resolution is kept.
+        List<RpcPoolEndpoint> eps = resolved.get(endpointKey);
+        if (closed || queue == null || queue.isEmpty() || eps == null) {
+            return;
         }
-        return false;
+        while (!queue.isEmpty()) {
+            RpcPoolCall call = queue.first();
+            if (tryAssign(call, eps)) {
+                continue;
+            }
+            RpcPoolEndpoint endpoint = openable(eps);
+            if (endpoint != null) {
+                // The call waits for the connection to connect: the connection's event pumps the key again.
+                open(endpoint);
+            }
+            return;
+        }
     }
 
 
@@ -913,6 +902,7 @@ public final class RpcPool {
             }
             if (!eps.contains(endpoint)) {
                 eps.add(endpoint);
+                endpoint.addKey(endpointKey);
             }
         }
         resolved.put(endpointKey, eps);
@@ -971,10 +961,7 @@ public final class RpcPool {
 
 
     private void attach(RpcPoolCall call, RpcPoolConnection conn) {
-        if (call.queued) {
-            queue.remove(call);
-            call.queued = false;
-        }
+        unqueue(call);
         conn.calls.add(call);
         call.connection = conn;
         call.endpointUrl = conn.endpoint.url();
@@ -995,7 +982,7 @@ public final class RpcPool {
     private void onAttemptDone(RpcPoolCall call, RpcPoolConnection conn, RPCResult result, Throwable error) {
         if (!conn.calls.remove(call)) {
             // The attempt was given up with its connection, which settled the call.
-            pump();
+            pumpEndpoint(conn.endpoint);
             return;
         }
         call.connection = null;
@@ -1019,7 +1006,7 @@ public final class RpcPool {
         if (idle(conn)) {
             markIdle(conn);
         }
-        pump();
+        pumpEndpoint(conn.endpoint);
     }
 
 
@@ -1034,7 +1021,7 @@ public final class RpcPool {
                 if (key != null) {
                     call.endpointKey = key;
                     call.resends++;
-                    queueFirst(call);
+                    routeFirst(call);
                     return;
                 }
             }
@@ -1062,21 +1049,53 @@ public final class RpcPool {
     private void onResendDue(RpcPoolCall call) {
         call.resendTask = null;
         if (!call.settled) {
-            enqueue(call);
-            pump();
+            enqueue(call, false);
+            pumpKey(call.endpointKey);
         }
     }
 
 
-    private void enqueue(RpcPoolCall call) {
-        queue.add(call);
-        call.queued = true;
+    // Queues the call in the queue of its key, at the back or, for a reroute, at the front.
+    private void enqueue(RpcPoolCall call, boolean first) {
+        RpcPoolQueue queue = queues.get(call.endpointKey);
+        if (queue == null) {
+            queue = new RpcPoolQueue();
+            queues.put(call.endpointKey, queue);
+        }
+        if (first) {
+            queue.addFirst(call);
+        } else {
+            queue.addLast(call);
+        }
+        queuedCount++;
     }
 
 
-    private void queueFirst(RpcPoolCall call) {
-        queue.addFirst(call);
-        call.queued = true;
+    // Takes the call out of its queue, if it waits in one.
+    private void unqueue(RpcPoolCall call) {
+        if (call.queue != null) {
+            call.queue.remove(call);
+            queuedCount--;
+        }
+    }
+
+
+    // Queues a rerouted call at the front of its new key, after the key has resolved: a key which resolves to nothing
+    // settles the call here, as a call of an unknown key does.
+    private void routeFirst(RpcPoolCall call) {
+        List<RpcPoolEndpoint> eps;
+        try {
+            eps = resolveKey(call.endpointKey);
+        } catch (RuntimeException e) {
+            settle(call, null, e);
+            return;
+        }
+        if (eps == null) {
+            settle(call, null, badConfiguration("endpoint key has no endpoint"));
+            return;
+        }
+        enqueue(call, true);
+        pumpKey(call.endpointKey);
     }
 
 
@@ -1208,7 +1227,6 @@ public final class RpcPool {
             }
         }
         startWaitingRedirects();
-        pump();
     }
 
 
@@ -1245,10 +1263,7 @@ public final class RpcPool {
             call.resendTask.cancel(false);
             call.resendTask = null;
         }
-        if (call.queued) {
-            queue.remove(call);
-            call.queued = false;
-        }
+        unqueue(call);
         if (call.connection != null && call.connection.lost.remove(call)) {
             // A lost call waiting for its connection's event leaves the connection with its outcome.
             RpcPoolConnection conn = call.connection;
@@ -1354,8 +1369,8 @@ public final class RpcPool {
         if (nextNanos >= 0L) {
             armIdleCheck(nextNanos);
         }
-        if (!expired.isEmpty()) {
-            pump();
+        for (RpcPoolConnection conn : expired) {
+            pumpEndpoint(conn.endpoint);
         }
     }
 
@@ -1414,7 +1429,7 @@ public final class RpcPool {
                 inflight += conn.calls.size();
             }
         }
-        return new Stats(connections, inflight, queue.size(), redirectsInflight);
+        return new Stats(connections, inflight, queuedCount, redirectsInflight);
     }
 
 
