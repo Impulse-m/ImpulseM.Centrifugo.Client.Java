@@ -205,10 +205,10 @@ pool.rpc("blob.writePart", chunk, RpcPool.CallOptions.builder().endpointKey("eu-
 - The calls are plain: no `msg_id`, no instance. A resent call may run again on the server, so the method must be idempotent.
 - The window is `maxInflightPerConnection`, 1 by default. The server must allow it: `client.concurrency` on the server is at least the window plus one, or the server's read loop cannot answer pings while calls run.
 - A call is sent again, up to `retries` times (3 by default) counted together, when its connection was lost (`IOException`), when the server refused it with the `x-centrifugo-retry: later` signal (after the same jittered delay as the main client), or when `reroute` maps the server's error to another endpoint key. A timeout is not resent. A connection the server closed for a frame over its size limit (WebSocket 1009) settles its calls with `IOException` and is not resent: the chunk is over the limit every time.
-- `redirect` lets the application move the bytes of a reply or an error to a URL (for example a presigned one). The pool fetches it with OkHttp, within the call's deadline, at most `maxRedirectsInflight` at a time, and the body is bounded by `RpcPool.Redirect` `maxBytes` (16 MiB by default). A fetch that fails, or a URL the endpoint does not allow (`https:` for `wss:`), fails the call with `REDIRECT_FAILED`.
-- `maxQueued` (64 by default) bounds the calls waiting for a connection; a call beyond it fails at once with `LIMIT_EXCEEDED`. `idleTimeout` (60 s by default, 0 keeps the connections) closes a connection with no call. `stats()` reports the connections, the calls in flight and waiting, and the redirect fetches.
+- `redirect` lets the application move the bytes of a reply or an error to a URL (for example a presigned one). The pool fetches it with OkHttp, within the call's deadline, at most `maxRedirectsInflight` at a time, and the body is bounded by `RpcPool.Redirect` `maxBytes` (16 MiB by default). The pool follows the redirects of the fetch itself, at most 5 hops: a hop from `https:` to `http:` is refused, and the request headers of `RpcPool.Redirect` go only to the host and port of the URL the hook named. A fetch that fails, or a URL the endpoint does not allow (`https:` for `wss:`), fails the call with `REDIRECT_FAILED`.
+- `maxQueued` (64 by default) bounds the calls waiting for a connection; a call beyond it fails at once with `LIMIT_EXCEEDED`. The calls waiting for a redirect fetch slot are not counted by it: their deadline is their only bound. `idleTimeout` (60 s by default, 0 keeps the connections) closes a connection with no call. `stats()` reports the connections, the calls in flight and waiting, and the redirect fetches.
 - `close()` closes every connection: the calls waiting fail with `CANCELLED`, the calls on the wire with `IOException`.
-- The array of `rpc` must not change until the callback: the pool reads it when it sends the call, which can be after the call waited in the queue. The okHttp client of the pool, when given, also serves the redirect fetches with its interceptors and redirects.
+- The array of `rpc` must not change until the callback: the pool reads it when it sends the call, which can be after the call waited in the queue. The okHttp client of the pool, when given, also serves the redirect fetches with its interceptors. The client itself does not follow redirects: the pool does, hop by hop, so each hop goes through the interceptors.
 
 ## Refreshing the connection token on demand
 
@@ -235,7 +235,7 @@ The client reports the calls it did not send, or cancelled, with the codes of `R
 | 12 | `RpcPool.BAD_CONFIGURATION` | the call of an `RpcPool` was refused: an option of the call, or an endpoint key which resolves to no endpoint |
 | 18 | `RpcPool.REDIRECT_FAILED` | the redirect of an `RpcPool` call could not be fetched, see `RpcPool.RedirectHook` |
 
-Codes 12 and 15 to 19 are reserved for client-local errors of the fork SDKs; a server never sends them.
+The codes of this section are client-local: a server never sends them.
 
 ## CI status
 
