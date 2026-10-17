@@ -255,13 +255,15 @@ final class AuthRefresh {
      * The connection is gone. The timer is cancelled, and the command gate is reset: the refresh
      * command in flight fails with the connection, so nothing awaits its reply. The refresh in flight
      * is not reset here. Its callback completes it, and only then does a waiting refresh start.
+     * A disconnect the client was asked for, or a terminal one the server ended the session with, ends the
+     * session of the token exchange; a transport loss does not.
      */
-    void onDisconnect(int code) {
+    void onDisconnect(int code, boolean terminal) {
         cancelTimer();
         commandInFlight = false;
         timerSuperseded = false;
         if (flow != null) {
-            flow.reset(code == Client.DISCONNECTED_DISCONNECT_CALLED);
+            flow.reset(code == Client.DISCONNECTED_DISCONNECT_CALLED || terminal);
         }
     }
 

@@ -231,14 +231,15 @@ final class TokenExchangeFlow {
     /**
      * The connection is gone: the bootstrap is abandoned and its retry is cancelled. The backoff of the bootstrap
      * attempts goes on, it restarts when a bootstrap completes or ends the session. A disconnect the client was asked
-     * for ends the session, so its attempts restart with the next connect. The expiry record is kept.
+     * for, or a terminal one, ends the session: its attempts restart with the next connect and its refusal run closes.
+     * The expiry record is kept.
      */
-    void reset(boolean clientInitiated) {
+    void reset(boolean endsSession) {
         if (bootstrap != null) {
             abandon(bootstrap);
         }
         anonymousConnect = false;
-        if (clientInitiated) {
+        if (endsSession) {
             bootstrapAttempt = 0;
             closeRefusalRun();
         }

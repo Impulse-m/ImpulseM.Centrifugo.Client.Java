@@ -55,6 +55,8 @@ public class TokenExchangeTest extends RpcTestBase {
     private static final int CODE_DISCONNECT_UNAUTHORIZED = 1;
     private static final int CODE_PERMISSION_DENIED = 103;
     private static final int CODE_TOKEN_EXPIRED = 109;
+    // A close code of the server which ends the session: the client does not reconnect after it.
+    private static final int CODE_TERMINAL_CLOSE = 3500;
     private static final long WINDOW_MIN_MILLIS = 7000L;
     private static final long WINDOW_MAX_MILLIS = 9000L;
     // The clock moves at most this far per test, so that the ping timer (25 s plus the ping delay) stays idle.
@@ -627,6 +629,37 @@ public class TokenExchangeTest extends RpcTestBase {
         awaitCondition("retry of the new run scheduled", () -> bootstrapDelays(clock).size() > before);
         assertNotNull(horizonOf());
         assertEquals(0, disconnects.stream().filter((DisconnectedEvent event) -> event.getCode() == CODE_DISCONNECT_UNAUTHORIZED).count());
+    }
+
+
+    @Test
+    public void terminalDisconnectClosesTheRefusalRun() throws Exception {
+        // A refusal opens the run, then the server ends the session with a terminal close code. The run closes with the
+        // session, so the anonymous connect after the storage was emptied goes on anonymously, not as a dead session.
+        ManualScheduler clock = new ManualScheduler();
+        answerIdentity(false, 0);
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                exchanged.add(event.getRefreshToken());
+                cb.onDone(new UnauthorizedException(), null);
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("refusal reported", () -> !errors.isEmpty());
+        assertNotNull(horizonOf());
+
+        server.disconnect(CODE_TERMINAL_CLOSE, "terminal");
+        awaitCondition("disconnected", () -> client.getState() == ClientState.DISCONNECTED);
+        assertNull(horizonOf());
+
+        storage.refreshToken = "";
+        client.connect();
+        awaitCondition("connected anonymously", () -> connected.size() == 1);
+        assertEquals(0, disconnects.stream().filter((DisconnectedEvent event) -> event.getCode() == CODE_DISCONNECT_UNAUTHORIZED).count());
+        // The empty storage is read, and nothing is presented to the issuer after the session ended.
+        assertEquals(Collections.singletonList("refresh-1"), storage.exchanged);
     }
 
 

@@ -334,7 +334,7 @@ public class Client {
             this.pingTask.cancel(true);
             this.pingTask = null;
         }
-        this.auth.onDisconnect(code);
+        this.auth.onDisconnect(code, !shouldReconnect);
         if (this.reconnectTask != null) {
             this.reconnectTask.cancel(true);
             this.reconnectTask = null;
