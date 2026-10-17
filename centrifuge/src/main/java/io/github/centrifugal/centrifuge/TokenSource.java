@@ -38,8 +38,8 @@ final class TokenSource {
 
     private final ClientHost host;
     private final AuthRefresh auth;
-    // The waiting requests, one per requester. A new request of a requester replaces its waiting one: the requester
-    // has given up the earlier attempt, which its own timeout bounds.
+    // The waiting requests, one per requester. A new request of a requester replaces its waiting one, which fails as
+    // unauthorized: the requester has given up the earlier attempt, and its callback must settle.
     private final Map<Object, Waiter> waiting = new LinkedHashMap<>();
     // The token a renewal was started for, so that one renewal serves every request for it. Cleared when the main client connects.
     private String renewedFor;
