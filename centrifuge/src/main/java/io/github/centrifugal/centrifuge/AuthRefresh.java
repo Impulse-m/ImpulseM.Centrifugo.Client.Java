@@ -22,12 +22,11 @@ import okhttp3.WebSocket;
  * {@link Client#refresh}, and the timer which refreshes before the token expires. One refresh is
  * in flight at a time, the others wait their turn. The rpc calls wait for the refresh command in
  * flight, see {@link RpcSession}. Used on the client's executor thread only, except the inline run of
- * {@link ClientHost#runOrInline} after the client closed: that run completes the refresh in flight
+ * {@link #runOnExecutorOrInline} after the client closed: that run completes the refresh in flight
  * too, so it fails the waiting refreshes and flushes the rpc calls on the completing thread.
  * <p>
  * The fetch and retry loop of the timer mirrors {@code Subscription.sendRefresh}. It is kept here,
- * so that the subscription code stays as it is. With a {@link TokenExchange} the timer fetches its
- * token through the exchange, see {@link TokenExchangeFlow}.
+ * so that the subscription code stays as it is.
  */
 final class AuthRefresh {
     // A refresh which waits for the refresh in flight. A requested refresh carries its token and the
@@ -104,30 +103,16 @@ final class AuthRefresh {
 
 
     AuthRefresh(ClientHost host, int retryMinMillis, int retryMaxMillis) {
-        TokenExchangeFlow.check(host.options());
         this.host = host;
         this.retryMinMillis = retryMinMillis;
         this.retryMaxMillis = retryMaxMillis;
-        TokenExchange tokenExchange = host.tokenExchange();
-        this.flow = tokenExchange == null ? null : new TokenExchangeFlow(host, tokenExchange);
-    }
-
-
-    /** Whether the client was created with a token exchange. */
-    boolean hasFlow() {
-        return flow != null;
+        this.flow = TokenExchangeFlow.create(host);
     }
 
 
     /** Moves on with each refresh() call and each accepted token. */
     long refreshGeneration() {
         return refreshGeneration;
-    }
-
-
-    /** The connection token getter of a token exchange: the timer fetches its token through the exchange. */
-    ConnectionTokenGetter exchangeTokenGetter() {
-        return flow.renewalGetter();
     }
 
 
@@ -148,6 +133,14 @@ final class AuthRefresh {
     /** Called for every push. Returns true when the push was held by a token exchange which is connecting. */
     boolean holdPush(Protocol.Push push) {
         return flow != null && flow.holdPush(push);
+    }
+
+
+    /** Called when the server accepted a connection token of a refresh call or a connect: an open refusal run is over. */
+    void tokenAccepted() {
+        if (flow != null) {
+            flow.tokenAccepted();
+        }
     }
 
 
@@ -223,21 +216,25 @@ final class AuthRefresh {
      */
     void scheduleExpiry(boolean expires, int ttl) {
         observeExpiry(expires, ttl);
-        if (!expires) {
-            cancelTimer();
-        } else if (flow != null) {
-            scheduleTimer(flow.renewalDelayMillis(ttl), TimeUnit.MILLISECONDS);
+        if (expires) {
+            scheduleTimer(renewalDelayMillis(ttl), TimeUnit.MILLISECONDS);
         } else {
-            scheduleTimer(ttl, TimeUnit.SECONDS);
+            cancelTimer();
         }
     }
 
 
-    // Records the expiry of the connection token, as the flow needs it for the next connect, whatever the state.
-    private void observeExpiry(boolean expires, int ttl) {
+    /** Records the expiry of the connection token for the token exchange, whatever the state of the client. */
+    void observeExpiry(boolean expires, int ttl) {
         if (flow != null) {
-            flow.observe(host.connectionToken(), expires, ttl);
+            flow.observe(expires, ttl);
         }
+    }
+
+
+    // The delay of the refresh timer for a ttl in seconds: a random share of it with a token exchange, the ttl otherwise.
+    private long renewalDelayMillis(int ttl) {
+        return flow == null ? ttl * 1000L : flow.renewalDelayMillis(ttl);
     }
 
 
@@ -263,7 +260,7 @@ final class AuthRefresh {
         commandInFlight = false;
         timerSuperseded = false;
         if (flow != null) {
-            flow.reset(code == Client.DISCONNECTED_DISCONNECT_CALLED || terminal);
+            flow.reset(code, terminal);
         }
     }
 
@@ -296,7 +293,7 @@ final class AuthRefresh {
 
     // The timer fired: fetch a token and refresh with it, under the single-flight gate.
     void onTimer(long generation) {
-        if (generation != timerGeneration || host.tokenGetter() == null) {
+        if (generation != timerGeneration || timerTokenGetter() == null) {
             return;
         }
         timer = null;
@@ -306,6 +303,12 @@ final class AuthRefresh {
         }
         inFlight = true;
         fetchAndRefresh();
+    }
+
+
+    // The getter of the timer refresh: the renewal of the token exchange, or else the token getter of the options.
+    private ConnectionTokenGetter timerTokenGetter() {
+        return flow == null ? host.tokenGetter() : flow.renewalGetter();
     }
 
 
@@ -320,7 +323,7 @@ final class AuthRefresh {
         // A getter which throws fails the fetch as an error does, so the refresh still completes.
         CompletableFuture<String> fetched = new CompletableFuture<>();
         try {
-            host.tokenGetter().getConnectionToken(new ConnectionTokenEvent(), (Throwable err, String token) -> {
+            timerTokenGetter().getConnectionToken(new ConnectionTokenEvent(), (Throwable err, String token) -> {
                 if (err != null) {
                     fetched.completeExceptionally(err);
                 } else {
@@ -331,7 +334,7 @@ final class AuthRefresh {
             fetched.completeExceptionally(e);
         }
         fetched.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS)
-                .whenComplete((String token, Throwable err) -> host.runOrInline(() -> onTokenFetched(transport, generation, Extensions.unwrapCompletion(err), token)));
+                .whenComplete((String token, Throwable err) -> runOnExecutorOrInline(() -> onTokenFetched(transport, generation, Extensions.unwrapCompletion(err), token)));
     }
 
 
@@ -359,8 +362,12 @@ final class AuthRefresh {
                 return;
             }
             if (err != null) {
-                scheduleRetry();
-                host.reportError(new TokenError(err));
+                if (err instanceof UnauthorizedException) {
+                    host.failUnauthorized();
+                } else {
+                    scheduleRetry();
+                    host.reportError(new TokenError(err));
+                }
                 return;
             }
             if (token == null || token.equals("")) {
@@ -368,7 +375,7 @@ final class AuthRefresh {
                 return;
             }
             commandInFlight = true;
-            sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> host.runOrInline(() -> finishTimer(transport, token, error, result)));
+            sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> runOnExecutorOrInline(() -> finishTimer(transport, token, error, result)));
             awaitingCommand = true;
         } finally {
             if (!awaitingCommand) {
@@ -448,9 +455,7 @@ final class AuthRefresh {
             connectTokenStored = false;
             timerSuperseded = false;
             refreshGeneration++;
-            if (flow != null) {
-                flow.tokenAccepted();
-            }
+            tokenAccepted();
             if (host.state() == ClientState.CONNECTED) {
                 scheduleExpiry(result.getExpires(), result.getTtl());
             } else {
@@ -478,7 +483,7 @@ final class AuthRefresh {
         inFlightToken = token;
         inFlightCallbacks = callbacks;
         commandInFlight = true;
-        sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> host.runOrInline(() -> finishRequested(token, error, result, callbacks)));
+        sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> runOnExecutorOrInline(() -> finishRequested(token, error, result, callbacks)));
     }
 
 
@@ -498,7 +503,7 @@ final class AuthRefresh {
         // One stage delivers the outcome, so a callback which throws is never called a second time.
         f.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS).handle((Protocol.Reply reply, Throwable e) -> {
             if (e != null) {
-                host.runOrInline(() -> {
+                runOnExecutorOrInline(() -> {
                     host.cleanCommand(cmd);
                     cb.onDone(Extensions.unwrapCompletion(e), null);
                 });
@@ -520,6 +525,16 @@ final class AuthRefresh {
             // The command could not be sent: the stage above delivers the failure once, as it does a failed reply.
             f.completeExceptionally(e);
         }
+    }
+
+
+    // Runs the task on the executor. Once the executor is shut down, which is after the client closed, a late
+    // completion runs the task inline on the completing thread instead, so the callbacks of the refresh still
+    // run exactly once. The task then only settles the callbacks: the client is closed. A failure of an inline
+    // task goes to the listener. Package-private: the token exchange runs its callbacks the same way.
+    void runOnExecutorOrInline(Runnable task) {
+        Runnable reported = host.reporting(task);
+        Extensions.submitOrRun(host.executor(), reported, reported);
     }
 
 

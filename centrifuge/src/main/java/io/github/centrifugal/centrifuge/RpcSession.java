@@ -778,26 +778,25 @@ final class RpcSession {
     // Hands the outcome to the callback. A callback which throws is reported to the listener: the executor would
     // drop the failure of the task, and nothing else would tell the caller of the call.
     private void deliverReporting(RpcCall call, Protocol.Reply reply, Throwable error) {
-        host.reporting(() -> deliver(host, call.callback, reply, error)).run();
+        host.reporting(() -> deliver(call, reply, error)).run();
     }
 
 
     // Hands the outcome of the call to its callback. Reads no session state, so it is safe once the
     // session is gone with the executor.
-    // Shared with the token exchange, whose plain rpc calls are delivered as the client's calls are.
-    static void deliver(ClientHost host, ResultCallback<RPCResult> callback, Protocol.Reply reply, Throwable error) {
+    private void deliver(RpcCall call, Protocol.Reply reply, Throwable error) {
         if (reply == null) {
-            callback.onDone(Extensions.unwrapCompletion(error), null);
+            call.callback.onDone(Extensions.unwrapCompletion(error), null);
             return;
         }
         if (reply.getError().getCode() != 0) {
-            callback.onDone(host.replyError(reply), null);
+            call.callback.onDone(host.replyError(reply), null);
             return;
         }
         Protocol.RPCResult rpcResult = reply.getRpc();
         RPCResult result = new RPCResult();
         result.setData(rpcResult.getData().toByteArray());
         result.setCached(rpcResult.getCached());
-        callback.onDone(null, result);
+        call.callback.onDone(null, result);
     }
 }

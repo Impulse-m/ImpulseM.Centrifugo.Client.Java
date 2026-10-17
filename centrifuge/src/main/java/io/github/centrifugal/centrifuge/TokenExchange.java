@@ -58,7 +58,8 @@ public abstract class TokenExchange {
     /**
      * The grace in seconds: how long the issuer keeps accepting the refresh token an exchange consumed. It is
      * the horizon of a refusal run, measured from the first refusal, and is used until the issuer publishes one in
-     * a {@link TokenExchangeResult}. Clamped to 0..300. Default 30.
+     * a {@link TokenExchangeResult}. Clamped to 0..300. Default 30. A negative value makes the client creation throw
+     * IllegalArgumentException.
      */
     public int grace() {
         return 30;

@@ -51,17 +51,8 @@ final class ClientHost {
     }
 
 
-    /** Follows the flow the client was created with, not the option, which may change later. */
     ConnectionTokenGetter tokenGetter() {
-        if (client.auth.hasFlow()) {
-            return client.auth.exchangeTokenGetter();
-        }
         return client.getOpts().getTokenGetter();
-    }
-
-
-    TokenExchange tokenExchange() {
-        return client.getOpts().getTokenExchange();
     }
 
 
@@ -245,13 +236,8 @@ final class ClientHost {
     }
 
 
-    /**
-     * Runs the task on the executor, from any thread. Once the executor is shut down, which is after the client closed,
-     * a late completion runs the task inline on the completing thread, so the callbacks still run exactly once.
-     * A failure of the task goes to the listener.
-     */
+    /** Runs the task on the executor, or inline once the client closed, see {@link AuthRefresh#runOnExecutorOrInline}. */
     void runOrInline(Runnable task) {
-        Runnable reported = reporting(task);
-        Extensions.submitOrRun(executor(), reported, reported);
+        client.auth.runOnExecutorOrInline(task);
     }
 }

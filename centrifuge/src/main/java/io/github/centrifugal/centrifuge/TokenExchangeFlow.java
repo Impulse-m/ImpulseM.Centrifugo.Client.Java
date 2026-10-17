@@ -111,13 +111,15 @@ final class TokenExchangeFlow {
 
 
     /**
-     * Rejects a client which sets both a token exchange and a token getter, or a refusal type which is null or empty.
-     * Called by the client constructor.
+     * The flow of a client created with a token exchange, or null without one. Rejects a client which sets both a token
+     * exchange and a token getter, a refusal type which is null or empty, and a negative grace. Called by the client
+     * constructor.
      */
-    static void check(Options opts) {
+    static TokenExchangeFlow create(ClientHost host) {
+        Options opts = host.options();
         TokenExchange exchange = opts.getTokenExchange();
         if (exchange == null) {
-            return;
+            return null;
         }
         if (opts.getTokenGetter() != null) {
             throw new IllegalArgumentException("tokenExchange and tokenGetter are exclusive");
@@ -127,10 +129,14 @@ final class TokenExchangeFlow {
                 throw new IllegalArgumentException("refusalTypes() holds a null or empty entry");
             }
         }
+        if (exchange.grace() < 0) {
+            throw new IllegalArgumentException("grace() is negative");
+        }
+        return new TokenExchangeFlow(host, exchange);
     }
 
 
-    TokenExchangeFlow(ClientHost host, TokenExchange exchange) {
+    private TokenExchangeFlow(ClientHost host, TokenExchange exchange) {
         this.host = host;
         this.exchange = exchange;
         this.refusalTypes = new LinkedHashSet<>(refusalTypesOf(exchange));
@@ -224,7 +230,8 @@ final class TokenExchangeFlow {
 
 
     /** Records when the connection token expires, from a reply which carried it. An empty token has no record. */
-    void observe(String token, boolean expires, int ttl) {
+    void observe(boolean expires, int ttl) {
+        String token = host.connectionToken();
         if (!expires || token == null || token.isEmpty()) {
             expiry = null;
             return;
@@ -239,12 +246,12 @@ final class TokenExchangeFlow {
      * for, or a terminal one, ends the session: its attempts restart with the next connect and its refusal run closes.
      * The expiry record is kept.
      */
-    void reset(boolean endsSession) {
+    void reset(int code, boolean terminal) {
         if (bootstrap != null) {
             abandon(bootstrap);
         }
         anonymousConnect = false;
-        if (endsSession) {
+        if (code == Client.DISCONNECTED_DISCONNECT_CALLED || terminal) {
             bootstrapAttempt = 0;
             closeRefusalRun();
         }
@@ -312,8 +319,25 @@ final class TokenExchangeFlow {
                         .setData(com.google.protobuf.ByteString.copyFrom(data)));
         final ResultCallback<RPCResult> classified = classifyRefusal(cb, refusalTypes);
         writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> {
-            host.runOrInline(() -> RpcSession.deliver(host, classified, reply, err));
+            host.runOrInline(() -> deliverRpc(host, classified, reply, err));
         });
+    }
+
+
+    // Hands the outcome of a plain rpc to its callback, as RpcSession hands a call's outcome to its callback.
+    private static void deliverRpc(ClientHost host, ResultCallback<RPCResult> cb, Protocol.Reply reply, Throwable err) {
+        if (reply == null) {
+            cb.onDone(Extensions.unwrapCompletion(err), null);
+            return;
+        }
+        if (reply.getError().getCode() != 0) {
+            cb.onDone(host.replyError(reply), null);
+            return;
+        }
+        RPCResult result = new RPCResult();
+        result.setData(reply.getRpc().getData().toByteArray());
+        result.setCached(reply.getRpc().getCached());
+        cb.onDone(null, result);
     }
 
 
@@ -410,7 +434,7 @@ final class TokenExchangeFlow {
             TokenExchangeResult result
     ) {
         cancelTimer(b);
-        if (err == null) {
+        if (err == null && isAccepted(result)) {
             acceptedExchange(result);
         } else if (err instanceof UnauthorizedException) {
             // A refusal which arrives after its connection went away starts the run too: the horizon counts from it.
@@ -520,6 +544,13 @@ final class TokenExchangeFlow {
 
     private static boolean isEmptyToken(String token) {
         return token == null || token.isEmpty();
+    }
+
+
+    // Whether a result which came without an error carries an access token. One which does not is a failure of the
+    // exchange: it leaves an open refusal run open, as a thrown error does.
+    private static boolean isAccepted(TokenExchangeResult result) {
+        return result != null && !isEmptyToken(result.getToken());
     }
 
 
@@ -763,7 +794,7 @@ final class TokenExchangeFlow {
                 } else {
                     host.runOrInline(() -> {
                         Throwable failure = Extensions.unwrapCompletion(err);
-                        if (failure == null) {
+                        if (failure == null && isAccepted(result)) {
                             acceptedExchange(result);
                         } else if (failure instanceof UnauthorizedException) {
                             // A refusal which arrives after the deadline starts the run too, as one within the deadline does.
@@ -803,7 +834,7 @@ final class TokenExchangeFlow {
         if (renewal.deadline != null) {
             renewal.deadline.cancel(false);
         }
-        if (err == null) {
+        if (err == null && isAccepted(result)) {
             acceptedExchange(result);
         } else if (err instanceof UnauthorizedException) {
             openRefusalRun();
