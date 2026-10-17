@@ -353,6 +353,28 @@ public class RpcPoolTokenTest extends RpcTestBase {
 
 
     @Test
+    public void aCallLostWithARetiredConnectionIsNotSentAgain() throws Exception {
+        firstTtl = 1;
+        renewedUser = "u2";
+        serveMain();
+        FakeCentrifugoServer endpoint = newPoolServer();
+        servePool(endpoint, null, true);
+        expiringConnects(endpoint, 1);
+        Client main = exchangeClient(new Storage("refresh-1"), null);
+        connect(main);
+        RpcPool pool = build(builderOn(main, endpoint));
+        CompletableFuture<RPCResult> call = submit(pool);
+        awaitCondition("the call is on the wire", () -> rpcCount(endpoint) == 1);
+        // The main client moves to the other identity. The connection's refresh at its expiry finds its token stale and retires
+        // the connection, which the server then ends with the call still on the wire: the call settles with that loss.
+        assertTrue(errorOf(call) instanceof IOException);
+        assertEquals("the call was not sent again", 1, rpcCount(endpoint));
+        assertEquals("no connection was opened for it", Collections.singletonList(ACCESS_TOKEN), connectTokensOf(endpoint));
+        awaitCondition("the retired connection is closed", () -> pool.stats().getConnections() == 0);
+    }
+
+
+    @Test
     public void aStaticTokenRefusalFailsTheConnectionAsUnauthorizedWithoutAGetter() throws Exception {
         FakeCentrifugoServer endpoint = newPoolServer();
         servePool(endpoint, "static-1", false);
