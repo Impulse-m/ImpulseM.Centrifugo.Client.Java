@@ -179,6 +179,8 @@ final class TokenExchangeFlow {
         }
         anonymousConnect = false;
         if (!reply.getConnect().getUser().isEmpty()) {
+            // The access token was accepted, so the session is alive: a refusal run of an earlier dead session is over.
+            closeRefusalRun();
             return false;
         }
         // The server pings the connection from now on, during the bootstrap too: the ping is answered as a connected one is.
@@ -475,9 +477,10 @@ final class TokenExchangeFlow {
     }
 
 
-    // Whether the horizon of the open run has passed.
+    // Whether the horizon of the open run has passed. No open run has no horizon left: an application which closed the
+    // client while its storage was read closes the run inside that read.
     private boolean horizonPassed() {
-        return horizon.getDelay(TimeUnit.MILLISECONDS) <= 0;
+        return horizon == null || horizon.getDelay(TimeUnit.MILLISECONDS) <= 0;
     }
 
 

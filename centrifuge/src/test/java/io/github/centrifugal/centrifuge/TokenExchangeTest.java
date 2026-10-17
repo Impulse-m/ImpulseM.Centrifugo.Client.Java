@@ -706,6 +706,75 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
+    public void connectWithAValidTokenClosesTheRefusalRunOfAnEarlierDeadSession() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        AtomicBoolean refusing = new AtomicBoolean();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public int grace() {
+                return 5;
+            }
+
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                if (refusing.get()) {
+                    exchanged.add(event.getRefreshToken());
+                    cb.onDone(new UnauthorizedException(), null);
+                    return;
+                }
+                super.exchange(event, cb);
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("connected", () -> connected.size() == 1);
+        long delay = renewalDelay(clock);
+
+        // The renewal is refused: a refusal run opens and its one retry is pending.
+        refusing.set(true);
+        clock.advance(delay);
+        awaitCondition("refusal reported", () -> errors.size() == 1);
+        // The retry of the refused renewal is armed after the error is reported: the transport is lost only once it is.
+        awaitCondition("retry armed", () -> {
+            long last = lastRequestedDelay(clock);
+            return last >= RETRY_MIN_MILLIS && last <= RETRY_MAX_MILLIS;
+        });
+        assertTrue(disconnects.isEmpty());
+        assertNotNull(horizonOf());
+
+        // The transport is lost with the retry, and the reconnect carries the still valid access token: the session is alive.
+        refusing.set(false);
+        server.connectResult = server.connectResult.toBuilder()
+                .setUser("u1")
+                .setAuthClass("authenticated")
+                .setExpires(true)
+                .setTtl(TTL_SECONDS)
+                .build();
+        int windows = renewalTimers(clock);
+        server.closeConnection();
+        // The loss is noticed before the clock moves: the retry of the refused renewal is cancelled with the connection.
+        awaitCondition("transport lost", () -> client.getState() == ClientState.CONNECTING);
+        pumpUntil(clock, "reconnected", () -> connected.size() == 2);
+        awaitCondition("renewal timer of the reconnect", () -> renewalTimers(clock) > windows);
+        assertNull(horizonOf());
+
+        // Later, past the old horizon, a single refusal is a first refusal of a new run: its one retry follows, no verdict yet.
+        refusing.set(true);
+        clock.advance(WINDOW_MAX_MILLIS);
+        awaitCondition("second refusal reported", () -> errors.size() == 2);
+        assertTrue(disconnects.isEmpty());
+        assertNotNull(horizonOf());
+
+        pumpUntil(clock, "verdict", () -> disconnects.size() == 1);
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        // The bootstrap's exchange, then the refused renewal of the first run, then the two refusals of the second run.
+        assertEquals(Arrays.asList("refresh-1", "refresh-2", "refresh-2", "refresh-2"), storage.exchanged);
+    }
+
+
+    @Test
     public void terminalDisconnectClosesTheRefusalRun() throws Exception {
         // A refusal opens the run, then the server ends the session with a terminal close code. The run closes with the
         // session, so the anonymous connect after the storage was emptied goes on anonymously, not as a dead session.
@@ -2111,6 +2180,25 @@ public class TokenExchangeTest extends RpcTestBase {
     private long renewalDelay(ManualScheduler clock) throws InterruptedException {
         awaitCondition("renewal timer", () -> renewalDelayIn(clock) != null);
         return renewalDelayIn(clock);
+    }
+
+
+    // The delay of the task scheduled last, or -1 when none was.
+    private static long lastRequestedDelay(ManualScheduler clock) {
+        List<Long> delays = clock.requestedDelays();
+        return delays.isEmpty() ? -1L : delays.get(delays.size() - 1);
+    }
+
+
+    // The number of the scheduled delays inside the renewal window, so far.
+    private static int renewalTimers(ManualScheduler clock) {
+        int count = 0;
+        for (long delay : clock.requestedDelays()) {
+            if (delay >= WINDOW_MIN_MILLIS && delay <= WINDOW_MAX_MILLIS) {
+                count++;
+            }
+        }
+        return count;
     }
 
 
