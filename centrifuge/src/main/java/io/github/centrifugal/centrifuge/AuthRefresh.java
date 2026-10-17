@@ -342,6 +342,12 @@ final class AuthRefresh {
             if (transport != host.transport() || host.state() == ClientState.CLOSED) {
                 return;
             }
+            // The session is over whatever asked for the token: the application removed its refresh token, or the issuer
+            // refused it past the grace horizon. A refresh() which waits for this fetch does not keep the session.
+            if (err instanceof UnauthorizedException) {
+                host.failUnauthorized();
+                return;
+            }
             if (host.state() != ClientState.CONNECTED) {
                 keepTimerTokenForConnect(err, token, generation);
                 return;
@@ -353,12 +359,8 @@ final class AuthRefresh {
                 return;
             }
             if (err != null) {
-                if (err instanceof UnauthorizedException) {
-                    host.failUnauthorized();
-                } else {
-                    scheduleRetry();
-                    host.reportError(new TokenError(err));
-                }
+                scheduleRetry();
+                host.reportError(new TokenError(err));
                 return;
             }
             if (token == null || token.equals("")) {

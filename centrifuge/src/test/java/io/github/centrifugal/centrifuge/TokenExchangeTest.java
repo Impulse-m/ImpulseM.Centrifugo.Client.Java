@@ -1901,6 +1901,68 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
+    public void emptyRefreshTokenAfterARenewalRefusalEndsTheSessionAtOnce() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        AtomicBoolean refusing = new AtomicBoolean();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                if (refusing.get()) {
+                    // The application removes its refresh token while the issuer refuses it: the re-read finds nothing.
+                    exchanged.add(event.getRefreshToken());
+                    refreshToken = "";
+                    cb.onDone(new UnauthorizedException(), null);
+                    return;
+                }
+                super.exchange(event, cb);
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("connected", () -> connected.size() == 1);
+        long delay = renewalDelay(clock);
+
+        refusing.set(true);
+        clock.advance(delay);
+        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1);
+
+        // The session ends at the re-read: no retry is pending, and the refusal is not reported as a retryable error.
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        assertTrue(errors.isEmpty());
+        assertEquals(Arrays.asList("refresh-1", "refresh-2"), storage.exchanged);
+    }
+
+
+    @Test
+    public void emptyRefreshTokenAtRenewalEndsTheSessionWhileARefreshCallWaits() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        // The renewal exchange, the second one, is held until the test answers it.
+        StallingStorage storage = new StallingStorage("refresh-1", 2);
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("connected", () -> connected.size() == 1);
+        long delay = renewalDelay(clock);
+
+        clock.advance(delay);
+        awaitCondition("renewal exchange held", () -> storage.held != null);
+        // A refresh call waits behind the renewal. The renewal is then refused, and the storage holds no token any more.
+        client.refresh("manual-token", (Throwable err, AuthResult result) -> {
+        });
+        storage.refreshToken = "";
+        storage.held.onDone(new UnauthorizedException(), null);
+
+        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1);
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        // The waiting refresh was never sent: the session ended before it could run.
+        assertEquals(Arrays.asList("access-1"), refreshTokens());
+    }
+
+
+    @Test
     public void storeFailureIsReportedAndBootstrapCompletes() throws Exception {
         answerExchanges("access-1|refresh-2");
         answerIdentity(false, 0);
