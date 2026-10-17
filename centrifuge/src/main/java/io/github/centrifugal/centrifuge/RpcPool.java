@@ -14,8 +14,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.Delayed;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
@@ -337,6 +339,7 @@ public final class RpcPool {
         private int maxInflightPerConnection = 1;
         private int maxQueued = 64;
         private long idleTimeout = 60_000L;
+        private boolean removeCancelledTimers = true;
         private int retries = RpcSession.LATER_RESENDS;
         private Function<ReplyError, String> reroute;
         private RedirectHook redirect;
@@ -514,6 +517,14 @@ public final class RpcPool {
         }
 
 
+        // Whether the scheduler drops a cancelled timer at once. The tests turn it off to run the fallback of the
+        // platforms below Android API 21, where a cancelled timer stays queued until its delay ends.
+        Builder removeCancelledTimers(boolean removeCancelledTimers) {
+            this.removeCancelledTimers = removeCancelledTimers;
+            return this;
+        }
+
+
         public RpcPool build() {
             return new RpcPool(this);
         }
@@ -532,6 +543,7 @@ public final class RpcPool {
     private final int maxInflightPerConnection;
     private final int maxQueued;
     private final long idleTimeoutMillis;
+    private final boolean removeCancelledTimers;
     private final int retries;
     private final Function<ReplyError, String> reroute;
     private final RedirectHook redirectHook;
@@ -550,6 +562,8 @@ public final class RpcPool {
     private final Map<String, List<RpcPoolEndpoint>> resolved = new HashMap<>();
     private final Map<String, RpcPoolEndpoint> endpoints = new HashMap<>();
     private final Deque<RpcPoolCall> redirectWaiting = new ArrayDeque<>();
+    // The one check of the idle connections, armed while there may be one; never cancelled, so it leaves no cancelled timer.
+    private ScheduledFuture<?> idleCheck;
     private OkHttpClient fetchHttpClient;
     private int redirectsInflight;
     private boolean closed;
@@ -634,7 +648,7 @@ public final class RpcPool {
             releaseLost(conn);
             pump();
             if (idle(conn)) {
-                scheduleIdle(conn);
+                markIdle(conn);
             }
         }
     }
@@ -703,6 +717,7 @@ public final class RpcPool {
         this.maxInflightPerConnection = builder.maxInflightPerConnection;
         this.maxQueued = builder.maxQueued;
         this.idleTimeoutMillis = builder.idleTimeout;
+        this.removeCancelledTimers = builder.removeCancelledTimers;
         this.retries = builder.retries;
         this.reroute = builder.reroute;
         this.redirectHook = builder.redirect;
@@ -723,7 +738,7 @@ public final class RpcPool {
             poolThread.set(thread);
             return thread;
         };
-        ScheduledThreadPoolExecutor executor = newScheduler(factory);
+        ScheduledThreadPoolExecutor executor = newScheduler(factory, removeCancelledTimers);
         executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         return executor;
     }
@@ -731,8 +746,11 @@ public final class RpcPool {
 
     // A scheduler of one thread, whose cancelled timers leave its queue at once: a cancelled deadline must not keep its call
     // alive until its delay ends. The policy is missing below Android API 21, where the cancelled timers stay queued.
-    private static ScheduledThreadPoolExecutor newScheduler(ThreadFactory factory) {
+    private static ScheduledThreadPoolExecutor newScheduler(ThreadFactory factory, boolean removeCancelled) {
         ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, factory);
+        if (!removeCancelled) {
+            return scheduler;
+        }
         try {
             scheduler.setRemoveOnCancelPolicy(true);
         } catch (NoSuchMethodError e) {
@@ -925,7 +943,7 @@ public final class RpcPool {
         RpcPoolConnection conn = new RpcPoolConnection(this, endpoint, options);
         endpoint.connections().add(conn);
         conn.connect();
-        scheduleIdle(conn);
+        markIdle(conn);
     }
 
 
@@ -934,7 +952,6 @@ public final class RpcPool {
             queue.remove(call);
             call.queued = false;
         }
-        cancelIdle(conn);
         conn.calls.add(call);
         call.connection = conn;
         call.endpointUrl = conn.endpoint.url();
@@ -977,7 +994,7 @@ public final class RpcPool {
             }
         }
         if (idle(conn)) {
-            scheduleIdle(conn);
+            markIdle(conn);
         }
         pump();
     }
@@ -1214,7 +1231,7 @@ public final class RpcPool {
             RpcPoolConnection conn = call.connection;
             call.connection = null;
             if (idle(conn)) {
-                scheduleIdle(conn);
+                markIdle(conn);
             }
         }
         if (call.redirectWaiting) {
@@ -1267,28 +1284,52 @@ public final class RpcPool {
     }
 
 
-    // A connection with no call is closed after the idle timeout; the timer runs only when the timeout is set.
-    private void scheduleIdle(RpcPoolConnection conn) {
-        if (idleTimeoutMillis <= 0L || conn.removed || closed) {
+    // Called when a connection may have become idle: it records the moment, and arms the one idle check of the pool if
+    // none is armed. Nothing is cancelled here, so a call does not leave a timer behind it.
+    private void markIdle(RpcPoolConnection conn) {
+        conn.idleSince = System.nanoTime();
+        if (idleTimeoutMillis > 0L && idleCheck == null && !closed) {
+            armIdleCheck(TimeUnit.MILLISECONDS.toNanos(idleTimeoutMillis));
+        }
+    }
+
+
+    private void armIdleCheck(long delayNanos) {
+        idleCheck = executor.schedule(this::onIdleCheck, delayNanos, TimeUnit.NANOSECONDS);
+    }
+
+
+    // Closes the connections which have been idle for the timeout, and arms the check again for the next of the others.
+    // It runs only while a connection may be idle, and each run sweeps the connections of the pool once.
+    private void onIdleCheck() {
+        idleCheck = null;
+        if (closed) {
             return;
         }
-        cancelIdle(conn);
-        conn.idleTask = executor.schedule(() -> onIdle(conn), idleTimeoutMillis, TimeUnit.MILLISECONDS);
-    }
-
-
-    private void cancelIdle(RpcPoolConnection conn) {
-        if (conn.idleTask != null) {
-            conn.idleTask.cancel(false);
-            conn.idleTask = null;
+        long now = System.nanoTime();
+        long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(idleTimeoutMillis);
+        long nextNanos = -1L;
+        List<RpcPoolConnection> expired = new ArrayList<>();
+        for (RpcPoolEndpoint endpoint : endpoints.values()) {
+            for (RpcPoolConnection conn : endpoint.connections()) {
+                if (!idle(conn)) {
+                    continue;
+                }
+                long remaining = conn.idleSince + timeoutNanos - now;
+                if (remaining <= 0L) {
+                    expired.add(conn);
+                } else if (nextNanos < 0L || remaining < nextNanos) {
+                    nextNanos = remaining;
+                }
+            }
         }
-    }
-
-
-    private void onIdle(RpcPoolConnection conn) {
-        conn.idleTask = null;
-        if (!conn.removed && idle(conn)) {
+        for (RpcPoolConnection conn : expired) {
             remove(conn);
+        }
+        if (nextNanos >= 0L) {
+            armIdleCheck(nextNanos);
+        }
+        if (!expired.isEmpty()) {
             pump();
         }
     }
@@ -1301,7 +1342,6 @@ public final class RpcPool {
             return;
         }
         conn.removed = true;
-        cancelIdle(conn);
         conn.endpoint.connections().remove(conn);
         conn.close();
     }
@@ -1325,6 +1365,18 @@ public final class RpcPool {
             }
         }
         executor.shutdown();
+    }
+
+
+    // The delays of the timers the scheduler holds, in nanoseconds, for the tests of the timers.
+    List<Long> timerDelays() {
+        List<Long> delays = new ArrayList<>();
+        for (Runnable task : executor.getQueue().toArray(new Runnable[0])) {
+            if (task instanceof Delayed) {
+                delays.add(((Delayed) task).getDelay(TimeUnit.NANOSECONDS));
+            }
+        }
+        return delays;
     }
 
 

@@ -333,6 +333,48 @@ public class RpcPoolTest extends RpcTestBase {
 
 
     @Test
+    public void aConnectionWithACallOnTheWireIsNotClosedByTheIdleTimeout() throws Exception {
+        server.deferCommand = cmd -> cmd.hasRpc();
+        RpcPool pool = build(builder().idleTimeout(100L));
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
+        awaitCondition("the call on the wire", () -> pool.stats().getInflight() == 1);
+        Thread.sleep(400L);
+        assertEquals("the connection of a call on the wire stays open past the idle timeout", 1, pool.stats().getConnections());
+        assertTrue("the call is still waiting", !future.isDone());
+        awaitAll(Collections.singletonList(future), true);
+        awaitCondition("the connection is closed once its call has ended", () -> pool.stats().getConnections() == 0);
+    }
+
+
+    @Test
+    public void theIdleCheckIsNotRearmedByEachCallOnTheFallbackScheduler() throws Exception {
+        answerRpcs("ok");
+        // A timeout of an hour tells the idle check apart from the deadlines of the calls, which last ten seconds.
+        RpcPool pool = build(builder().removeCancelledTimers(false).idleTimeout(TimeUnit.HOURS.toMillis(1L)));
+        for (int i = 0; i < 50; i++) {
+            CompletableFuture<RPCResult> future = new CompletableFuture<>();
+            pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(10_000L).build(), into(future));
+            future.get(5, TimeUnit.SECONDS);
+        }
+        assertEquals("one connection, kept open", 1, pool.stats().getConnections());
+        assertEquals("one idle check for all the calls, not one cancelled timer per call", 1,
+                timersLongerThan(pool, TimeUnit.MINUTES.toNanos(30L)));
+    }
+
+
+    private static int timersLongerThan(RpcPool pool, long nanos) {
+        int count = 0;
+        for (Long delay : pool.timerDelays()) {
+            if (delay > nanos) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+
+    @Test
     public void aPoolWithoutIdleTimeoutKeepsItsConnection() throws Exception {
         AtomicInteger connects = new AtomicInteger();
         server.onCommand = cmd -> {

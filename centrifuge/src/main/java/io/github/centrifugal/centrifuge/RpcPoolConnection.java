@@ -4,7 +4,6 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ScheduledFuture;
 
 
 /**
@@ -24,8 +23,8 @@ final class RpcPoolConnection {
     boolean connecting = true;
     // The pool has dropped the connection: no call goes to it, and it is closed.
     boolean removed;
-    // The idle close of the connection, when it has no call and the pool has an idle timeout.
-    ScheduledFuture<?> idleTask;
+    // When the connection last became idle (nanoTime), read by the pool's idle check; not meaningful while it has a call.
+    long idleSince;
     // The server closed the connection for a frame over its size limit, with this reason: the lost calls are settled, not sent again.
     boolean sizeLimited;
     String closeReason;
