@@ -1,10 +1,8 @@
 package io.github.centrifugal.centrifuge;
 
 import java.io.IOException;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -64,7 +62,8 @@ public final class RpcPool {
         /**
          * The endpoints of the key, each a {@code ws://} or {@code wss://} URL, at least one. The pool
          * calls it on its thread once per key, until the pool is closed, and a key which resolves to
-         * nothing rejects its calls with {@link RpcPool#BAD_CONFIGURATION}.
+         * nothing rejects its calls with {@link RpcPool#BAD_CONFIGURATION}. The pool's thread waits for
+         * the resolver, so it must not block.
          */
         List<String> endpoints(String endpointKey);
     }
@@ -598,7 +597,8 @@ public final class RpcPool {
     private final Map<String, RpcPoolEndpoint> endpoints = new HashMap<>();
     // The connections taken out of their endpoints, which close once their last call settles.
     private final Set<RpcPoolConnection> retiring = new HashSet<>();
-    private final Deque<RpcPoolCall> redirectWaiting = new ArrayDeque<>();
+    // The calls whose redirect waits for a fetch slot, in order. They count in the queued calls of the pool.
+    private final RpcPoolQueue redirectWaiting = new RpcPoolQueue();
     // The one check of the idle connections, armed while there may be one; never cancelled, so it leaves no cancelled timer.
     private ScheduledFuture<?> idleCheck;
     private OkHttpClient fetchHttpClient;
@@ -901,6 +901,13 @@ public final class RpcPool {
         // A queued call's key has resolved: it resolved when the call was started or rerouted, and the resolution is kept.
         List<RpcPoolEndpoint> eps = resolved.get(endpointKey);
         if (closed || queue == null || queue.isEmpty() || eps == null) {
+            return;
+        }
+        // The main client's session ended as unauthorized: the waiting calls fail, as a call started now does, and none opens a connection.
+        if (source != null && source.ended()) {
+            while (!queue.isEmpty()) {
+                settle(queue.first(), null, new IOException("unauthorized"));
+            }
             return;
         }
         retireStale(eps);
@@ -1239,95 +1246,56 @@ public final class RpcPool {
         call.redirect = target;
         if (redirectsInflight < maxRedirectsInflight) {
             fetch(call);
-        } else {
-            redirectWaiting.add(call);
-            call.redirectWaiting = true;
+            return;
         }
+        // A fetch which would wait counts in the pool-wide bound, as a call which waits for a connection does.
+        if (queuedCount >= maxQueued) {
+            settle(call, null, new ReplyError(ReplyError.LIMIT_EXCEEDED, "too many rpc calls are waiting", false));
+            return;
+        }
+        redirectWaiting.addLast(call);
+        queuedCount++;
     }
 
 
+    // Requests the redirect URL, on the pool's thread. The answer comes back on the OkHttp thread. The client follows no
+    // redirect: a 3xx answer fails the fetch with the redirect error, since the URL it names was never checked.
     private void fetch(RpcPoolCall call) {
         redirectsInflight++;
         try {
-            HttpUrl first = HttpUrl.get(call.redirect.getUrl());
-            hop(call, first, first, RpcPoolRedirect.MAX_HOPS);
+            Request request = RpcPoolRedirect.request(HttpUrl.get(call.redirect.getUrl()), call.redirect);
+            final long maxBytes = call.redirect.getMaxBytes();
+            call.redirectCall = fetchClient().newCall(request);
+            call.redirectCall.enqueue(new Callback() {
+                @Override
+                public void onFailure(okhttp3.Call httpCall, IOException e) {
+                    post(() -> onFetchDone(call, null, e));
+                }
+
+
+                @Override
+                public void onResponse(okhttp3.Call httpCall, Response response) {
+                    byte[] body = null;
+                    IOException failure = null;
+                    try {
+                        body = RpcPoolRedirect.readBody(response, maxBytes);
+                    } catch (IOException e) {
+                        failure = e;
+                    } catch (RuntimeException e) {
+                        failure = new IOException("redirect body could not be read", e);
+                    } finally {
+                        response.close();
+                    }
+                    final byte[] bodyOnce = body;
+                    final IOException failureOnce = failure;
+                    post(() -> onFetchDone(call, bodyOnce, failureOnce));
+                }
+            });
         } catch (IllegalArgumentException e) {
             redirectsInflight--;
             settle(call, null, new ReplyError(REDIRECT_FAILED, "redirect could not be requested", false));
             startWaitingRedirects();
         }
-    }
-
-
-    // Requests one hop of a fetch, on the pool's thread. The answer comes back on the OkHttp thread.
-    private void hop(RpcPoolCall call, HttpUrl url, HttpUrl allowedUrl, int hopsLeft) {
-        final String endpoint = call.endpointUrl;
-        final long maxBytes = call.redirect.getMaxBytes();
-        Request request = RpcPoolRedirect.request(url, allowedUrl, call.redirect);
-        call.redirectCall = fetchClient().newCall(request);
-        call.redirectCall.enqueue(new Callback() {
-            @Override
-            public void onFailure(okhttp3.Call httpCall, IOException e) {
-                post(() -> onFetchDone(call, null, e));
-            }
-
-
-            @Override
-            public void onResponse(okhttp3.Call httpCall, Response response) {
-                if (RpcPoolRedirect.isRedirect(response)) {
-                    onRedirectResponse(call, response, endpoint, allowedUrl, hopsLeft);
-                    return;
-                }
-                byte[] body = null;
-                IOException failure = null;
-                try {
-                    body = RpcPoolRedirect.readBody(response, maxBytes);
-                } catch (IOException e) {
-                    failure = e;
-                } catch (RuntimeException e) {
-                    failure = new IOException("redirect body could not be read", e);
-                } finally {
-                    response.close();
-                }
-                final byte[] bodyOnce = body;
-                final IOException failureOnce = failure;
-                post(() -> onFetchDone(call, bodyOnce, failureOnce));
-            }
-        });
-    }
-
-
-    // Runs on the OkHttp thread: checks the URL the redirect names, and hands the next hop to the pool's thread.
-    private void onRedirectResponse(RpcPoolCall call, Response response, String endpoint, HttpUrl allowedUrl, int hopsLeft) {
-        HttpUrl next = null;
-        IOException failure = null;
-        try {
-            if (hopsLeft <= 0) {
-                throw new IOException("redirects are longer than " + RpcPoolRedirect.MAX_HOPS + " hops");
-            }
-            next = RpcPoolRedirect.nextUrl(response, endpoint);
-        } catch (IOException e) {
-            failure = e;
-        } finally {
-            response.close();
-        }
-        final HttpUrl nextOnce = next;
-        final IOException failureOnce = failure;
-        if (failureOnce != null) {
-            post(() -> onFetchDone(call, null, failureOnce));
-        } else {
-            post(() -> onHop(call, nextOnce, allowedUrl, hopsLeft - 1));
-        }
-    }
-
-
-    // Starts the next hop on the pool's thread. A call settled meanwhile gives its fetch slot back and no more.
-    private void onHop(RpcPoolCall call, HttpUrl next, HttpUrl allowedUrl, int hopsLeft) {
-        if (call.settled) {
-            onFetchDone(call, null, null);
-            return;
-        }
-        hop(call, next, allowedUrl, hopsLeft);
     }
 
 
@@ -1347,13 +1315,12 @@ public final class RpcPool {
     }
 
 
+    // Starts the waiting fetches in order while a slot is free. A settled call leaves its queue at once, so each one is live.
     private void startWaitingRedirects() {
         while (redirectsInflight < maxRedirectsInflight && !redirectWaiting.isEmpty()) {
-            RpcPoolCall next = redirectWaiting.poll();
-            next.redirectWaiting = false;
-            if (!next.settled) {
-                fetch(next);
-            }
+            RpcPoolCall next = redirectWaiting.first();
+            unqueue(next);
+            fetch(next);
         }
     }
 
@@ -1388,10 +1355,6 @@ public final class RpcPool {
             if (idle(conn)) {
                 markIdle(conn);
             }
-        }
-        if (call.redirectWaiting) {
-            redirectWaiting.remove(call);
-            call.redirectWaiting = false;
         }
         if (call.redirectCall != null) {
             call.redirectCall.cancel();

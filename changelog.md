@@ -29,6 +29,7 @@ Unreleased
 * `RpcPool.BAD_CONFIGURATION` (12) and `RpcPool.REDIRECT_FAILED` (18) are the client-local codes of the pool.
 * A command frame is written into one array (`FrameEncoder`), and an rpc payload is wrapped in its request without a copy: a call with a large payload makes fewer copies of it on the way out. The array passed to `Client.rpc` or `RpcPool.rpc` must not change until the callback.
 * `RpcPool.Builder.tokenFrom(client)`: the pool takes its token from the main client, which renews itself when a pool connection is refused its token. Exclusive with `token` and `tokenGetter`. A pool of a client whose session ended as unauthorized fails its calls at once. `idleTimeout` is at most 2147483647 ms.
+* `RpcPool` follows no redirect of a fetch: a 3xx answer fails the fetch with `REDIRECT_FAILED`. The calls waiting for a redirect fetch slot count in `maxQueued` and `stats().queued`.
 
 0.3.1
 =====

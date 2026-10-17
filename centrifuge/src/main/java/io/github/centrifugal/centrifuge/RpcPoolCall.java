@@ -40,9 +40,8 @@ final class RpcPoolCall {
     ScheduledFuture<?> resendTask;
     // The redirect fetch in flight, null when none is.
     okhttp3.Call redirectCall;
-    // The redirect of the call which waits for a fetch slot.
+    // The redirect of the call, which is fetched when a fetch slot is free.
     RpcPool.Redirect redirect;
-    boolean redirectWaiting;
 
 
     RpcPoolCall(
