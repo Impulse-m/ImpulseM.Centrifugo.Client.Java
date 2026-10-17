@@ -25,7 +25,9 @@ import java.util.function.Function;
 
 import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import okhttp3.Callback;
+import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
+import okhttp3.Request;
 import okhttp3.Response;
 
 
@@ -138,7 +140,10 @@ public final class RpcPool {
             }
 
 
-            /** Adds a request header of the fetch. Adding the same key again replaces its value. */
+            /**
+             * Adds a request header of the fetch. Adding the same key again replaces its value. The header goes only to
+             * the host and port of the redirect URL: a redirect to another host is requested without it.
+             */
             public Builder header(String key, String value) {
                 this.headers.put(Objects.requireNonNull(key, "header key"), Objects.requireNonNull(value, "header value"));
                 return this;
@@ -482,9 +487,10 @@ public final class RpcPool {
 
 
         /**
-         * The OkHttp client of the connections and of the redirect fetches, shared. Optional: without one, the pools share
-         * a default client. The interceptors of this client apply to the redirect fetches too, and redirects are followed
-         * to other hosts, so an interceptor which adds credentials sends them to the host the server redirects to.
+         * The OkHttp client of the connections and of the redirect fetches, shared. Optional: without one, the redirect
+         * fetches share a default client of the process, and each connection builds its own. The interceptors of this
+         * client apply to the redirect fetches too, so an interceptor which adds credentials sends them to the host of
+         * each hop.
          */
         public Builder okHttpClient(OkHttpClient okHttpClient) {
             this.okHttpClient = okHttpClient;
@@ -1065,8 +1071,24 @@ public final class RpcPool {
 
     private void fetch(RpcPoolCall call) {
         redirectsInflight++;
+        try {
+            HttpUrl first = HttpUrl.get(call.redirect.getUrl());
+            hop(call, first, first, RpcPoolRedirect.MAX_HOPS);
+        } catch (IllegalArgumentException e) {
+            redirectsInflight--;
+            settle(call, null, new ReplyError(REDIRECT_FAILED, "redirect could not be requested", false));
+            startWaitingRedirects();
+        }
+    }
+
+
+    // Requests one hop of a fetch, on the pool's thread. The answer comes back on the OkHttp thread.
+    private void hop(RpcPoolCall call, HttpUrl url, HttpUrl allowedUrl, int hopsLeft) {
+        final String endpoint = call.endpointUrl;
         final long maxBytes = call.redirect.getMaxBytes();
-        Callback callback = new Callback() {
+        Request request = RpcPoolRedirect.request(url, allowedUrl, call.redirect);
+        call.redirectCall = fetchClient().newCall(request);
+        call.redirectCall.enqueue(new Callback() {
             @Override
             public void onFailure(okhttp3.Call httpCall, IOException e) {
                 post(() -> onFetchDone(call, null, e));
@@ -1075,6 +1097,10 @@ public final class RpcPool {
 
             @Override
             public void onResponse(okhttp3.Call httpCall, Response response) {
+                if (RpcPoolRedirect.isRedirect(response)) {
+                    onRedirectResponse(call, response, endpoint, allowedUrl, hopsLeft);
+                    return;
+                }
                 byte[] body = null;
                 IOException failure = null;
                 try {
@@ -1090,14 +1116,41 @@ public final class RpcPool {
                 final IOException failureOnce = failure;
                 post(() -> onFetchDone(call, bodyOnce, failureOnce));
             }
-        };
+        });
+    }
+
+
+    // Runs on the OkHttp thread: checks the URL the redirect names, and hands the next hop to the pool's thread.
+    private void onRedirectResponse(RpcPoolCall call, Response response, String endpoint, HttpUrl allowedUrl, int hopsLeft) {
+        HttpUrl next = null;
+        IOException failure = null;
         try {
-            call.redirectCall = RpcPoolRedirect.enqueue(fetchClient(), call.redirect, callback);
-        } catch (IllegalArgumentException e) {
-            redirectsInflight--;
-            settle(call, null, new ReplyError(REDIRECT_FAILED, "redirect could not be requested", false));
-            startWaitingRedirects();
+            if (hopsLeft <= 0) {
+                throw new IOException("redirects are longer than " + RpcPoolRedirect.MAX_HOPS + " hops");
+            }
+            next = RpcPoolRedirect.nextUrl(response, endpoint);
+        } catch (IOException e) {
+            failure = e;
+        } finally {
+            response.close();
         }
+        final HttpUrl nextOnce = next;
+        final IOException failureOnce = failure;
+        if (failureOnce != null) {
+            post(() -> onFetchDone(call, null, failureOnce));
+        } else {
+            post(() -> onHop(call, nextOnce, allowedUrl, hopsLeft - 1));
+        }
+    }
+
+
+    // Starts the next hop on the pool's thread. A call settled meanwhile gives its fetch slot back and no more.
+    private void onHop(RpcPoolCall call, HttpUrl next, HttpUrl allowedUrl, int hopsLeft) {
+        if (call.settled) {
+            onFetchDone(call, null, null);
+            return;
+        }
+        hop(call, next, allowedUrl, hopsLeft);
     }
 
 
@@ -1287,11 +1340,11 @@ public final class RpcPool {
     }
 
 
-    // A redirect is never followed across schemes: the body of a secure endpoint is not fetched over plain HTTP.
+    // The client does not follow a redirect itself: the pool checks each hop's scheme and host, and sets the headers of each hop.
     private OkHttpClient fetchClient() {
         if (fetchHttpClient == null) {
             OkHttpClient base = httpClient != null ? httpClient : defaultHttpClient();
-            fetchHttpClient = base.newBuilder().followSslRedirects(false).build();
+            fetchHttpClient = base.newBuilder().followRedirects(false).followSslRedirects(false).build();
         }
         return fetchHttpClient;
     }

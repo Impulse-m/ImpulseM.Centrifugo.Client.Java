@@ -4,8 +4,7 @@ import java.io.IOException;
 import java.util.Locale;
 import java.util.Map;
 
-import okhttp3.Callback;
-import okhttp3.OkHttpClient;
+import okhttp3.HttpUrl;
 import okhttp3.Request;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
@@ -13,10 +12,14 @@ import okio.BufferedSource;
 
 
 /**
- * The fetch of a redirect of an {@link RpcPool}: the URL check of the endpoint, the request, and the
- * body read within its bound.
+ * The fetch of a redirect of an {@link RpcPool}: the URL checks of the endpoint and of each hop, the request of each
+ * hop, and the body read within its bound. The pool follows the hops itself, so the application headers reach only
+ * the host the redirect names.
  */
 final class RpcPoolRedirect {
+    /** Redirects a fetch follows after its first request. The response after the last one fails the fetch. */
+    static final int MAX_HOPS = 5;
+
     private RpcPoolRedirect() {
     }
 
@@ -35,18 +38,57 @@ final class RpcPoolRedirect {
 
 
     /**
-     * Starts the GET of the redirect. The callback gets the response, or the failure of the call.
-     *
-     * @throws IllegalArgumentException when the URL or a header is not valid.
+     * Whether a hop may follow the URL it answers. The endpoint rule of {@link #allowed} applies to every hop, and an
+     * https URL never hands over to a plain http one, whatever the endpoint is.
      */
-    static okhttp3.Call enqueue(OkHttpClient client, RpcPool.Redirect redirect, Callback callback) {
-        Request.Builder builder = new Request.Builder().url(redirect.getUrl());
-        for (Map.Entry<String, String> header : redirect.getHeaders().entrySet()) {
-            builder.header(header.getKey(), header.getValue());
+    static boolean hopAllowed(String endpoint, HttpUrl from, HttpUrl to) {
+        if (from.isHttps() && !to.isHttps()) {
+            return false;
         }
-        okhttp3.Call call = client.newCall(builder.build());
-        call.enqueue(callback);
-        return call;
+        return allowed(endpoint, to.toString());
+    }
+
+
+    /** Whether the response is a redirect the pool follows: a 301, 302, 303, 307 or 308. */
+    static boolean isRedirect(Response response) {
+        int code = response.code();
+        return code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
+    }
+
+
+    /**
+     * The URL a redirect response points to, resolved against the URL it answers.
+     *
+     * @throws IOException when the response has no valid location, or the hop is not allowed for the endpoint.
+     */
+    static HttpUrl nextUrl(Response response, String endpoint) throws IOException {
+        HttpUrl from = response.request().url();
+        String location = response.header("Location");
+        HttpUrl next = location != null ? from.resolve(location) : null;
+        if (next == null) {
+            throw new IOException("redirect has no valid location");
+        }
+        if (!hopAllowed(endpoint, from, next)) {
+            throw new IOException("redirect url is not allowed for the endpoint");
+        }
+        return next;
+    }
+
+
+    /**
+     * The GET of one hop. The request headers of the redirect go only to the host and port of the URL the hook named,
+     * the allowed URL: a hop to any other host is requested without them.
+     *
+     * @throws IllegalArgumentException when a header is not valid.
+     */
+    static Request request(HttpUrl url, HttpUrl allowedUrl, RpcPool.Redirect redirect) {
+        Request.Builder builder = new Request.Builder().url(url);
+        if (url.host().equals(allowedUrl.host()) && url.port() == allowedUrl.port()) {
+            for (Map.Entry<String, String> header : redirect.getHeaders().entrySet()) {
+                builder.header(header.getKey(), header.getValue());
+            }
+        }
+        return builder.build();
     }
 
 
