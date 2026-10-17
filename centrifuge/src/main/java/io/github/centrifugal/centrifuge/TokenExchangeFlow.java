@@ -370,6 +370,9 @@ final class TokenExchangeFlow {
         String refreshToken;
         try {
             refreshToken = exchange.load();
+        } catch (UnauthorizedException e) {
+            endBootstrapSession();
+            return true;
         } catch (RuntimeException e) {
             failBootstrap(b, e);
             return true;
@@ -464,12 +467,15 @@ final class TokenExchangeFlow {
 
     // The issuer refused the refresh token: the refusal run goes on. The storage is read again first: a changed token is
     // presented at once, an empty one ends the session, and the same one is presented again once, at a random moment
-    // inside the remaining grace; a second refusal of an unchanged value, or one at the horizon, ends the session. A
-    // failed read throws.
+    // inside the remaining grace; a second refusal of an unchanged value, or one at the horizon, ends the session. A read
+    // which throws UnauthorizedException ends the session; another failed read is retried.
     private void reloadAfterRefusal(Bootstrap b, String refreshToken) {
         String again;
         try {
             again = exchange.load();
+        } catch (UnauthorizedException e) {
+            endBootstrapSession();
+            return;
         } catch (RuntimeException e) {
             failBootstrap(b, e);
             return;
@@ -734,6 +740,9 @@ final class TokenExchangeFlow {
         String current;
         try {
             current = exchange.load();
+        } catch (UnauthorizedException e) {
+            // A stale attempt does not end the session: its rotation is dropped with its outcome.
+            return;
         } catch (RuntimeException e) {
             host.reportError(new TokenError(e));
             return;
@@ -751,6 +760,10 @@ final class TokenExchangeFlow {
         String refreshToken;
         try {
             refreshToken = exchange.load();
+        } catch (UnauthorizedException e) {
+            closeRefusalRun();
+            cb.Done(e, null);
+            return;
         } catch (RuntimeException e) {
             cb.Done(e, null);
             return;
@@ -850,6 +863,10 @@ final class TokenExchangeFlow {
             String again;
             try {
                 again = exchange.load();
+            } catch (UnauthorizedException e) {
+                closeRefusalRun();
+                cb.Done(e, null);
+                return;
             } catch (RuntimeException e) {
                 cb.Done(e, null);
                 return;

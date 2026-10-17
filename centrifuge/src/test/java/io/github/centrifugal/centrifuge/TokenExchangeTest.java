@@ -99,7 +99,7 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
         @Override
-        public String load() {
+        public String load() throws UnauthorizedException {
             return refreshToken;
         }
 
@@ -131,7 +131,7 @@ public class TokenExchangeTest extends RpcTestBase {
 
     // An exchange whose callback the test completes itself: the one numbered stallOn (1 is the first exchange, the
     // bootstrap's), after the connection or the timer changed.
-    private static final class StallingStorage extends Storage {
+    private static class StallingStorage extends Storage {
         volatile ResultCallback<TokenExchangeResult> held;
         private final int stallOn;
 
@@ -668,7 +668,7 @@ public class TokenExchangeTest extends RpcTestBase {
         AtomicInteger loads = new AtomicInteger();
         Storage storage = new Storage("refresh-1") {
             @Override
-            public String load() {
+            public String load() throws UnauthorizedException {
                 if (!renewing.get()) {
                     return super.load();
                 }
@@ -2014,6 +2014,184 @@ public class TokenExchangeTest extends RpcTestBase {
         assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
         assertTrue(errors.isEmpty());
         assertEquals(Arrays.asList("refresh-1", "refresh-2"), storage.exchanged);
+    }
+
+
+    @Test
+    public void unauthorizedFromLoadAtBootstrapEndsTheSession() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public String load() throws UnauthorizedException {
+                throw new UnauthorizedException();
+            }
+        };
+        newClient(exchangeOptions(storage));
+
+        client.connect();
+
+        awaitCondition("disconnected", () -> disconnects.size() == 1);
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        assertTrue(storage.exchanged.isEmpty());
+        assertTrue(errors.isEmpty());
+        assertTrue(connected.isEmpty());
+    }
+
+
+    @Test
+    public void unauthorizedFromLoadAtRenewalEndsTheSession() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        AtomicBoolean ended = new AtomicBoolean();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public String load() throws UnauthorizedException {
+                if (ended.get()) {
+                    throw new UnauthorizedException();
+                }
+                return super.load();
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("connected", () -> connected.size() == 1);
+        long delay = renewalDelay(clock);
+
+        ended.set(true);
+        clock.advance(delay);
+        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1);
+
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        assertTrue(errors.isEmpty());
+        assertEquals(Arrays.asList("refresh-1"), storage.exchanged);
+    }
+
+
+    @Test
+    public void unauthorizedFromTheRefusalReReadEndsTheSession() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        AtomicBoolean refused = new AtomicBoolean();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public String load() throws UnauthorizedException {
+                if (refused.get()) {
+                    throw new UnauthorizedException();
+                }
+                return super.load();
+            }
+
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                exchanged.add(event.getRefreshToken());
+                refused.set(true);
+                cb.onDone(new UnauthorizedException(), null);
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+
+        client.connect();
+
+        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1);
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        assertEquals(Arrays.asList("refresh-1"), storage.exchanged);
+        assertTrue(errors.isEmpty());
+    }
+
+
+    @Test
+    public void otherFailureOfLoadAtBootstrapIsRetried() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        AtomicBoolean failLoad = new AtomicBoolean(true);
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public String load() throws UnauthorizedException {
+                if (failLoad.getAndSet(false)) {
+                    throw new IllegalStateException("storage unavailable");
+                }
+                return super.load();
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+
+        client.connect();
+
+        assertFalse(connectedNow());
+        pumpUntil(clock, "connected", () -> connected.size() == 1);
+        assertEquals(1, errors.size());
+        assertTrue(errors.get(0) instanceof TokenError);
+        assertEquals(Arrays.asList("refresh-1"), storage.exchanged);
+        assertTrue(disconnects.isEmpty());
+    }
+
+
+    @Test
+    public void otherFailureOfLoadAtRenewalIsRetried() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        AtomicBoolean failLoad = new AtomicBoolean();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public String load() throws UnauthorizedException {
+                if (failLoad.getAndSet(false)) {
+                    throw new IllegalStateException("storage unavailable");
+                }
+                return super.load();
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("connected", () -> connected.size() == 1);
+        long delay = renewalDelay(clock);
+
+        failLoad.set(true);
+        clock.advance(delay);
+        awaitCondition("renewal reported", () -> !errors.isEmpty());
+        pumpUntil(clock, "renewed", () -> refreshTokens().size() == 2);
+
+        assertEquals(1, errors.size());
+        assertTrue(errors.get(0) instanceof TokenError);
+        assertEquals(1, connected.size());
+        assertTrue(disconnects.isEmpty());
+    }
+
+
+    @Test
+    public void staleAttemptWithAnEmptyTokenDoesNotEndTheSession() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        AtomicBoolean unavailable = new AtomicBoolean();
+        StallingStorage storage = new StallingStorage("refresh-1") {
+            @Override
+            public String load() throws UnauthorizedException {
+                if (unavailable.get()) {
+                    throw new UnauthorizedException();
+                }
+                return super.load();
+            }
+        };
+        newClient(exchangeOptions(storage));
+        client.connect();
+        awaitCondition("first exchange started", () -> storage.held != null);
+
+        server.closeConnection();
+
+        awaitCondition("second bootstrap", () -> storage.exchanged.size() == 2);
+        awaitCondition("connected", () -> connected.size() == 1);
+        // The application's storage is gone while the stale exchange completes with an empty access token: the stale
+        // attempt drops its outcome, and the session goes on.
+        unavailable.set(true);
+        storage.held.onDone(null, new TokenExchangeResult("", "refresh-stale"));
+        drainExecutor();
+
+        assertEquals(1, connected.size());
+        assertEquals(ClientState.CONNECTED, client.getState());
+        assertTrue(disconnects.isEmpty());
+        assertEquals(Arrays.asList("refresh-2"), storage.stored);
     }
 
 

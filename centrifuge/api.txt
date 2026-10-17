@@ -447,7 +447,7 @@ package io.github.centrifugal.centrifuge {
     ctor public TokenExchange();
     method public abstract void exchange(io.github.centrifugal.centrifuge.TokenExchangeEvent!, io.github.centrifugal.centrifuge.ResultCallback<io.github.centrifugal.centrifuge.TokenExchangeResult!>!);
     method public int grace();
-    method public abstract String load();
+    method public abstract String load() throws io.github.centrifugal.centrifuge.UnauthorizedException;
     method public Set<String> refusalTypes();
     method public abstract void store(String);
   }

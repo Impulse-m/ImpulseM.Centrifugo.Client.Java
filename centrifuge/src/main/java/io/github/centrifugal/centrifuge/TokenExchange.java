@@ -17,8 +17,12 @@ public abstract class TokenExchange {
      * The refresh token the application persisted, or null when there is none. Called on the client's
      * thread before every exchange, so it is never cached: keep it fast. Once the client is closed, it
      * may be called on the thread which completes the exchange instead.
+     * <p>
+     * Throw {@link UnauthorizedException} when the application's session is over: the client ends the
+     * session, at bootstrap and at renewal, as the issuer's refusal does at the grace horizon. Any other
+     * exception is reported and the exchange is retried with backoff.
      */
-    public abstract String load();
+    public abstract String load() throws UnauthorizedException;
 
 
     /**
