@@ -158,15 +158,18 @@ final class TokenExchangeFlow {
     }
 
 
+    /** Whether the token is the one the expiry record holds, and the record says it has expired. */
+    boolean tokenExpired(String token) {
+        return token != null && expiry != null && expiry.token.equals(token) && System.currentTimeMillis() >= expiry.expiresAtMillis;
+    }
+
+
     /**
      * Called at the start of every connect attempt. Clears the connection token when the server asked for a
      * fresh one, or when the expiry record says it expired, so that the connect goes out anonymously.
      */
     void beforeConnect() {
-        boolean expired = expiry != null
-                && expiry.token.equals(host.connectionToken())
-                && System.currentTimeMillis() >= expiry.expiresAtMillis;
-        if (host.isRefreshRequired() || expired) {
+        if (host.isRefreshRequired() || tokenExpired(host.connectionToken())) {
             host.storeToken("");
             host.setRefreshRequired(false);
             expiry = null;

@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
@@ -100,6 +101,8 @@ final class AuthRefresh {
     // Identity the server last reported for the connection, see applyAuth. Used on the executor thread only.
     private String currentUser = "";
     private String currentAuthClass = "";
+    // The token source of the rpc pools which take their token from this client, created by the first of them. Null before.
+    private final AtomicReference<TokenSource> tokenSource = new AtomicReference<>();
 
 
     AuthRefresh(ClientHost host, int retryMinMillis, int retryMaxMillis) {
@@ -107,6 +110,53 @@ final class AuthRefresh {
         this.retryMinMillis = retryMinMillis;
         this.retryMaxMillis = retryMaxMillis;
         this.flow = TokenExchangeFlow.create(host);
+    }
+
+
+    /** The token source of this client, created on the first call and shared by all its callers. */
+    TokenSource tokenSource() {
+        TokenSource existing = tokenSource.get();
+        if (existing == null) {
+            tokenSource.compareAndSet(null, new TokenSource(host, this));
+            existing = tokenSource.get();
+        }
+        return existing;
+    }
+
+
+    /** Whether a timer refresh can fetch a token: a token exchange or a token getter is set. Runs on the executor. */
+    boolean canRenew() {
+        return timerTokenGetter() != null;
+    }
+
+
+    /** Whether the token is one the token exchange expired. */
+    boolean tokenExpired(String token) {
+        return flow != null && flow.tokenExpired(token);
+    }
+
+
+    /**
+     * Starts the timer refresh now, when the client is connected, the token can be renewed and no refresh is in
+     * flight. Runs on the executor. A refresh in flight which fails is retried by the retry timer.
+     */
+    void renewNow() {
+        if (host.state() != ClientState.CONNECTED || inFlight || timerTokenGetter() == null) {
+            return;
+        }
+        scheduleTimer(0L, TimeUnit.MILLISECONDS);
+    }
+
+
+    /** The user the server last reported for the connection. Runs on the executor. */
+    String currentUser() {
+        return currentUser;
+    }
+
+
+    /** The auth class the server last reported for the connection. Runs on the executor. */
+    String currentAuthClass() {
+        return currentAuthClass;
     }
 
 
@@ -120,6 +170,10 @@ final class AuthRefresh {
     void beforeConnect() {
         if (flow != null) {
             flow.beforeConnect();
+        }
+        TokenSource source = tokenSource.get();
+        if (source != null) {
+            source.onConnectAttempt();
         }
     }
 
@@ -262,6 +316,10 @@ final class AuthRefresh {
         if (flow != null) {
             flow.reset(code, terminal);
         }
+        TokenSource source = tokenSource.get();
+        if (source != null) {
+            source.onDisconnect(code, terminal);
+        }
     }
 
 
@@ -275,6 +333,10 @@ final class AuthRefresh {
         this.currentAuthClass = authClass;
         if (always || changed) {
             host.reportAuth(new AuthEvent(user, authClass));
+        }
+        TokenSource source = tokenSource.get();
+        if (source != null) {
+            source.onAuth(user, authClass, always);
         }
     }
 

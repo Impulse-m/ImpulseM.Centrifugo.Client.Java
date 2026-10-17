@@ -25,14 +25,43 @@ final class RpcPoolConnection {
     boolean removed;
     // When the connection last became idle (nanoTime), read by the pool's idle check; not meaningful while it has a call.
     long idleSince;
-    // The server closed the connection for a frame over its size limit, with this reason: the lost calls are settled, not sent again.
-    boolean sizeLimited;
+    // The token the connection was given last, and the identity generation stamped at its first delivery (-1 before it).
+    // Written on the main client's executor, and read from the client's threads and the pool's.
+    volatile String token = "";
+    volatile int generation = -1;
+    // The pool takes the connection out of its endpoint: it takes no call, and closes once its calls settle.
+    boolean retired;
+    // The lost calls of the connection are settled, not sent again: the connection was closed for a frame over its size limit,
+    // ended as unauthorized, or retired. The reason is the error of those calls.
+    boolean noResend;
     String closeReason;
 
 
-    RpcPoolConnection(RpcPool pool, RpcPoolEndpoint endpoint, Options options) {
+    RpcPoolConnection(RpcPool pool, RpcPoolEndpoint endpoint, Options options, TokenSource source) {
         this.endpoint = endpoint;
-        this.client = new Client(endpoint.url(), options, new ConnectionListener(pool));
+        this.client = new Client(endpoint.url(), clientOptions(pool, options, source), new ConnectionListener(pool));
+    }
+
+
+    // The options of a connection which takes its token from a source: a copy of the pool's options, with a token getter bound
+    // to this connection. Without a source the connection shares the pool's options, which carry the token of the pool.
+    private Options clientOptions(RpcPool pool, Options options, TokenSource source) {
+        if (source == null) {
+            return options;
+        }
+        Options copy = new Options();
+        copy.setHeaders(options.getHeaders());
+        copy.setName(options.getName());
+        copy.setVersion(options.getVersion());
+        copy.setTimeout(options.getTimeout());
+        copy.setOkHttpClient(options.getOkHttpClient());
+        copy.setTokenGetter(new ConnectionTokenGetter() {
+            @Override
+            public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
+                pool.tokenOf(RpcPoolConnection.this, cb);
+            }
+        });
+        return copy;
     }
 
 

@@ -320,6 +320,7 @@ package io.github.centrifugal.centrifuge {
     method public io.github.centrifugal.centrifuge.RpcPool.Builder! retries(int);
     method public io.github.centrifugal.centrifuge.RpcPool.Builder! timeout(int);
     method public io.github.centrifugal.centrifuge.RpcPool.Builder! token(String);
+    method public io.github.centrifugal.centrifuge.RpcPool.Builder! tokenFrom(io.github.centrifugal.centrifuge.Client!);
     method public io.github.centrifugal.centrifuge.RpcPool.Builder! tokenGetter(io.github.centrifugal.centrifuge.ConnectionTokenGetter!);
     method public io.github.centrifugal.centrifuge.RpcPool.Builder! version(String);
   }

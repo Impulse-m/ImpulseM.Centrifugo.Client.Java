@@ -334,6 +334,9 @@ public final class RpcPool {
     public static final class Builder {
         private final EndpointResolver resolver;
         private final Options options = new Options();
+        // Whether token or tokenGetter was called: the pool's own token is exclusive with tokenFrom.
+        private boolean ownToken;
+        private Client tokenFrom;
         private String affinityHeader;
         private int maxConnectionsPerEndpoint = 2;
         private int maxInflightPerConnection = 1;
@@ -354,16 +357,34 @@ public final class RpcPool {
         }
 
 
-        /** The token of the connections, see {@link Options#setToken}. */
+        /** The token of the connections, see {@link Options#setToken}. Exclusive with {@link #tokenFrom(Client)}. */
         public Builder token(String token) {
             options.setToken(token);
+            ownToken = true;
             return this;
         }
 
 
-        /** The token getter of the connections, see {@link Options#setTokenGetter}. */
+        /** The token getter of the connections, see {@link Options#setTokenGetter}. Exclusive with {@link #tokenFrom(Client)}. */
         public Builder tokenGetter(ConnectionTokenGetter tokenGetter) {
             options.setTokenGetter(tokenGetter);
+            ownToken = true;
+            return this;
+        }
+
+
+        /**
+         * The main client whose token the connections use. Each connection gets the client's current access token, and when
+         * its token expires or is refused, the client's newer one. The client renews itself when a connection is refused the
+         * token the client still holds, and the connections never run the token exchange or the token getter themselves.
+         * Works with every token mode of the client: a token exchange, a token getter or a static token. Exclusive with
+         * {@link #token(String)} and {@link #tokenGetter(ConnectionTokenGetter)}, which build a pool without a client.
+         *
+         * <p>A pool and its client: the pool follows the client's connect, disconnect and logout. A call made while the
+         * client's session has ended as unauthorized fails at once, and a call made after the client connects again goes out.
+         */
+        public Builder tokenFrom(Client client) {
+            this.tokenFrom = Objects.requireNonNull(client, "tokenFrom");
             return this;
         }
 
@@ -532,6 +553,9 @@ public final class RpcPool {
 
 
         public RpcPool build() {
+            if (tokenFrom != null && ownToken) {
+                throw new IllegalArgumentException("tokenFrom is exclusive with token and tokenGetter");
+            }
             return new RpcPool(this);
         }
     }
@@ -559,6 +583,8 @@ public final class RpcPool {
     private final ScheduledThreadPoolExecutor executor;
     private final AtomicReference<Thread> poolThread = new AtomicReference<>();
     private final Random random;
+    // The token source of the main client, null when the pool takes its token from its own options.
+    private final TokenSource source;
 
     // The state below belongs to the pool's thread.
     // The waiting calls, one queue per endpoint key which resolved; a queue is kept once made, as the keys are.
@@ -570,6 +596,8 @@ public final class RpcPool {
     // The endpoints of the keys which resolved, by key: cached until the pool is closed.
     private final Map<String, List<RpcPoolEndpoint>> resolved = new HashMap<>();
     private final Map<String, RpcPoolEndpoint> endpoints = new HashMap<>();
+    // The connections taken out of their endpoints, which close once their last call settles.
+    private final Set<RpcPoolConnection> retiring = new HashSet<>();
     private final Deque<RpcPoolCall> redirectWaiting = new ArrayDeque<>();
     // The one check of the idle connections, armed while there may be one; never cancelled, so it leaves no cancelled timer.
     private ScheduledFuture<?> idleCheck;
@@ -674,12 +702,16 @@ public final class RpcPool {
         report(conn.endpoint.url(), new IOException(reason));
         remove(conn);
         if (code == Client.DISCONNECTED_MESSAGE_SIZE_LIMIT) {
-            conn.sizeLimited = true;
+            conn.noResend = true;
             conn.closeReason = reason;
             // The attempts of the client failed before this event, and are lost calls already; the rest are settled too.
             conn.lost.addAll(conn.calls);
             conn.calls.clear();
         } else {
+            if (code == Client.DISCONNECTED_UNAUTHORIZED) {
+                conn.noResend = true;
+                conn.closeReason = reason;
+            }
             hold(conn.endpoint);
         }
         releaseLost(conn);
@@ -700,7 +732,7 @@ public final class RpcPool {
             if (call.settled) {
                 continue;
             }
-            if (conn.sizeLimited) {
+            if (conn.noResend) {
                 finishAttempt(call, null, new IOException(conn.closeReason));
             } else if (canResend(call)) {
                 call.resends++;
@@ -734,6 +766,7 @@ public final class RpcPool {
         this.httpClient = builder.okHttpClient;
         this.errorListener = builder.errorListener;
         this.random = builder.random != null ? builder.random : new Random();
+        this.source = builder.tokenFrom != null ? builder.tokenFrom.auth.tokenSource() : null;
         this.executor = createExecutor();
     }
 
@@ -797,6 +830,11 @@ public final class RpcPool {
             settle(call, null, cancelled());
             return;
         }
+        // The main client's session ended as unauthorized: the call fails at once, and opens nothing.
+        if (source != null && source.ended()) {
+            settle(call, null, new IOException("unauthorized"));
+            return;
+        }
         if (call.affinity != null && affinityHeader == null) {
             settle(call, null, badConfiguration("affinity needs the affinityHeader option"));
             return;
@@ -820,6 +858,7 @@ public final class RpcPool {
         // The timer runs on the deadline of the call, which started at its submit: the time it waited for the pool's thread is spent.
         call.deadlineTask = executor.schedule(() -> onDeadline(call), call.remainingNanos(), TimeUnit.NANOSECONDS);
         // A call goes out at once only when no call of its key waits: the waiting calls are older, and go first.
+        retireStale(eps);
         RpcPoolQueue waiting = queues.get(call.endpointKey);
         if ((waiting == null || waiting.isEmpty()) && tryAssign(call, eps)) {
             return;
@@ -864,6 +903,7 @@ public final class RpcPool {
         if (closed || queue == null || queue.isEmpty() || eps == null) {
             return;
         }
+        retireStale(eps);
         while (!queue.isEmpty()) {
             RpcPoolCall call = queue.first();
             if (tryAssign(call, eps)) {
@@ -953,7 +993,7 @@ public final class RpcPool {
     // A connection with no call is closed after the idle timeout from the open, so that a connection whose calls all
     // time out while it connects does not stay open.
     private void open(RpcPoolEndpoint endpoint) {
-        RpcPoolConnection conn = new RpcPoolConnection(this, endpoint, options);
+        RpcPoolConnection conn = new RpcPoolConnection(this, endpoint, options, source);
         endpoint.connections().add(conn);
         conn.connect();
         markIdle(conn);
@@ -1003,10 +1043,87 @@ public final class RpcPool {
                 finishAttempt(call, null, error);
             }
         }
-        if (idle(conn)) {
+        // A connection whose token went stale leaves its endpoint now, and a retired one closes once it is idle.
+        if (stale(conn)) {
+            retire(conn);
+        }
+        if (conn.retired) {
+            if (idle(conn)) {
+                remove(conn);
+            }
+        } else if (idle(conn)) {
             markIdle(conn);
         }
         pumpEndpoint(conn.endpoint);
+    }
+
+
+    // Whether the connection holds a token of an identity which has ended: the main client's generation moved on since.
+    private boolean stale(RpcPoolConnection conn) {
+        return source != null && conn.generation >= 0 && conn.generation != source.generation();
+    }
+
+
+    // Retires the stale connections of the endpoints, before a call is placed on them. Walks each list backwards, as a retire
+    // takes its connection out of the list.
+    private void retireStale(List<RpcPoolEndpoint> eps) {
+        if (source == null) {
+            return;
+        }
+        for (RpcPoolEndpoint endpoint : eps) {
+            List<RpcPoolConnection> connections = endpoint.connections();
+            for (int i = connections.size() - 1; i >= 0; i--) {
+                RpcPoolConnection conn = connections.get(i);
+                if (stale(conn)) {
+                    retire(conn);
+                }
+            }
+        }
+    }
+
+
+    // Takes a connection out of its endpoint, so that no call goes to it, and records that its lost calls are not sent again.
+    // It closes at once when it has no call, and otherwise when its last call settles. Retiring is not an error of the connection.
+    private void retire(RpcPoolConnection conn) {
+        if (conn.removed || conn.retired) {
+            return;
+        }
+        conn.retired = true;
+        conn.noResend = true;
+        conn.closeReason = "rpc connection retired";
+        conn.endpoint.connections().remove(conn);
+        retiring.add(conn);
+        source.forget(conn);
+        if (idle(conn)) {
+            remove(conn);
+        }
+    }
+
+
+    // The token getter of a pool connection, which runs on the client's threads. It asks the source with the token the connection
+    // was given last, and never takes a token of another identity: a connection of an ended identity is retired and fails.
+    void tokenOf(RpcPoolConnection conn, TokenCallback cb) {
+        int known = conn.generation;
+        if (known >= 0 && known != source.generation()) {
+            post(() -> retire(conn));
+            cb.Done(new UnauthorizedException(), null);
+            return;
+        }
+        source.token(conn, conn.token, (Throwable error, String token, int delivered) -> {
+            if (error != null) {
+                cb.Done(error, null);
+                return;
+            }
+            if (conn.generation < 0) {
+                conn.generation = delivered;
+            } else if (conn.generation != delivered) {
+                post(() -> retire(conn));
+                cb.Done(new UnauthorizedException(), null);
+                return;
+            }
+            conn.token = token;
+            cb.Done(null, token);
+        });
     }
 
 
@@ -1383,6 +1500,10 @@ public final class RpcPool {
         }
         conn.removed = true;
         conn.endpoint.connections().remove(conn);
+        retiring.remove(conn);
+        if (source != null) {
+            source.forget(conn);
+        }
         conn.close();
     }
 
@@ -1403,6 +1524,9 @@ public final class RpcPool {
             for (RpcPoolConnection conn : new ArrayList<>(endpoint.connections())) {
                 remove(conn);
             }
+        }
+        for (RpcPoolConnection conn : new ArrayList<>(retiring)) {
+            remove(conn);
         }
         executor.shutdown();
     }
@@ -1428,6 +1552,10 @@ public final class RpcPool {
                 connections++;
                 inflight += conn.calls.size();
             }
+        }
+        for (RpcPoolConnection conn : retiring) {
+            connections++;
+            inflight += conn.calls.size();
         }
         return new Stats(connections, inflight, queuedCount, redirectsInflight);
     }
