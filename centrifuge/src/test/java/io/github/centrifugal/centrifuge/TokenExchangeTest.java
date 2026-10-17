@@ -760,6 +760,19 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
+    public void clientWithoutATokenExchangeBuildsNoFlow() throws Exception {
+        // The feature is off by default: a client without a token exchange builds no flow, so it holds no refusal run.
+        ManualScheduler clock = new ManualScheduler();
+        newExchangeClient(new Options(), clock);
+
+        client.connect();
+
+        awaitCondition("connected", () -> connected.size() == 1);
+        assertNull(fieldOf(fieldOf(client, "auth"), "flow"));
+    }
+
+
+    @Test
     public void graceOfTheOptionReturnsWhenAResultPublishesNone() throws Exception {
         // The first result publishes a grace of 300 s, the second publishes none: the refusal run then takes the option's 7 s.
         ManualScheduler clock = new ManualScheduler();
