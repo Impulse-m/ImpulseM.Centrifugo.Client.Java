@@ -38,9 +38,10 @@ final class TokenExchangeFlow {
     private static final double RENEWAL_MIN_SHARE = 0.7;
     private static final double RENEWAL_JITTER = 0.2;
 
-    // The retry delay of a refused attempt within the grace, in milliseconds, and the bounds of the grace in seconds.
-    private static final int REFUSAL_RETRY_MIN_MILLIS = 1000;
-    private static final int REFUSAL_RETRY_MAX_MILLIS = 8000;
+    // The re-presentations of an unchanged refresh token a refusal run allows: one, at a random moment inside the
+    // remaining grace.
+    private static final int REFUSAL_RETRIES = 1;
+    // The upper bound of the grace in seconds.
     private static final int GRACE_MAX_SECONDS = 300;
     // The grace of a result which publishes none, see TokenExchangeResult.getGrace.
     private static final int ABSENT_GRACE = -1;
@@ -103,7 +104,8 @@ final class TokenExchangeFlow {
     private int bootstrapAttempt = 0;
     // The grace in seconds: the exchange's, then the one the latest accepted exchange published.
     private int graceSeconds;
-    // The refusal run: the deadline of its horizon, null when no run is open, and the refused attempts of the run.
+    // The refusal run: the deadline of its horizon, null when no run is open, and the refused attempts of the run whose
+    // re-read found the value unchanged.
     private ScheduledFuture<?> horizon;
     private int refusals = 0;
 
@@ -424,8 +426,9 @@ final class TokenExchangeFlow {
 
 
     // The issuer refused the refresh token: the refusal run goes on. The storage is read again first: a changed token is
-    // presented at once, an empty one ends the session, and the same one is presented again after the backoff, until the
-    // grace horizon has passed. A failed read throws.
+    // presented at once, an empty one ends the session, and the same one is presented again once, at a random moment
+    // inside the remaining grace; a second refusal of an unchanged value, or one at the horizon, ends the session. A
+    // failed read throws.
     private void reloadAfterRefusal(Bootstrap b, String refreshToken) {
         String again;
         try {
@@ -442,14 +445,12 @@ final class TokenExchangeFlow {
             runExchange(b, again);
             return;
         }
-        if (horizonPassed()) {
+        if (horizonPassed() || refusals >= REFUSAL_RETRIES) {
             endBootstrapSession();
             return;
         }
         host.reportError(new TokenError(new IllegalStateException(REFUSED_RETRY_MESSAGE)));
-        long delay = Math.min(
-                backoff.duration(refusals, REFUSAL_RETRY_MIN_MILLIS, REFUSAL_RETRY_MAX_MILLIS),
-                horizon.getDelay(TimeUnit.MILLISECONDS));
+        long delay = ThreadLocalRandom.current().nextLong(Math.max(0, horizon.getDelay(TimeUnit.MILLISECONDS)) + 1);
         refusals++;
         scheduleRetry(b, delay);
     }
@@ -817,12 +818,14 @@ final class TokenExchangeFlow {
                 runRenewal(transport, cb, again, generation);
                 return;
             }
-            if (horizonPassed()) {
+            if (horizonPassed() || refusals >= REFUSAL_RETRIES) {
                 closeRefusalRun();
                 cb.Done(new UnauthorizedException(), null);
                 return;
             }
-            // Within the grace: the fetch fails with a retryable error, and the next fetch reads the storage again.
+            // Within the grace: the fetch fails once with a retryable error, and the next fetch reads the storage again. The
+            // refusal of an unchanged value after that retry ends the session.
+            refusals++;
             cb.Done(new IllegalStateException(REFUSED_RETRY_MESSAGE), null);
             return;
         }

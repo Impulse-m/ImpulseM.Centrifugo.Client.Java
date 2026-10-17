@@ -31,6 +31,7 @@ import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -57,6 +58,8 @@ public class TokenExchangeTest extends RpcTestBase {
     private static final int CODE_TOKEN_EXPIRED = 109;
     // A close code of the server which ends the session: the client does not reconnect after it.
     private static final int CODE_TERMINAL_CLOSE = 3500;
+    // The grace of an exchange which publishes none and the option does not set.
+    private static final long DEFAULT_GRACE_MILLIS = 30000L;
     private static final long WINDOW_MIN_MILLIS = 7000L;
     private static final long WINDOW_MAX_MILLIS = 9000L;
     // The clock moves at most this far per test, so that the ping timer (25 s plus the ping delay) stays idle.
@@ -392,9 +395,52 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
-    public void unchangedRefreshTokenIsRetriedUntilTheGraceHorizon() throws Exception {
+    public void unchangedRefreshTokenIsPresentedAgainOnceInsideTheGrace() throws Exception {
+        // The retry moment is drawn at random inside the grace: over the runs it does not always come at the same time.
+        Set<Long> retryMoments = new HashSet<>();
+        for (int run = 0; run < 20; run++) {
+            ManualScheduler clock = new ManualScheduler();
+            List<Long> presentedAt = new CopyOnWriteArrayList<>();
+            Storage storage = new Storage("refresh-1") {
+                @Override
+                public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                    exchanged.add(event.getRefreshToken());
+                    presentedAt.add(clock.elapsedMillis());
+                    cb.onDone(new UnauthorizedException(), null);
+                }
+            };
+            newExchangeClient(exchangeOptions(storage), clock);
+            client.connect();
+
+            // The first refusal is reported, and is not the verdict.
+            final int expected = run + 1;
+            awaitCondition("first refusal reported", () -> errors.size() == expected);
+            assertEquals(expected - 1, disconnects.size());
+            // The second presentation of the same value is the verdict, inside the grace.
+            pumpUntil(clock, "disconnected", () -> disconnects.size() == expected);
+            assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(expected - 1).getCode());
+            assertEquals(ClientState.DISCONNECTED, client.getState());
+            assertTrue(storage.stored.isEmpty());
+            assertEquals(Arrays.asList("refresh-1", "refresh-1"), storage.exchanged);
+            long retry = presentedAt.get(1) - presentedAt.get(0);
+            // The presentation is recorded on the client's thread, a pump step or two after the clock fired the retry.
+            assertTrue("retry after " + retry + " ms", retry >= 0 && retry <= DEFAULT_GRACE_MILLIS + 2 * PUMP_STEP_MILLIS);
+            retryMoments.add(retry);
+            client.close(1000);
+        }
+        assertTrue("retry moments " + retryMoments, retryMoments.size() > 1);
+    }
+
+
+    @Test
+    public void secondRefusalOfAnUnchangedTokenEndsTheSessionBeforeTheHorizon() throws Exception {
         ManualScheduler clock = new ManualScheduler();
         Storage storage = new Storage("refresh-1") {
+            @Override
+            public int grace() {
+                return 300;
+            }
+
             @Override
             public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
                 exchanged.add(event.getRefreshToken());
@@ -402,30 +448,19 @@ public class TokenExchangeTest extends RpcTestBase {
             }
         };
         newExchangeClient(exchangeOptions(storage), clock);
-
         client.connect();
 
-        // A refusal inside the grace is retried, and is not the verdict.
-        awaitCondition("first refusal reported", () -> !errors.isEmpty());
-        assertTrue(disconnects.isEmpty());
-        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1);
+        // The one retry comes at a random moment inside the 300 s horizon, and its refusal ends the session before the horizon.
+        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1, 1000, 300);
         assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
-        assertEquals(ClientState.DISCONNECTED, client.getState());
-        assertTrue(storage.stored.isEmpty());
-        // Each attempt presented the stored token, and the attempts stayed within the grace.
-        assertTrue("attempts " + storage.exchanged.size(), storage.exchanged.size() >= 2);
-        assertTrue("attempts " + storage.exchanged.size(), storage.exchanged.size() <= 30);
-        for (String token : storage.exchanged) {
-            assertEquals("refresh-1", token);
-        }
-        // The refusal reports name no token.
-        assertFalse(errors.isEmpty());
-        for (Throwable error : errors) {
-            assertFalse(String.valueOf(error.getMessage()).contains("refresh-1"));
-            assertFalse(String.valueOf(error.getCause()).contains("refresh-1"));
-        }
-        clock.advance(60000);
-        assertEquals("no reconnect", 1, kinds().stream().filter("connect"::equals).count());
+        assertEquals(2, storage.exchanged.size());
+        assertNull(horizonOf());
+
+        // Nothing is left after the verdict: no further presentation whatever the clock does.
+        clock.advance(600000);
+        drainExecutor();
+        assertEquals(2, storage.exchanged.size());
+        assertEquals(1, disconnects.size());
     }
 
 
@@ -549,15 +584,10 @@ public class TokenExchangeTest extends RpcTestBase {
         awaitCondition("refusal reported", () -> !errors.isEmpty());
         assertTrue(clock.requestedDelays().contains(5000L));
 
-        // The verdict waits for the scheduler's clock to pass the grace; no wall clock step moves it.
-        for (int step = 0; step < 4; step++) {
-            clock.advance(1000);
-            drainExecutor();
-        }
-        drainExecutor();
-        assertTrue(disconnects.isEmpty());
-        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1);
+        // The retry and the verdict are timed on the scheduler's clock, inside the grace; no wall clock step moves them.
+        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1, 1000, 5);
         assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        assertEquals(2, storage.exchanged.size());
     }
 
 
@@ -589,17 +619,62 @@ public class TokenExchangeTest extends RpcTestBase {
         assertTrue(errors.get(0) instanceof TokenError);
         assertTrue(disconnects.isEmpty());
 
-        // The fetch retry presents the stored token again, inside the grace.
-        pumpUntil(clock, "second attempt", () -> storage.exchanged.size() >= 3);
-        assertEquals("refresh-2", storage.exchanged.get(1));
-        assertEquals("refresh-2", storage.exchanged.get(2));
+        // The fetch retry presents the stored token once more, and its refusal of the same value is the verdict.
+        pumpUntil(clock, "verdict", () -> disconnects.size() == 1);
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        assertEquals(Arrays.asList("refresh-1", "refresh-2", "refresh-2"), storage.exchanged);
+        assertEquals(1, connected.size());
+    }
+
+
+    @Test
+    public void renewalRefusalWithAChangedStoredTokenAtTheRetryConnects() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        AtomicBoolean renewing = new AtomicBoolean();
+        AtomicInteger loads = new AtomicInteger();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public String load() {
+                if (!renewing.get()) {
+                    return super.load();
+                }
+                // The renewal and its immediate re-read find refresh-2; the fetch retry finds the application's newer token.
+                return loads.getAndIncrement() < 2 ? "refresh-2" : "refresh-3";
+            }
+
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                if (event.getRefreshToken().equals("refresh-2")) {
+                    exchanged.add(event.getRefreshToken());
+                    cb.onDone(new UnauthorizedException(), null);
+                    return;
+                }
+                super.exchange(event, cb);
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("connected", () -> connected.size() == 1);
+        long delay = renewalDelay(clock);
+        answerExchanges("access-2|refresh-4");
+
+        renewing.set(true);
+        clock.advance(delay);
+        awaitCondition("refusal reported", () -> !errors.isEmpty());
+        assertTrue(disconnects.isEmpty());
+
+        // The fetch retry presents the newer token, which the issuer accepts: the session goes on with it.
+        pumpUntil(clock, "renewed with the newer token", () -> storage.stored.contains("refresh-4"));
+        assertEquals(Arrays.asList("refresh-1", "refresh-2", "refresh-3"), storage.exchanged);
         assertTrue(disconnects.isEmpty());
         assertEquals(1, connected.size());
     }
 
 
     @Test
-    public void refusalRunSurvivesAReconnectAndDisconnectEndsIt() throws Exception {
+    public void refusalRunSurvivesAReconnectAndItsRefusalIsTheVerdict() throws Exception {
         ManualScheduler clock = new ManualScheduler();
         Storage storage = new Storage("refresh-1") {
             @Override
@@ -614,21 +689,19 @@ public class TokenExchangeTest extends RpcTestBase {
         Object horizon = horizonOf();
         assertNotNull(horizon);
 
-        // The reconnect goes on with the same run: its horizon is the one of the first refusal.
+        // The transport is lost before the one retry of the run fires, and the retry goes with its connection. The reconnect
+        // goes on with the same run: its bootstrap presents the stored token, and its refusal of the same value is the verdict.
         server.closeConnection();
-        pumpUntil(clock, "reconnect refused", () -> storage.exchanged.size() >= 3);
-        assertSame(horizon, horizonOf());
-        assertTrue(disconnects.isEmpty());
+        pumpUntil(clock, "verdict of the reconnect", () -> disconnects.size() == 1);
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        assertEquals(Arrays.asList("refresh-1", "refresh-1"), storage.exchanged);
+        assertNull(horizonOf());
 
-        // The application's disconnect ends the run: a new connect starts one, even past the old horizon.
-        client.disconnect();
-        awaitCondition("run closed", () -> horizonOf() == null);
-        clock.advance(29000);
-        int before = bootstrapDelays(clock).size();
+        // The verdict closed the run: the next connect opens a new one with its own first refusal.
         client.connect();
-        awaitCondition("retry of the new run scheduled", () -> bootstrapDelays(clock).size() > before);
+        awaitCondition("refusal of the new run reported", () -> errors.size() == 2);
         assertNotNull(horizonOf());
-        assertEquals(0, disconnects.stream().filter((DisconnectedEvent event) -> event.getCode() == CODE_DISCONNECT_UNAUTHORIZED).count());
+        assertNotSame(horizon, horizonOf());
     }
 
 
@@ -690,12 +763,12 @@ public class TokenExchangeTest extends RpcTestBase {
         assertEquals(values, storage.exchanged);
         assertTrue(disconnects.isEmpty());
 
-        // The retry comes after the backoff, and presents the unchanged value once more and no sooner.
-        clock.advance(2000);
-        drainExecutor();
+        // The retry comes at a random moment inside the grace, and presents the unchanged value once more; its refusal ends the
+        // session, and nothing is presented after it.
+        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1);
         assertEquals(5, storage.exchanged.size());
         assertEquals("refresh-4", storage.exchanged.get(4));
-        assertTrue(disconnects.isEmpty());
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
     }
 
 
@@ -2053,11 +2126,23 @@ public class TokenExchangeTest extends RpcTestBase {
 
     // Moves the manual clock forward until the condition holds. The clock stays inside the ping delay of a connection.
     private void pumpUntil(ManualScheduler clock, String what, BooleanSupplier condition) throws InterruptedException {
-        for (int step = 0; step < PUMP_STEPS; step++) {
+        pumpUntil(clock, what, condition, PUMP_STEP_MILLIS, PUMP_STEPS);
+    }
+
+
+    // Moves the manual clock forward in steps of stepMillis, at most steps times, until the condition holds.
+    private void pumpUntil(
+            ManualScheduler clock,
+            String what,
+            BooleanSupplier condition,
+            int stepMillis,
+            int steps
+    ) throws InterruptedException {
+        for (int step = 0; step < steps; step++) {
             if (condition.getAsBoolean()) {
                 return;
             }
-            clock.advance(PUMP_STEP_MILLIS);
+            clock.advance(stepMillis);
             Thread.sleep(5);
         }
         awaitCondition(what, condition);
