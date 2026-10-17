@@ -765,6 +765,8 @@ final class TokenExchangeFlow {
     // The connection token of the timer refresh: an exchange over the connected socket. Runs on the executor.
     private void renew(TokenCallback cb) {
         WebSocket transport = host.transport();
+        // The renewal is superseded by a refresh() call made after this point: its outcome is then a stale one.
+        final long generation = host.refreshGeneration();
         String refreshToken;
         try {
             refreshToken = exchange.load();
@@ -781,7 +783,7 @@ final class TokenExchangeFlow {
             cb.Done(new UnauthorizedException(), null);
             return;
         }
-        runRenewal(transport, cb, refreshToken);
+        runRenewal(transport, cb, refreshToken, generation);
     }
 
 
@@ -790,7 +792,8 @@ final class TokenExchangeFlow {
     private void runRenewal(
             final WebSocket transport,
             final TokenCallback cb,
-            final String refreshToken
+            final String refreshToken,
+            final long generation
     ) {
         final Renewal renewal = new Renewal();
         try {
@@ -806,6 +809,7 @@ final class TokenExchangeFlow {
                                 transport,
                                 cb,
                                 refreshToken,
+                                generation,
                                 Extensions.unwrapCompletion(err),
                                 result
                         );
@@ -817,7 +821,7 @@ final class TokenExchangeFlow {
             });
         } catch (RuntimeException e) {
             if (renewal.called.compareAndSet(false, true)) {
-                onRenewed(renewal, transport, cb, refreshToken, e, null);
+                onRenewed(renewal, transport, cb, refreshToken, generation, e, null);
             } else {
                 host.reportError(new TokenError(e));
             }
@@ -838,6 +842,7 @@ final class TokenExchangeFlow {
             WebSocket transport,
             TokenCallback cb,
             String refreshToken,
+            long generation,
             Throwable err,
             TokenExchangeResult result
     ) {
@@ -849,6 +854,13 @@ final class TokenExchangeFlow {
         if (transport != host.transport() || host.state() != ClientState.CONNECTED) {
             storeAbandonedRotation(result, refreshToken);
             cb.Done(new IOException("connection lost"), null);
+            return;
+        }
+        // A renewal superseded by a refresh() call is a stale attempt: the call's token decides, so its outcome, a refusal
+        // or an empty token included, changes no run and ends no session. Its rotation is stored as the abandoned one's.
+        if (generation != host.refreshGeneration()) {
+            storeAbandonedRotation(result, refreshToken);
+            cb.Done(new IOException("superseded by a refresh"), null);
             return;
         }
         if (err == null && isAccepted(result)) {
@@ -881,7 +893,7 @@ final class TokenExchangeFlow {
                 return;
             }
             if (!again.equals(refreshToken)) {
-                runRenewal(transport, cb, again);
+                runRenewal(transport, cb, again, generation);
                 return;
             }
             if (horizonPassed() || refusals >= REFUSAL_RETRIES) {

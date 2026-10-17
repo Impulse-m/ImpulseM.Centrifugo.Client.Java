@@ -2406,7 +2406,7 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
-    public void emptyRefreshTokenAtRenewalEndsTheSessionWhileARefreshCallWaits() throws Exception {
+    public void supersededRenewalRefusalIsSilentWhileARefreshCallWaits() throws Exception {
         ManualScheduler clock = new ManualScheduler();
         answerExchanges("access-1|refresh-2");
         answerIdentity(true, TTL_SECONDS);
@@ -2419,16 +2419,19 @@ public class TokenExchangeTest extends RpcTestBase {
 
         clock.advance(delay);
         awaitCondition("renewal exchange held", () -> storage.held != null);
-        // A refresh call waits behind the renewal. The renewal is then refused, and the storage holds no token any more.
+        // A refresh call supersedes the renewal and waits behind it. The renewal is then refused, and the storage holds no
+        // token any more: the superseded refusal reports nothing and ends nothing, and the waiting refresh is sent.
         client.refresh("manual-token", (Throwable err, AuthResult result) -> {
         });
         storage.refreshToken = "";
         storage.held.onDone(new UnauthorizedException(), null);
 
-        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1);
-        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
-        // The waiting refresh was never sent: the session ended before it could run.
-        assertEquals(Arrays.asList("access-1"), refreshTokens());
+        awaitCondition("waiting refresh sent", () -> refreshTokens().contains("manual-token"));
+        drainExecutor();
+        assertTrue(disconnects.isEmpty());
+        assertTrue(errors.isEmpty());
+        assertEquals(1, connected.size());
+        assertEquals(Arrays.asList("access-1", "manual-token"), refreshTokens());
     }
 
 
@@ -2450,6 +2453,96 @@ public class TokenExchangeTest extends RpcTestBase {
         assertEquals(1, errors.size());
         assertTrue(errors.get(0) instanceof TokenError);
         assertEquals("access-1", lastRefreshToken());
+    }
+
+
+    @Test
+    public void storeStepLoadFailureIsReportedAndTheExchangeCompletes() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        AtomicInteger loads = new AtomicInteger();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public String load() throws UnauthorizedException {
+                // The first read starts the exchange, the second one is the read of the store step, which fails.
+                if (loads.incrementAndGet() == 2) {
+                    throw new IllegalStateException("storage is unreadable");
+                }
+                return super.load();
+            }
+        };
+        newClient(exchangeOptions(storage));
+
+        client.connect();
+
+        awaitCondition("connected", () -> connected.size() == 1);
+        assertEquals(1, errors.size());
+        assertTrue(errors.get(0) instanceof TokenError);
+        assertTrue(storage.stored.isEmpty());
+        assertEquals("access-1", lastRefreshToken());
+    }
+
+
+    @Test
+    public void unauthorizedFromTheStoreStepAtBootstrapEndsTheSession() throws Exception {
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(false, 0);
+        AtomicInteger loads = new AtomicInteger();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public String load() throws UnauthorizedException {
+                // The first read starts the exchange, the second one is the read of the store step, which ends the session.
+                if (loads.incrementAndGet() == 2) {
+                    throw new UnauthorizedException();
+                }
+                return super.load();
+            }
+        };
+        newClient(exchangeOptions(storage));
+
+        client.connect();
+
+        awaitCondition("disconnected", () -> disconnects.size() == 1);
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        assertTrue(connected.isEmpty());
+        assertTrue(errors.isEmpty());
+        assertTrue(storage.stored.isEmpty());
+    }
+
+
+    @Test
+    public void unauthorizedFromTheStoreStepAtRenewalEndsTheSession() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        AtomicBoolean armed = new AtomicBoolean();
+        AtomicInteger loads = new AtomicInteger();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public String load() throws UnauthorizedException {
+                // Once armed, the first read starts the renewal, and the second one, of the store step, ends the session.
+                if (armed.get() && loads.incrementAndGet() == 2) {
+                    throw new UnauthorizedException();
+                }
+                return super.load();
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("connected", () -> connected.size() == 1);
+        long delay = renewalDelay(clock);
+
+        // The renewal rotates the token, so its store step runs.
+        answerExchanges("access-2|refresh-3");
+        armed.set(true);
+        clock.advance(delay);
+        pumpUntil(clock, "disconnected", () -> disconnects.size() == 1);
+
+        assertEquals(CODE_DISCONNECT_UNAUTHORIZED, disconnects.get(0).getCode());
+        assertTrue(errors.isEmpty());
+        // Only the bootstrap's rotation was stored: the renewal's was not.
+        assertEquals(Arrays.asList("refresh-2"), storage.stored);
+        assertEquals(Arrays.asList("refresh-1", "refresh-2"), storage.exchanged);
     }
 
 
