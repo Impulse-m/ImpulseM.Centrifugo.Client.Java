@@ -37,7 +37,8 @@ public abstract class TokenExchange {
      * Exchanges the refresh token for an access token. The callback is called once, from any thread.
      * Fail it with {@link UnauthorizedException} (or with the {@link TokenExchangeRefusedException} of
      * {@link TokenExchangeEvent#rpc}) when the issuer refused the refresh token: the client presents the
-     * stored token again, with backoff, until the grace horizon has passed, and only then ends the session.
+     * stored token again once inside the grace horizon, picks up a newer stored token at once, and ends the session at
+     * the second refusal of a token that did not change, or at the horizon.
      * Any other failure is reported to the listener and retried with backoff.
      */
     public abstract void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb);
