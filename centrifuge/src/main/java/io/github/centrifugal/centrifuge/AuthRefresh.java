@@ -446,6 +446,9 @@ final class AuthRefresh {
             connectTokenStored = false;
             timerSuperseded = false;
             refreshGeneration++;
+            if (flow != null) {
+                flow.tokenAccepted();
+            }
             if (host.state() == ClientState.CONNECTED) {
                 scheduleExpiry(result.getExpires(), result.getTtl());
             } else {

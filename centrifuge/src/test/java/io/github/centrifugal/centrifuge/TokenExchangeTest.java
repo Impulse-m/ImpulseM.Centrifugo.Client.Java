@@ -775,6 +775,62 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
+    public void acceptedRefreshCallClosesTheRefusalRunOfAnEarlierDeadSession() throws Exception {
+        ManualScheduler clock = new ManualScheduler();
+        answerExchanges("access-1|refresh-2");
+        answerIdentity(true, TTL_SECONDS);
+        AtomicBoolean refusing = new AtomicBoolean();
+        Storage storage = new Storage("refresh-1") {
+            @Override
+            public int grace() {
+                return 5;
+            }
+
+            @Override
+            public void exchange(TokenExchangeEvent event, ResultCallback<TokenExchangeResult> cb) {
+                if (refusing.get()) {
+                    exchanged.add(event.getRefreshToken());
+                    cb.onDone(new UnauthorizedException(), null);
+                    return;
+                }
+                super.exchange(event, cb);
+            }
+        };
+        newExchangeClient(exchangeOptions(storage), clock);
+        client.connect();
+        awaitCondition("connected", () -> connected.size() == 1);
+        long delay = renewalDelay(clock);
+
+        // The renewal is refused: a refusal run opens and its one retry is pending.
+        refusing.set(true);
+        clock.advance(delay);
+        awaitCondition("refusal reported", () -> errors.size() == 1);
+        assertTrue(disconnects.isEmpty());
+        assertNotNull(horizonOf());
+
+        // The application's refresh is accepted: the server accepted the token, so the run is over.
+        refusing.set(false);
+        CompletableFuture<AuthResult> refreshed = new CompletableFuture<>();
+        client.refresh("manual-token", (Throwable err, AuthResult result) -> {
+            if (err != null) {
+                refreshed.completeExceptionally(err);
+            } else {
+                refreshed.complete(result);
+            }
+        });
+        assertEquals("u1", refreshed.get(5, TimeUnit.SECONDS).getUser());
+        assertNull(horizonOf());
+
+        // Past the old horizon, a refusal is the first of a new run: its retry follows, no verdict yet.
+        refusing.set(true);
+        clock.advance(WINDOW_MAX_MILLIS);
+        awaitCondition("second refusal reported", () -> errors.size() == 2);
+        assertTrue(disconnects.isEmpty());
+        assertNotNull(horizonOf());
+    }
+
+
+    @Test
     public void terminalDisconnectClosesTheRefusalRun() throws Exception {
         // A refusal opens the run, then the server ends the session with a terminal close code. The run closes with the
         // session, so the anonymous connect after the storage was emptied goes on anonymously, not as a dead session.

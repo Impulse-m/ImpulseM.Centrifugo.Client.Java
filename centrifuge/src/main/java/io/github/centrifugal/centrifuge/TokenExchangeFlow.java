@@ -179,8 +179,7 @@ final class TokenExchangeFlow {
         }
         anonymousConnect = false;
         if (!reply.getConnect().getUser().isEmpty()) {
-            // The access token was accepted, so the session is alive: a refusal run of an earlier dead session is over.
-            closeRefusalRun();
+            tokenAccepted();
             return false;
         }
         // The server pings the connection from now on, during the bootstrap too: the ping is answered as a connected one is.
@@ -247,6 +246,16 @@ final class TokenExchangeFlow {
             bootstrapAttempt = 0;
             closeRefusalRun();
         }
+    }
+
+
+    /**
+     * Called when the server accepted the connection token: a connect reply with a user, or a refresh reply of a
+     * refresh call. The session is valid then, so an open refusal run is over, and a later refusal starts a run of
+     * its own with a fresh horizon.
+     */
+    void tokenAccepted() {
+        closeRefusalRun();
     }
 
 
