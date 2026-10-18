@@ -250,7 +250,7 @@ final class TokenSource {
     void onAuth(String user, String authClass, boolean always) {
         String token = auth.confirmedToken();
         boolean unusableCleared = unusable != null;
-        boolean spentBefore = spent != null;
+        String spentBefore = spent;
         int before = stamp.generation;
         if (always) {
             renewedFor = null;
@@ -271,7 +271,7 @@ final class TokenSource {
         observe(user, authClass);
         boolean changed = stamp.generation != before;
         evaluateAll();
-        boolean spentChanged = (spent != null) != spentBefore;
+        boolean spentChanged = !Objects.equals(spentBefore, spent);
         if (always || changed || unusableCleared || spentChanged) {
             notifyListening();
         }

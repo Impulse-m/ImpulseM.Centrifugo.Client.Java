@@ -726,6 +726,9 @@ public final class RpcPool {
         if (stale(conn)) {
             retire(conn);
         }
+        // The client drops the replies of its old transport, so the calls on the wire are lost here, at the connection's event.
+        conn.lost.addAll(conn.calls);
+        conn.calls.clear();
         releaseLost(conn);
         pumpEndpoint(conn.endpoint);
     }
