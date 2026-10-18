@@ -233,6 +233,33 @@ public final class FakeCentrifugoServer {
         replyDefault(webSocket, cmd);
     }
 
+    /** The number of commands held by {@link #deferCommand} which no release has answered yet. */
+    public int heldCount() {
+        synchronized (deferredCommands) {
+            return deferredCommands.size();
+        }
+    }
+
+    /**
+     * Answers the held commands which match, in the order received, and keeps the others held. A command which arrived on a
+     * connection the client has since replaced still gets its answer on that connection.
+     */
+    public void releaseDeferredMatching(Function<Protocol.Command, Boolean> matches) {
+        List<Protocol.Command> released = new ArrayList<>();
+        List<WebSocket> sockets = new ArrayList<>();
+        synchronized (deferredCommands) {
+            for (int i = deferredCommands.size() - 1; i >= 0; i--) {
+                if (Boolean.TRUE.equals(matches.apply(deferredCommands.get(i)))) {
+                    released.add(0, deferredCommands.remove(i));
+                    sockets.add(0, deferredSockets.remove(i));
+                }
+            }
+        }
+        for (int i = 0; i < released.size(); i++) {
+            answerDeferred(sockets.get(i), released.get(i));
+        }
+    }
+
     /** Answer the commands held by {@link #deferCommand}, in the order received. */
     public void releaseDeferredCommands() {
         List<Protocol.Command> pending;
@@ -243,7 +270,7 @@ public final class FakeCentrifugoServer {
         }
         WebSocket s = currentSocket.get();
         for (Protocol.Command cmd : pending) {
-            replyDefault(s, cmd);
+            answerDeferred(s, cmd);
         }
     }
 
@@ -261,8 +288,19 @@ public final class FakeCentrifugoServer {
             deferredSockets.clear();
         }
         for (int i = 0; i < pending.size(); i++) {
-            replyDefault(sockets.get(i), pending.get(i));
+            answerDeferred(sockets.get(i), pending.get(i));
         }
+    }
+
+    // A held command is answered by the unhandled hook when it gives a reply, as a command the hooks did not answer is, and by
+    // the default replies otherwise.
+    private void answerDeferred(WebSocket webSocket, Protocol.Command cmd) {
+        Protocol.Reply reply = onUnhandled != null ? onUnhandled.apply(cmd) : null;
+        if (reply != null) {
+            send(webSocket, reply);
+            return;
+        }
+        replyDefault(webSocket, cmd);
     }
 
     private void replyDefault(WebSocket webSocket, Protocol.Command cmd) {

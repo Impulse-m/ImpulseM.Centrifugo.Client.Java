@@ -352,7 +352,7 @@ public class RpcPoolTest extends RpcTestBase {
     public void theIdleCheckIsNotRearmedByEachCallOnTheFallbackScheduler() throws Exception {
         answerRpcs("ok");
         // A timeout of an hour tells the idle check apart from the deadlines of the calls, which last ten seconds.
-        RpcPool pool = build(builder().removeCancelledTimers(false).idleTimeout(TimeUnit.HOURS.toMillis(1L)));
+        RpcPool pool = build(builder().timeout(10_000).removeCancelledTimers(false).idleTimeout(TimeUnit.HOURS.toMillis(1L)));
         for (int i = 0; i < 50; i++) {
             CompletableFuture<RPCResult> future = new CompletableFuture<>();
             pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(10_000L).build(), into(future));
@@ -368,7 +368,7 @@ public class RpcPoolTest extends RpcTestBase {
     public void aSettledCallLetsGoOfItsPayloadOnTheFallbackScheduler() throws Exception {
         answerRpcs("ok");
         // The cancelled deadline of the call stays queued on this scheduler until its ten seconds are over.
-        RpcPool pool = build(builder().removeCancelledTimers(false));
+        RpcPool pool = build(builder().timeout(10_000).removeCancelledTimers(false));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         byte[] payload = new byte[1 << 20];
         WeakReference<byte[]> released = new WeakReference<>(payload);
@@ -533,6 +533,269 @@ public class RpcPoolTest extends RpcTestBase {
         } catch (IllegalArgumentException expected) {
             assertTrue(expected.getMessage().contains("maxInflightPerConnection"));
         }
+    }
+
+
+    // T14
+    @Test
+    public void callWaitsForItsConnectionToConnect() throws Exception {
+        answerRpcs("payload");
+        server.deferCommand = cmd -> cmd.hasConnect();
+        RpcPool pool = build(builder());
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
+        awaitCondition("the call waits for its connection", () -> pool.stats().getQueued() == 1);
+        awaitHeld(server);
+        assertEquals("not written before the reply", 0, pool.stats().getInflight());
+        server.releaseDeferredCommands();
+        assertEquals("payload", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+        assertEquals(1, connectsOf(server));
+    }
+
+
+    // T15
+    @Test
+    public void connectionsAreSharedByKeysOfOneEndpoint() throws Exception {
+        answerRpcs("payload");
+        RpcPool pool = build(builder().maxConnectionsPerEndpoint(1).maxInflightPerConnection(2));
+        CompletableFuture<RPCResult> a = new CompletableFuture<>();
+        CompletableFuture<RPCResult> b = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("a").build(), into(a));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("b").build(), into(b));
+        assertEquals("payload", new String(a.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+        assertEquals("payload", new String(b.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+        assertEquals("one socket for both keys", 1, connectsOf(server));
+        assertEquals(2, sentRpcRequests().size());
+        assertEquals(1, pool.stats().getConnections());
+    }
+
+
+    // T16
+    @Test
+    public void reroutedCallGoesToTheFrontOfItsNewLine() throws Exception {
+        FakeCentrifugoServer other = new FakeCentrifugoServer();
+        other.start();
+        try {
+            server.onCommand = cmd -> cmd.hasRpc() && "svc.a".equals(cmd.getRpc().getMethod()) ? moveReply(cmd.getId(), "b") : null;
+            AtomicInteger held = new AtomicInteger();
+            other.onUnhandled = cmd -> cmd.hasRpc() ? rpcReply(cmd.getId(), "ok") : null;
+            // Only the first call on b is held: it keeps the window of b full while the rerouted call and a second call wait.
+            other.deferCommand = cmd -> cmd.hasRpc() && held.incrementAndGet() == 1;
+            RpcPool pool = build(new RpcPool.Builder(key -> Collections.singletonList("b".equals(key) ? other.url() : server.url()))
+                    .random(maximumDraws())
+                    .maxConnectionsPerEndpoint(1)
+                    .maxInflightPerConnection(1)
+                    .reroute(error -> error.getMetadata().get("x-example-relocate")));
+            CompletableFuture<RPCResult> first = submitTo(pool, "svc.first", "b");
+            awaitCondition("the first call holds the window of b", () -> rpcMethodsOf(other).size() == 1);
+            CompletableFuture<RPCResult> second = submitTo(pool, "svc.second", "b");
+            CompletableFuture<RPCResult> a = submitTo(pool, "svc.a", "a");
+            // A has been answered with its move and waits at the front of b: the first call is on the wire, and two calls wait.
+            awaitCondition("the rerouted call and the second call wait for b", () -> rpcMethodsOf(server).contains("svc.a")
+                    && pool.stats().getInflight() == 1 && pool.stats().getQueued() == 2);
+            other.releaseDeferredCommandsOnTheirSockets();
+            first.get(5, TimeUnit.SECONDS);
+            a.get(5, TimeUnit.SECONDS);
+            second.get(5, TimeUnit.SECONDS);
+            assertEquals(Arrays.asList("svc.first", "svc.a", "svc.second"), rpcMethodsOf(other));
+        } finally {
+            other.stop();
+        }
+    }
+
+
+    // T31
+    @Test
+    public void retiredConnectionCloseReportsNoErrorAndHoldsNoOpen() throws Exception {
+        FakeCentrifugoServer endpoint = new FakeCentrifugoServer();
+        endpoint.completeClose = true;
+        endpoint.start();
+        try {
+            server.onCommand = cmd -> cmd.hasRefresh() ? refreshAs(cmd, "bob") : connectAs(cmd, "alice", false);
+            endpoint.onCommand = cmd -> {
+                if (cmd.hasConnect()) {
+                    return connectAs(cmd, cmd.getConnect().getToken().equals("bob-token") ? "bob" : "alice", false);
+                }
+                return cmd.hasRefresh() ? refreshAs(cmd, "alice") : null;
+            };
+            endpoint.onUnhandled = cmd -> cmd.hasRpc() ? rpcReply(cmd.getId(), "ok") : null;
+            // A and B are held until the test answers them; C is answered at once.
+            endpoint.deferCommand = cmd -> cmd.hasRpc() && !"svc.c".equals(cmd.getRpc().getMethod());
+            Options options = new Options();
+            options.setToken("alice-token");
+            Client main = new Client(server.url(), options, new EventListener() {
+                @Override
+                public void onConnected(Client c, ConnectedEvent e) {
+                    connectedSignals.release();
+                }
+            });
+            connect(main);
+            List<Throwable> errors = Collections.synchronizedList(new ArrayList<>());
+            RpcPool pool = build(new RpcPool.Builder(key -> Collections.singletonList(endpoint.url()))
+                    .random(maximumDraws())
+                    .tokenFrom(main)
+                    .maxConnectionsPerEndpoint(1)
+                    .maxInflightPerConnection(2)
+                    .errorListener((String url, Throwable error) -> errors.add(error)));
+            CompletableFuture<RPCResult> a = submitTo(pool, "svc.a", "");
+            CompletableFuture<RPCResult> b = submitTo(pool, "svc.b", "");
+            awaitCondition("A and B are on the wire", () -> rpcMethodsOf(endpoint).size() == 2);
+            CompletableFuture<AuthResult> refreshed = new CompletableFuture<>();
+            main.refresh("bob-token", (Throwable error, AuthResult result) -> {
+                if (error != null) {
+                    refreshed.completeExceptionally(error);
+                } else {
+                    refreshed.complete(result);
+                }
+            });
+            refreshed.get(5, TimeUnit.SECONDS);
+            // The identity changed while A and B are in flight. A's answer frees a slot of the stale connection, which is retired with
+            // B still on the wire. The fleet then closes it for good: B settles with the loss, no error is reported, and the one
+            // connection the endpoint allows is free for the next call at once.
+            endpoint.releaseDeferredMatching(cmd -> cmd.hasRpc() && "svc.a".equals(cmd.getRpc().getMethod()));
+            assertEquals("ok", new String(a.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+            awaitCondition("B is still on the wire", () -> pool.stats().getInflight() == 1);
+            endpoint.disconnect(3501, "terminal");
+            assertEquals("B settles with the loss", "rpc connection retired", errorOf(b).getMessage());
+            CompletableFuture<RPCResult> c = submitTo(pool, "svc.c", "");
+            assertEquals("ok", new String(c.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+            assertTrue("no error for the retired connection", errors.isEmpty());
+        } finally {
+            endpoint.stop();
+        }
+    }
+
+
+    // T32
+    @Test
+    public void terminalCloseHoldsTheEndpointOpens() throws Exception {
+        answerRpcs("payload");
+        List<Throwable> errors = Collections.synchronizedList(new ArrayList<>());
+        RpcPool pool = build(builder().errorListener((String url, Throwable error) -> errors.add(error)));
+        assertEquals("payload", new String(submitTo(pool, "svc.read", "").get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+        server.disconnect(3501, "terminal");
+        awaitCondition("the close is reported", () -> !errors.isEmpty());
+        CompletableFuture<RPCResult> next = submitTo(pool, "svc.read", "");
+        assertEquals("the next open waits the hold", 0, pool.stats().getConnections());
+        assertEquals("payload", new String(next.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+        assertEquals("the endpoint reopened after the hold", 2, connectsOf(server));
+    }
+
+
+    // T41
+    @Test
+    public void refusesTimerDurationsAboveTheLimit() throws Exception {
+        try {
+            builder().idleTimeout(2147483648L).build();
+            fail("an idle timeout above the timer limit is refused");
+        } catch (IllegalArgumentException expected) {
+            assertTrue(expected.getMessage().contains("idleTimeout"));
+        }
+        answerRpcs("payload");
+        RpcPool pool = build(builder().timeout(5000));
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(5001L).build(), into(future));
+        assertEquals(RpcPool.BAD_CONFIGURATION, ((ReplyError) errorOf(future)).getCode());
+        assertEquals("the fleet sees no connect", 0, connectsOf(server));
+    }
+
+
+    // T42
+    @Test
+    public void saturatedKeyDoesNotHoldBackAnotherKey() throws Exception {
+        FakeCentrifugoServer other = new FakeCentrifugoServer();
+        other.start();
+        try {
+            server.onCommand = cmd -> null;
+            server.deferCommand = cmd -> cmd.hasRpc();
+            other.onUnhandled = cmd -> cmd.hasRpc() ? rpcReply(cmd.getId(), "b") : null;
+            other.deferCommand = cmd -> cmd.hasRpc();
+            RpcPool pool = build(new RpcPool.Builder(key -> Collections.singletonList("b".equals(key) ? other.url() : server.url()))
+                    .random(maximumDraws())
+                    .maxConnectionsPerEndpoint(1)
+                    .maxInflightPerConnection(1));
+            CompletableFuture<RPCResult> a1 = submitTo(pool, "svc.a1", "a");
+            awaitCondition("A1 holds the window of a", () -> rpcMethodsOf(server).size() == 1);
+            CompletableFuture<RPCResult> a2 = submitTo(pool, "svc.a2", "a");
+            assertEquals("A2 waits in its line", 1, pool.stats().getQueued());
+            CompletableFuture<RPCResult> b = submitTo(pool, "svc.b", "b");
+            awaitCondition("B is written at once", () -> rpcMethodsOf(other).size() == 1);
+            assertEquals("A2 stays queued", 1, pool.stats().getQueued());
+            long before = pool.keyLookups();
+            other.releaseDeferredCommandsOnTheirSockets();
+            assertEquals("b", new String(b.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+            assertEquals("the line of a is not looked up at the reply of b", before, pool.keyLookups());
+            assertTrue("A2 is still waiting", !a2.isDone());
+            server.releaseDeferredCommandsOnTheirSockets();
+            a1.get(5, TimeUnit.SECONDS);
+        } finally {
+            other.stop();
+        }
+    }
+
+
+    private static CompletableFuture<RPCResult> submitTo(RpcPool pool, String method, String endpointKey) {
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        pool.rpc(method, EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey(endpointKey).build(), into(future));
+        return future;
+    }
+
+
+    // The methods of the rpc requests a fake server received, in order.
+    private static List<String> rpcMethodsOf(FakeCentrifugoServer endpoint) {
+        List<String> methods = new ArrayList<>();
+        for (Protocol.Command cmd : endpoint.received()) {
+            if (cmd.hasRpc()) {
+                methods.add(cmd.getRpc().getMethod());
+            }
+        }
+        return methods;
+    }
+
+
+    // The connect commands a fake server received.
+    private static int connectsOf(FakeCentrifugoServer endpoint) {
+        int count = 0;
+        for (Protocol.Command cmd : endpoint.received()) {
+            if (cmd.hasConnect()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+
+    private static int refreshesOf(FakeCentrifugoServer endpoint) {
+        int count = 0;
+        for (Protocol.Command cmd : endpoint.received()) {
+            if (cmd.hasRefresh()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+
+    // A connect reply for the token of the command: the user of the token, the auth class, and the ttl of the connection if asked.
+    private static Protocol.Reply connectAs(Protocol.Command cmd, String user, boolean expires) {
+        Protocol.ConnectResult.Builder reply = Protocol.ConnectResult.newBuilder()
+                .setClient("fake-client")
+                .setVersion("0.0.0")
+                .setPing(25)
+                .setUser(user)
+                .setAuthClass("authenticated");
+        if (expires) {
+            reply.setExpires(true).setTtl(1);
+        }
+        return Protocol.Reply.newBuilder().setId(cmd.getId()).setConnect(reply.build()).build();
+    }
+
+
+    private static Protocol.Reply refreshAs(Protocol.Command cmd, String user) {
+        return Protocol.Reply.newBuilder()
+                .setId(cmd.getId())
+                .setRefresh(Protocol.RefreshResult.newBuilder().setUser(user).setAuthClass("authenticated").setExpires(false))
+                .build();
     }
 
 

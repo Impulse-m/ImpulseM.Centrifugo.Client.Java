@@ -186,6 +186,15 @@ abstract class RpcTestBase extends FakeServerTestBase {
     }
 
 
+    /**
+     * Waits until the fake server holds a command, so that the release which follows answers it: a command which arrives
+     * after its release would be held forever.
+     */
+    protected static void awaitHeld(FakeCentrifugoServer endpoint) throws InterruptedException {
+        awaitCondition("a command is held by the server", () -> endpoint.heldCount() > 0);
+    }
+
+
     /** Waits until the condition holds, or fails after {@link #WAIT_MILLIS}. */
     protected static void awaitCondition(String description, BooleanSupplier condition) throws InterruptedException {
         long deadline = System.currentTimeMillis() + WAIT_MILLIS;

@@ -4,6 +4,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -13,9 +14,14 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
 
+import okhttp3.Cookie;
+import okhttp3.CookieJar;
+import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
+import okhttp3.mockwebserver.RecordedRequest;
+import okhttp3.mockwebserver.SocketPolicy;
 
 import org.junit.After;
 import org.junit.Before;
@@ -23,6 +29,8 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -118,7 +126,7 @@ public class RpcPoolRedirectTest extends RpcTestBase {
 
 
     @Test
-    public void aRedirectAnswerIsNotFollowedAndFailsWithRedirectFailed() throws Exception {
+    public void redirect3xxFailsTheFetch() throws Exception {
         MockWebServer other = new MockWebServer();
         other.start();
         try {
@@ -148,7 +156,27 @@ public class RpcPoolRedirectTest extends RpcTestBase {
 
 
     @Test
-    public void aFetchWhichWaitsForASlotCountsInTheQueueBound() throws Exception {
+    public void redirectWaiterCountsInMaxQueued() throws Exception {
+        // With maxQueued 0 a second fetch has no room to wait: it fails at once, and the first one is not disturbed.
+        RpcPool none = new RpcPool.Builder(endpointKey -> Collections.singletonList(server.url()))
+                .random(maximumDraws())
+                .maxInflightPerConnection(8)
+                .maxQueued(0)
+                .maxRedirectsInflight(1)
+                .redirect((reply, error) -> reply != null ? RpcPool.Redirect.builder(redirects.url("/data").toString()).build() : null)
+                .build();
+        try {
+            redirects.enqueue(new MockResponse().setBody("slow").setBodyDelay(1000L, TimeUnit.MILLISECONDS));
+            CompletableFuture<RPCResult> slow = new CompletableFuture<>();
+            none.rpc("svc.read", EMPTY_PAYLOAD, null, into(slow));
+            awaitCondition("the first fetch is on the wire", () -> none.stats().getRedirects() == 1);
+            CompletableFuture<RPCResult> refused = new CompletableFuture<>();
+            none.rpc("svc.read", EMPTY_PAYLOAD, null, into(refused));
+            assertEquals(ReplyError.LIMIT_EXCEEDED, ((ReplyError) errorOf(refused)).getCode());
+            assertEquals("slow", new String(slow.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+        } finally {
+            none.close();
+        }
         redirects.enqueue(new MockResponse().setBody("one").setBodyDelay(1000L, TimeUnit.MILLISECONDS));
         redirects.enqueue(new MockResponse().setBody("two"));
         pool = new RpcPool.Builder(endpointKey -> Collections.singletonList(server.url()))
@@ -167,7 +195,7 @@ public class RpcPoolRedirectTest extends RpcTestBase {
         assertEquals("the fetch over the bound is refused", ReplyError.LIMIT_EXCEEDED, failureOf().getCode());
         assertEquals("one", new String(first.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
         assertEquals("two", new String(second.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
-        assertEquals("the refused fetch was never requested", 2, redirects.getRequestCount());
+        assertEquals("the refused fetches were never requested", 3, redirects.getRequestCount());
         assertEquals(0, pool.stats().getQueued());
     }
 
@@ -216,12 +244,70 @@ public class RpcPoolRedirectTest extends RpcTestBase {
 
 
     @Test
-    public void theAllowedSchemesFollowTheEndpoint() {
+    public void httpRedirectIsRefusedFromASecureEndpoint() {
         assertTrue(RpcPoolRedirect.allowed("ws://host/connection/websocket", "http://host.example/x"));
         assertTrue(RpcPoolRedirect.allowed("ws://host/connection/websocket", "https://host.example/x"));
         assertTrue(RpcPoolRedirect.allowed("wss://host/connection/websocket", "https://host.example/x"));
-        assertFalse("a secure endpoint takes no plain http redirect", RpcPoolRedirect.allowed("wss://host/connection/websocket", "http://host.example/x"));
+        assertFalse("a wss endpoint takes no plain http redirect", RpcPoolRedirect.allowed("wss://host/connection/websocket", "http://host.example/x"));
+        assertFalse("an https endpoint takes no plain http redirect", RpcPoolRedirect.allowed("https://host/x", "http://host.example/x"));
         assertFalse(RpcPoolRedirect.allowed("ws://host/connection/websocket", "ftp://host.example/x"));
+    }
+
+
+    // T34
+    @Test
+    public void redirectFetchCarriesNoApplicationCredentials() throws Exception {
+        OkHttpClient application = new OkHttpClient.Builder()
+                .addInterceptor(chain -> chain.proceed(chain.request().newBuilder().header("Authorization", "app-secret").build()))
+                .cookieJar(new CookieJar() {
+                    @Override
+                    public void saveFromResponse(HttpUrl url, List<Cookie> cookies) {
+                    }
+
+
+                    @Override
+                    public List<Cookie> loadForRequest(HttpUrl url) {
+                        return Collections.singletonList(new Cookie.Builder().name("session").value("secret").domain(url.host()).build());
+                    }
+                })
+                .authenticator((route, response) -> response.request().newBuilder().header("Authorization", "retry-secret").build())
+                .build();
+        redirects.enqueue(new MockResponse().setResponseCode(401));
+        pool = new RpcPool.Builder(endpointKey -> Collections.singletonList(server.url()))
+                .random(maximumDraws())
+                .okHttpClient(application)
+                .redirect((reply, error) -> reply != null
+                        ? RpcPool.Redirect.builder(redirects.url("/data").toString()).header("x-example-key", "secret").build()
+                        : null)
+                .build();
+        assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
+        RecordedRequest request = redirects.takeRequest(5, TimeUnit.SECONDS);
+        assertNull("no application header", request.getHeader("Authorization"));
+        assertNull("no cookie of the application", request.getHeader("Cookie"));
+        assertEquals("the redirect header goes with the request", "secret", request.getHeader("x-example-key"));
+        assertEquals("the 401 is not retried with credentials", 1, redirects.getRequestCount());
+    }
+
+
+    // T43
+    @Test
+    public void redirectFailureKeepsItsCauseAndReleasesTheBody() throws Exception {
+        // A body which breaks after its first chunk: the read error stays the cause of the redirect error.
+        redirects.enqueue(new MockResponse().setBody("first-chunk").setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY));
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).build());
+        ReplyError broken = failureOf();
+        assertEquals(RpcPool.REDIRECT_FAILED, broken.getCode());
+        assertNotNull("the read error is the cause", broken.getCause());
+        // A declared length over the bound: refused before the body is read.
+        pool.close();
+        redirects.enqueue(new MockResponse().setBody("chunk-bytes"));
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).maxBytes(10L).build());
+        assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
+        // A chunked body which passes the bound while it is read.
+        pool.close();
+        redirects.enqueue(new MockResponse().setChunkedBody("chunk-bytes", 4));
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).maxBytes(10L).build());
+        assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
     }
 
 
