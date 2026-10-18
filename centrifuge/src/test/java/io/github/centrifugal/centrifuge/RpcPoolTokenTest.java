@@ -806,52 +806,6 @@ public class RpcPoolTokenTest extends RpcTestBase {
     }
 
 
-    // T38: the token request of a pool connection that waits for a renewal is answered unauthorized after close(), and the
-    // source stops listing the pool.
-    @Test
-    public void closeAnswersAWaitingTokenRequest() throws Exception {
-        FakeCentrifugoServer endpoint = newPoolServer();
-        serveFleet(endpoint, "tA");
-        AtomicInteger getterCalls = new AtomicInteger();
-        CountDownLatch gate = new CountDownLatch(1);
-        server.connectResult = Protocol.ConnectResult.newBuilder().setClient("fake-client").setVersion("0.0.0").setPing(25)
-                .setExpires(true).setTtl(1).build();
-        serveFleet(server);
-        Options options = new Options();
-        setScriptedGetter(options, (ConnectionTokenEvent event, TokenCallback cb) -> {
-            int call = getterCalls.incrementAndGet();
-            if (call == 1) {
-                cb.Done(null, "tA");
-                return;
-            }
-            new Thread(() -> {
-                try {
-                    gate.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-                cb.Done(null, "tZ");
-            }).start();
-        });
-        client = new Client(server.url(), options, new EventListener() {
-            @Override
-            public void onConnected(Client c, ConnectedEvent e) {
-                connectedSignals.release();
-            }
-        });
-        connect(client);
-        awaitCondition("the renewal is in progress", () -> getterCalls.get() == 2);
-        RpcPool pool = build(builderOn(client, endpoint));
-        submit(pool);
-        awaitCondition("the pool connection waits for its token", () -> pool.stats().getConnections() == 1 && waitingCountOf(client) == 1);
-        awaitCondition("the source lists the pool with its waiting call", () -> listeningOf(client).contains(pool));
-        pool.close();
-        awaitCondition("the waiting request was answered and left", () -> waitingCountOf(client) == 0);
-        awaitCondition("the source no longer lists the closed pool", () -> !listeningOf(client).contains(pool));
-        gate.countDown();
-    }
-
-
     // T27
     @Test
     public void sourceReferencesOnlyPoolsWithWaitingCalls() throws Exception {
@@ -875,7 +829,9 @@ public class RpcPoolTokenTest extends RpcTestBase {
         server.deferCommand = (Protocol.Command cmd) -> cmd.hasConnect();
         main.disconnect();
         awaitCondition("the main client disconnected", () -> main.getState() == ClientState.DISCONNECTED);
+        // connect() only queues the state change on the main executor: the call waits for CONNECTING, or it settles as disconnected.
         main.connect();
+        awaitCondition("the main client is connecting again", () -> main.getState() == ClientState.CONNECTING);
         submit(waiting);
         awaitCondition("the call waits again", () -> listeningOf(main).contains(waiting));
         waiting.close();
@@ -954,24 +910,63 @@ public class RpcPoolTokenTest extends RpcTestBase {
     }
 
 
-    // T38
+    // T38: a queued call, a call in flight and a waiting token request. close() settles the call in flight with the closed error,
+    // cancels the queued calls, answers the waiting request unauthorized, and the source stops listing the pool. The request
+    // waits for the main client's refresh, which is held, on a connection to the endpoint that refuses the main client's token.
     @Test
     public void closeSettlesAndUnlistens() throws Exception {
-        FakeCentrifugoServer endpoint = newPoolServer();
-        serveFleet(endpoint);
-        endpoint.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();
-        Client main = clientWithToken(ACCESS_TOKEN);
+        serveMain();
+        FakeCentrifugoServer live = newPoolServer();
+        serveFleet(live);
+        FakeCentrifugoServer refusing = newPoolServer();
+        serveFleet(refusing, ACCESS_TOKEN);
+        Client main = exchangeClient(new Storage("refresh-1"), null);
         connect(main);
-        RpcPool pool = build(builderOn(main, endpoint).maxInflightPerConnection(1));
-        CompletableFuture<RPCResult> inFlight = submit(pool);
-        awaitCondition("the call is on the wire", () -> rpcCount(endpoint) == 1);
-        CompletableFuture<RPCResult> queued = submit(pool);
-        awaitCondition("the pool listens with a waiting call", () -> listeningOf(main).equals(Collections.singleton(pool)));
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasRefresh() && "tY".equals(cmd.getRefresh().getToken());
+        main.refresh("tY", (Throwable error, AuthResult result) -> { });
+        awaitCondition("the refresh is held", () -> refreshCountOf("tY") == 1);
+        live.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();
+        RpcPool pool = build(new RpcPool.Builder(endpointKey -> Collections.singletonList("live".equals(endpointKey) ? live.url() : refusing.url()))
+                .tokenFrom(main)
+                .maxConnectionsPerEndpoint(1)
+                .maxInflightPerConnection(1));
+        CompletableFuture<RPCResult> inFlight = submitTo(pool, "live");
+        awaitCondition("the call is on the wire", () -> rpcCount(live) == 1);
+        CompletableFuture<RPCResult> queued = submitTo(pool, "live");
+        CompletableFuture<RPCResult> waitingCall = submitTo(pool, "refused");
+        awaitCondition("the pool connection waits for its token", () -> waitingCountOf(main) == 1);
+        awaitCondition("the source lists the pool with its waiting calls", () -> listeningOf(main).equals(Collections.singleton(pool)));
+        List<Throwable> answers = new CopyOnWriteArrayList<>();
+        recordAnswerOfWaiter(main, answers);
         pool.close();
         assertEquals("rpc pool closed", errorOf(inFlight).getMessage());
         assertEquals("queued call is cancelled", ReplyError.CANCELLED, ((ReplyError) errorOf(queued)).getCode());
-        awaitCondition("the pool left the set", () -> listeningOf(main).isEmpty());
-        endpoint.releaseDeferredCommandsOnTheirSockets();
+        assertEquals("call waiting for its connection is cancelled", ReplyError.CANCELLED, ((ReplyError) errorOf(waitingCall)).getCode());
+        awaitCondition("the waiting request was answered and left", () -> waitingCountOf(main) == 0);
+        awaitCondition("the waiting request was answered unauthorized", () -> answers.size() == 1 && answers.get(0) instanceof UnauthorizedException);
+        awaitCondition("the source no longer lists the closed pool", () -> listeningOf(main).isEmpty());
+        server.releaseDeferredCommands();
+        live.releaseDeferredCommandsOnTheirSockets();
+    }
+
+
+    // Wraps the callback of the waiting request of the main client, on its executor, so that the test reads the answer it is given.
+    private void recordAnswerOfWaiter(Client main, List<Throwable> answers) throws Exception {
+        Callable<Void> wrap = () -> {
+            Field waitingField = TokenSource.class.getDeclaredField("waiting");
+            waitingField.setAccessible(true);
+            Map<?, ?> waiting = (Map<?, ?>) waitingField.get(main.auth.tokenSource());
+            Object waiter = waiting.values().iterator().next();
+            Field callbackField = waiter.getClass().getDeclaredField("callback");
+            callbackField.setAccessible(true);
+            TokenSource.Callback original = (TokenSource.Callback) callbackField.get(waiter);
+            callbackField.set(waiter, (TokenSource.Callback) (Throwable error, String token, int generation) -> {
+                answers.add(error);
+                original.done(error, token, generation);
+            });
+            return null;
+        };
+        main.getExecutor().submit(wrap).get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
     }
 
 
