@@ -543,6 +543,14 @@ public final class RpcPool {
         }
 
 
+        // The delays of the hold of an endpoint after its connection ends, which the tests set; the public API has no setter for them.
+        Builder reconnectDelays(int minMillis, int maxMillis) {
+            options.setMinReconnectDelay(minMillis);
+            options.setMaxReconnectDelay(maxMillis);
+            return this;
+        }
+
+
         // The source of the random delays of the later resends, which the tests seed.
         Builder random(Random random) {
             this.random = random;
@@ -763,7 +771,9 @@ public final class RpcPool {
         // The calls which the client has not reported yet are lost with the connection: no answer will come for them.
         conn.lost.addAll(conn.calls);
         conn.calls.clear();
-        if (conn.retired) {
+        // A stale connection's end is its next event: it is retired, with no error, no hold and no drain of its endpoint.
+        if (conn.retired || stale(conn)) {
+            retire(conn);
             remove(conn);
             releaseLost(conn);
             return;
@@ -1051,8 +1061,29 @@ public final class RpcPool {
                 if (tryAssign(call, eps)) {
                     return PLACED;
                 }
-                return source.canLend() ? STOP_OPEN : STOP;
+                if (source.canLend()) {
+                    return STOP_OPEN;
+                }
+                if (source.isSpent() && !hasLive(eps, call.generation)) {
+                    // The fleet refused the token and no connection of the identity is left to take the call.
+                    settle(call, null, new IOException("token refused"));
+                    return FAILED;
+                }
+                return STOP;
         }
+    }
+
+
+    // Whether a connection of the endpoints is live for the identity: connected and verified, and stamped with the generation.
+    private static boolean hasLive(List<RpcPoolEndpoint> eps, int generation) {
+        for (RpcPoolEndpoint endpoint : eps) {
+            for (RpcPoolConnection conn : endpoint.connections()) {
+                if (!conn.connecting && conn.generation == generation) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
 
@@ -1335,6 +1366,12 @@ public final class RpcPool {
             }
             if (call.generation >= 0 && call.generation != source.generation()) {
                 settle(call, null, new IOException("identity changed"));
+                return;
+            }
+            List<RpcPoolEndpoint> eps = resolved.get(call.endpointKey);
+            if (phase == TokenSource.Phase.CONNECTED && source.isSpent() && eps != null && !hasLive(eps, source.generation())) {
+                // The same refusal as a fresh call: the fleet refused the token and no connection of the identity can take the call.
+                settle(call, null, new IOException("token refused"));
                 return;
             }
         }

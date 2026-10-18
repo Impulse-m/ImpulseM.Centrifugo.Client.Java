@@ -91,12 +91,34 @@ final class TokenSource {
     private volatile String confirmed;
     // The token a pool connection found unusable (u), cleared at each confirmation. Null when none.
     private volatile String unusable;
+    // The token the fleet refused and no renewal can replace before the next confirmation (d). Null when none. Cleared at each
+    // confirmation, unless that confirmation spends the new token again.
+    private volatile String spent;
     private volatile Stamp stamp = new Stamp(0, false, "", "");
+    // Whether the source took the state of the main client, on the executor. Until then the pools read the client's own state.
+    private volatile boolean initialized;
 
 
     TokenSource(ClientHost host, AuthRefresh auth) {
         this.host = host;
         this.auth = auth;
+    }
+
+
+    /**
+     * Takes the state of the main client when the source is made: a source made while the main client is connected takes the
+     * confirmation it missed, without counting an identity change. Runs on the executor, before the first request of the source.
+     */
+    void initialize() {
+        if (host.state() == ClientState.CONNECTED) {
+            phase = Phase.CONNECTED;
+            confirmed = auth.confirmedToken();
+            stamp = new Stamp(stamp.generation, true, auth.currentUser(), auth.currentAuthClass());
+        } else {
+            phase = Phase.DISCONNECTED;
+        }
+        initialized = true;
+        notifyListening();
     }
 
 
@@ -142,6 +164,10 @@ final class TokenSource {
         if (state == ClientState.CONNECTING) {
             return Phase.CONNECTING;
         }
+        if (!initialized) {
+            // The source is not taken yet: the client's state decides, and a connected client waits for the source to take it.
+            return state == ClientState.CONNECTED ? Phase.CONNECTING : Phase.DISCONNECTED;
+        }
         Phase current = phase;
         if (current == Phase.ENDED || current == Phase.DISCONNECTED) {
             return current == Phase.ENDED && state == ClientState.DISCONNECTED ? Phase.ENDED : Phase.DISCONNECTED;
@@ -155,11 +181,21 @@ final class TokenSource {
 
     /**
      * Whether a pool may open a connection now: the main client is connected with its identity confirmed, and the token it
-     * confirmed is not the one a connection found unusable. Any thread.
+     * confirmed is neither the one a connection found unusable nor the one the fleet refused for good. Any thread.
      */
     boolean canLend() {
         String token = confirmed;
-        return mainState() == Phase.CONNECTED && token != null && !token.equals(unusable);
+        return mainState() == Phase.CONNECTED && token != null && !token.equals(unusable) && !token.equals(spent);
+    }
+
+
+    /**
+     * Whether the source is spent: the fleet refused the confirmed token, and no renewal can replace it before the next
+     * confirmation. A pool connection which has no live connection of its identity fails its calls then. Any thread.
+     */
+    boolean isSpent() {
+        String token = confirmed;
+        return token != null && token.equals(spent);
     }
 
 
@@ -212,22 +248,31 @@ final class TokenSource {
     // The main client's identity was confirmed: a connect, or a refresh which was accepted. A connect confirms the
     // identity and clears the renewal; both clear the unusable token, and move the confirmed token on.
     void onAuth(String user, String authClass, boolean always) {
-        String token = host.connectionToken();
+        String token = auth.confirmedToken();
         boolean unusableCleared = unusable != null;
+        boolean spentBefore = spent != null;
         int before = stamp.generation;
         if (always) {
             renewedFor = null;
             phase = Phase.CONNECTED;
         }
+        // A refresh accepted with a token the waiting requests were refused, or with the token the renewal was started for, gave
+        // the refused token back: the source is spent. A connect, or a refresh which brings another token, clears it.
+        String nextSpent = null;
+        if (!always && token != null && !token.isEmpty()) {
+            boolean brought = refusedAgain(token);
+            if (brought || token.equals(renewedFor)) {
+                nextSpent = token;
+            }
+        }
         confirmed = token;
         unusable = null;
+        spent = nextSpent;
         observe(user, authClass);
         boolean changed = stamp.generation != before;
-        if (!always) {
-            refusedAgain(token);
-        }
         evaluateAll();
-        if (always || changed || unusableCleared) {
+        boolean spentChanged = (spent != null) != spentBefore;
+        if (always || changed || unusableCleared || spentChanged) {
             notifyListening();
         }
     }
@@ -261,8 +306,12 @@ final class TokenSource {
         if (!explicit && !refused) {
             return;
         }
-        if (refused && renewedFor != null && renewedFor.equals(confirmed)) {
+        String token = confirmed;
+        if (refused && token != null && token.equals(renewedFor)) {
+            // The one renewal of the confirmed token was refused, and the main client does not retry: the token is spent.
+            spent = token;
             failAll();
+            notifyListening();
             return;
         }
         evaluateAll();
@@ -285,18 +334,21 @@ final class TokenSource {
     // A refresh accepted with the token a waiting request was refused gave that token back, which no request can use: those
     // requests fail as unauthorized now. Waiting for the next event would wait up to a whole token ttl. An empty token
     // refuses nothing: a request which was never refused has the empty token as its refused one.
-    private void refusedAgain(String token) {
+    private boolean refusedAgain(String token) {
         if (token == null || token.isEmpty()) {
-            return;
+            return false;
         }
+        boolean failed = false;
         Iterator<Map.Entry<Object, Waiter>> iterator = waiting.entrySet().iterator();
         while (iterator.hasNext()) {
             Waiter waiter = iterator.next().getValue();
             if (token.equals(waiter.refused)) {
                 iterator.remove();
                 fail(waiter);
+                failed = true;
             }
         }
+        return failed;
     }
 
 
@@ -330,15 +382,23 @@ final class TokenSource {
             deliver(waiter, token);
             return true;
         }
-        if (token != null && token.equals(unusable)) {
+        // The token was found unusable and the fleet did not refuse it for good: the next confirmation resolves it.
+        if (token != null && token.equals(unusable) && !token.equals(spent)) {
             return false;
         }
         if (token != null && token.isEmpty()) {
             deliver(waiter, token);
             return true;
         }
-        if (!auth.canRenew()) {
+        boolean isSpent = token != null && token.equals(spent);
+        if (isSpent || !auth.canRenew()) {
+            // No renewal can replace the token, so the requester is answered now. A token refused here spends the source, and
+            // the pools are told after the answer.
             fail(waiter);
+            if (!isSpent && token != null) {
+                spent = token;
+                notifyListening();
+            }
             return true;
         }
         if (!Objects.equals(token, renewedFor) && auth.renewNow()) {
@@ -349,9 +409,10 @@ final class TokenSource {
 
 
     // Whether the main client's token can be lent to a requester which was refused the given one: it is non-empty, it is
-    // neither the refused one nor the unusable one, and the token exchange has not expired it.
+    // neither the refused one, the unusable one nor the spent one, and the token exchange has not expired it.
     private boolean usable(String token, String refused) {
-        return token != null && !token.isEmpty() && !token.equals(refused) && !token.equals(unusable) && !auth.tokenExpired(token);
+        return token != null && !token.isEmpty() && !token.equals(refused) && !token.equals(unusable) && !token.equals(spent)
+                && !auth.tokenExpired(token);
     }
 
 

@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
@@ -100,9 +101,12 @@ final class AuthRefresh {
     // Identity the server last reported for the connection, see applyAuth. Used on the executor thread only.
     private String currentUser = "";
     private String currentAuthClass = "";
-    // The token source of the rpc pools which take their token from this client. It exists from the start, so that it sees every
-    // confirmation of the client, whether or not a pool was built yet.
-    private final TokenSource tokenSource;
+    // The connection token in effect at the last confirmation of the identity. A token set by the application is not one until
+    // the server confirms it, so a token source made later takes this one, not the client's current token.
+    private String confirmedToken = "";
+    // The token source of the rpc pools which take their token from this client. It is made by the first pool which takes its
+    // token from this client, so a client no pool uses has none and pays nothing for it.
+    private final AtomicReference<TokenSource> tokenSource = new AtomicReference<>();
 
 
     AuthRefresh(ClientHost host, int retryMinMillis, int retryMaxMillis) {
@@ -110,13 +114,21 @@ final class AuthRefresh {
         this.retryMinMillis = retryMinMillis;
         this.retryMaxMillis = retryMaxMillis;
         this.flow = TokenExchangeFlow.create(host);
-        this.tokenSource = new TokenSource(host, this);
     }
 
 
-    /** The token source of this client, shared by all its pools. */
+    /** The token source of this client, shared by all its pools. Made on the first call, and taken on the executor. */
     TokenSource tokenSource() {
-        return tokenSource;
+        TokenSource existing = tokenSource.get();
+        if (existing != null) {
+            return existing;
+        }
+        TokenSource created = new TokenSource(host, this);
+        if (tokenSource.compareAndSet(null, created)) {
+            Extensions.submitOrIgnore(host.executor(), created::initialize);
+            return created;
+        }
+        return tokenSource.get();
     }
 
 
@@ -158,6 +170,12 @@ final class AuthRefresh {
     }
 
 
+    /** The connection token in effect at the last confirmation of the identity. Runs on the executor. */
+    String confirmedToken() {
+        return confirmedToken;
+    }
+
+
     /** Moves on with each refresh() call and each accepted token. */
     long refreshGeneration() {
         return refreshGeneration;
@@ -169,7 +187,7 @@ final class AuthRefresh {
         if (flow != null) {
             flow.beforeConnect();
         }
-        TokenSource source = tokenSource;
+        TokenSource source = tokenSource.get();
         if (source != null) {
             source.onConnectAttempt();
         }
@@ -314,7 +332,7 @@ final class AuthRefresh {
         if (flow != null) {
             flow.reset(code, terminal);
         }
-        TokenSource source = tokenSource;
+        TokenSource source = tokenSource.get();
         if (source != null) {
             source.onDisconnect(code, terminal);
         }
@@ -329,10 +347,11 @@ final class AuthRefresh {
         boolean changed = !user.equals(this.currentUser) || !authClass.equals(this.currentAuthClass);
         this.currentUser = user;
         this.currentAuthClass = authClass;
+        this.confirmedToken = host.connectionToken();
         if (always || changed) {
             host.reportAuth(new AuthEvent(user, authClass));
         }
-        TokenSource source = tokenSource;
+        TokenSource source = tokenSource.get();
         if (source != null) {
             source.onAuth(user, authClass, always);
         }
@@ -488,7 +507,7 @@ final class AuthRefresh {
 
     // Tells the source of the rpc pools that a refresh of the connected client failed, see TokenSource.onRefreshFailed.
     private void refreshFailed(Throwable error, boolean explicit) {
-        TokenSource source = tokenSource;
+        TokenSource source = tokenSource.get();
         if (source != null) {
             source.onRefreshFailed(error, explicit);
         }
