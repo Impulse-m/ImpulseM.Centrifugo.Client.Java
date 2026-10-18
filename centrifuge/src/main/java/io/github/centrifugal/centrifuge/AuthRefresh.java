@@ -9,7 +9,6 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 
 import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
@@ -101,8 +100,9 @@ final class AuthRefresh {
     // Identity the server last reported for the connection, see applyAuth. Used on the executor thread only.
     private String currentUser = "";
     private String currentAuthClass = "";
-    // The token source of the rpc pools which take their token from this client, created by the first of them. Null before.
-    private final AtomicReference<TokenSource> tokenSource = new AtomicReference<>();
+    // The token source of the rpc pools which take their token from this client. It exists from the start, so that it sees every
+    // confirmation of the client, whether or not a pool was built yet.
+    private final TokenSource tokenSource;
 
 
     AuthRefresh(ClientHost host, int retryMinMillis, int retryMaxMillis) {
@@ -110,17 +110,13 @@ final class AuthRefresh {
         this.retryMinMillis = retryMinMillis;
         this.retryMaxMillis = retryMaxMillis;
         this.flow = TokenExchangeFlow.create(host);
+        this.tokenSource = new TokenSource(host, this);
     }
 
 
-    /** The token source of this client, created on the first call and shared by all its callers. */
+    /** The token source of this client, shared by all its pools. */
     TokenSource tokenSource() {
-        TokenSource existing = tokenSource.get();
-        if (existing == null) {
-            tokenSource.compareAndSet(null, new TokenSource(host, this));
-            existing = tokenSource.get();
-        }
-        return existing;
+        return tokenSource;
     }
 
 
@@ -138,13 +134,15 @@ final class AuthRefresh {
 
     /**
      * Starts the timer refresh now, when the client is connected, the token can be renewed and no refresh is in
-     * flight. Runs on the executor. A refresh in flight which fails is retried by the retry timer.
+     * flight. Runs on the executor, and returns whether the refresh was started. A refresh in flight which fails is
+     * retried by the retry timer.
      */
-    void renewNow() {
+    boolean renewNow() {
         if (host.state() != ClientState.CONNECTED || inFlight || timerTokenGetter() == null) {
-            return;
+            return false;
         }
         scheduleTimer(0L, TimeUnit.MILLISECONDS);
+        return true;
     }
 
 
@@ -171,7 +169,7 @@ final class AuthRefresh {
         if (flow != null) {
             flow.beforeConnect();
         }
-        TokenSource source = tokenSource.get();
+        TokenSource source = tokenSource;
         if (source != null) {
             source.onConnectAttempt();
         }
@@ -316,7 +314,7 @@ final class AuthRefresh {
         if (flow != null) {
             flow.reset(code, terminal);
         }
-        TokenSource source = tokenSource.get();
+        TokenSource source = tokenSource;
         if (source != null) {
             source.onDisconnect(code, terminal);
         }
@@ -334,7 +332,7 @@ final class AuthRefresh {
         if (always || changed) {
             host.reportAuth(new AuthEvent(user, authClass));
         }
-        TokenSource source = tokenSource.get();
+        TokenSource source = tokenSource;
         if (source != null) {
             source.onAuth(user, authClass, always);
         }
@@ -459,6 +457,7 @@ final class AuthRefresh {
 
 
     private void finishTimer(WebSocket transport, String token, Throwable error, Protocol.RefreshResult result) {
+        boolean failed = false;
         try {
             if (transport != host.transport() || host.state() != ClientState.CONNECTED) {
                 return;
@@ -471,6 +470,7 @@ final class AuthRefresh {
                 applyAuth(result.getUser(), result.getAuthClass(), false);
                 return;
             }
+            failed = true;
             try {
                 host.reportError(new RefreshError(error));
             } finally {
@@ -478,6 +478,19 @@ final class AuthRefresh {
             }
         } finally {
             complete(false);
+            // The source hears of the failure once this refresh is no longer in flight, so that a renewal it starts can run.
+            if (failed) {
+                refreshFailed(error, false);
+            }
+        }
+    }
+
+
+    // Tells the source of the rpc pools that a refresh of the connected client failed, see TokenSource.onRefreshFailed.
+    private void refreshFailed(Throwable error, boolean explicit) {
+        TokenSource source = tokenSource;
+        if (source != null) {
+            source.onRefreshFailed(error, explicit);
         }
     }
 
@@ -504,13 +517,14 @@ final class AuthRefresh {
 
 
     private void finishRequested(String token, Throwable error, Protocol.RefreshResult result, List<ResultCallback<AuthResult>> callbacks) {
+        Throwable undelivered = null;
         try {
             inFlightToken = null;
             inFlightCallbacks = null;
             requestedInProgress -= callbacks.size();
             if (error != null) {
                 settleConnectToken(error);
-                rethrow(deliverAll(callbacks, error, null));
+                undelivered = deliverAll(callbacks, error, null);
                 return;
             }
             host.storeToken(token);
@@ -535,6 +549,11 @@ final class AuthRefresh {
             }
         } finally {
             complete(error != null);
+            // The source hears of a failed refresh once it is no longer in flight, so that a renewal it starts can run.
+            if (error != null && host.state() == ClientState.CONNECTED) {
+                refreshFailed(error, true);
+            }
+            rethrow(undelivered);
         }
     }
 
