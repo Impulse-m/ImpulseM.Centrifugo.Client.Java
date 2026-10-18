@@ -351,6 +351,7 @@ public final class RpcPool {
         private RedirectHook redirect;
         private int maxRedirectsInflight = 4;
         private OkHttpClient okHttpClient;
+        private Function<Response, Response> responseTap;
         private ErrorListener errorListener;
         private Random random;
 
@@ -510,6 +511,14 @@ public final class RpcPool {
         }
 
 
+        // The seam of the tests: each redirect answer passes through it before its body is read, so a test can observe the close
+        // of the body the pool releases. The public API has no setter for it.
+        Builder responseTap(Function<Response, Response> responseTap) {
+            this.responseTap = responseTap;
+            return this;
+        }
+
+
         /**
          * Redirect fetches in flight at most, over the pool, from 1. Default 4. The pool's peak for redirect bodies is this
          * count times 2 times the body limit, held briefly during a buffer growth step or the final copy.
@@ -606,6 +615,7 @@ public final class RpcPool {
     private final RedirectHook redirectHook;
     private final int maxRedirectsInflight;
     private final OkHttpClient httpClient;
+    private final Function<Response, Response> responseTap;
     private final ErrorListener errorListener;
     private final ScheduledThreadPoolExecutor executor;
     private final AtomicReference<Thread> poolThread = new AtomicReference<>();
@@ -637,6 +647,8 @@ public final class RpcPool {
     private int redirectsInflight;
     // The key lines the pool examined, for the tests of the lookups.
     private long keyLookups;
+    // The calls resent after their connection was lost, for the tests (T8).
+    private int lostResends;
     private boolean closed;
 
 
@@ -723,6 +735,12 @@ public final class RpcPool {
     // The number of key lines the pool examined, read on its thread. For the tests.
     long keyLookups() throws Exception {
         return executor.submit(() -> keyLookups).get();
+    }
+
+
+    // The number of calls the pool resent after a connection lost them, read on its thread. For the tests.
+    int lostResends() throws Exception {
+        return executor.submit(() -> lostResends).get();
     }
 
 
@@ -835,6 +853,7 @@ public final class RpcPool {
                     finishAttempt(call, null, new IOException(lossReason));
                 } else if (canResend(call)) {
                     call.resends++;
+                    lostResends++;
                     resend(call, false);
                 } else {
                     finishAttempt(call, null, new IOException(lossReason));
@@ -864,6 +883,7 @@ public final class RpcPool {
         this.redirectHook = builder.redirect;
         this.maxRedirectsInflight = builder.maxRedirectsInflight;
         this.httpClient = builder.okHttpClient;
+        this.responseTap = builder.responseTap;
         this.errorListener = builder.errorListener;
         this.random = builder.random != null ? builder.random : new Random();
         this.source = builder.tokenFrom != null ? builder.tokenFrom.auth.tokenSource() : null;
@@ -1323,6 +1343,10 @@ public final class RpcPool {
                 cb.Done(new UnauthorizedException(), null);
                 return;
             }
+            // Recorded at delivery to the client's current connect attempt, since the Client has no connect-frame hook (I6). An
+            // attempt the client abandons before its connect is replaced by the next attempt's delivery. So a refusal may name
+            // the token of a delivery whose connect never ran: at most one extra renewal, which the one-renewal rule of 2.5
+            // bounds (R5.4).
             conn.token = token;
             cb.Done(null, token);
         });
@@ -1533,7 +1557,8 @@ public final class RpcPool {
 
 
                 @Override
-                public void onResponse(okhttp3.Call httpCall, Response response) {
+                public void onResponse(okhttp3.Call httpCall, Response answer) {
+                    Response response = responseTap != null ? responseTap.apply(answer) : answer;
                     byte[] body = null;
                     IOException failure = null;
                     try {
@@ -1759,7 +1784,8 @@ public final class RpcPool {
         }
         waitingKeys.clear();
         for (RpcPoolCall call : new ArrayList<>(unsettled)) {
-            boolean inFlight = call.connection != null || call.redirectCall != null;
+            // A call waiting for a redirect fetch slot is in redirect (1.4): it settles with the closed error, as a running fetch (R5.3).
+            boolean inFlight = call.connection != null || call.redirectCall != null || call.queue == redirectWaiting;
             settle(call, null, inFlight ? new IOException("rpc pool closed") : cancelled());
         }
         for (RpcPoolEndpoint endpoint : endpoints.values()) {
