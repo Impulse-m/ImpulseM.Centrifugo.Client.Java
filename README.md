@@ -1,10 +1,10 @@
 # ImpulseM.Centrifugo.Client.Java
 
-Android and Java client for the ImpulseM build of [Centrifugo](https://github.com/Impulse-m/ImpulseM.Centrifugo) (Docker: `ghcr.io/impulse-m/impulsem.centrifugo`).
+Android and Java client for [this Centrifugo fork](https://github.com/Impulse-m/ImpulseM.Centrifugo) (Docker: `ghcr.io/impulse-m/impulsem.centrifugo`).
 
-This is the ImpulseM fork of [centrifuge-java](https://github.com/centrifugal/centrifuge-java). The API matches upstream.
+A fork of [centrifuge-java](https://github.com/centrifugal/centrifuge-java). The API matches upstream.
 
-Sibling ImpulseM SDKs:
+Sibling SDKs of the fork:
 
 - JavaScript: [ImpulseM.Centrifugo.Client.JS](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.JS), npm `@impulsem/centrifuge`
 - Swift: [ImpulseM.Centrifugo.Client.Swift](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Swift), Swift Package Manager
