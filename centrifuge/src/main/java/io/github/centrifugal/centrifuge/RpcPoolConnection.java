@@ -97,7 +97,9 @@ final class RpcPoolConnection {
 
         @Override
         public void onConnected(Client c, ConnectedEvent event) {
-            pool.post(() -> pool.onConnected(RpcPoolConnection.this));
+            final String user = event.getUser();
+            final String authClass = event.getAuthClass();
+            pool.post(() -> pool.onConnected(RpcPoolConnection.this, user, authClass));
         }
 
 

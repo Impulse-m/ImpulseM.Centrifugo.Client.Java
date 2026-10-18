@@ -6,6 +6,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -24,7 +25,9 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
 import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
+import okhttp3.Authenticator;
 import okhttp3.Callback;
+import okhttp3.CookieJar;
 import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -142,8 +145,8 @@ public final class RpcPool {
 
 
             /**
-             * Adds a request header of the fetch. Adding the same key again replaces its value. The header goes only to
-             * the host and port of the redirect URL: a redirect to another host is requested without it.
+             * Adds a request header of the fetch. Adding the same key again replaces its value. The header goes to the
+             * redirect URL, the one request the pool makes: no redirect is followed, so a 3xx answer fails the fetch.
              */
             public Builder header(String key, String value) {
                 this.headers.put(Objects.requireNonNull(key, "header key"), Objects.requireNonNull(value, "header value"));
@@ -243,7 +246,10 @@ public final class RpcPool {
             }
 
 
-            /** The deadline of the call in milliseconds, which holds across its resends and its redirect fetch. */
+            /**
+             * The deadline of the call in milliseconds, which holds across its resends and its redirect fetch. At most the
+             * connect timeout of the pool: a longer deadline is refused with {@link RpcPool#BAD_CONFIGURATION}.
+             */
             public Builder timeout(long timeout) {
                 if (timeout <= 0) {
                     throw new IllegalArgumentException("timeout must be positive");
@@ -450,7 +456,10 @@ public final class RpcPool {
         }
 
 
-        /** Calls waiting for a connection at most, over all endpoints. Beyond it a call is rejected with LIMIT_EXCEEDED. Default 64. */
+        /**
+         * Calls waiting for a connection at most, over all endpoints, and each redirect fetch that waits for a fetch slot.
+         * Beyond it a call is rejected with LIMIT_EXCEEDED. A fetch that finds a free slot is not refused. Default 64.
+         */
         public Builder maxQueued(int maxQueued) {
             if (maxQueued < 0) {
                 throw new IllegalArgumentException("maxQueued must not be negative");
@@ -462,14 +471,11 @@ public final class RpcPool {
 
         /**
          * Closes a connection with no call for this long, in milliseconds; 0 keeps it. At most 2147483647, the limit of
-         * a timer. Default 60000.
+         * a timer, which {@link #build()} checks. Default 60000.
          */
         public Builder idleTimeout(long idleTimeout) {
             if (idleTimeout < 0) {
                 throw new IllegalArgumentException("idleTimeout must not be negative");
-            }
-            if (idleTimeout > Integer.MAX_VALUE) {
-                throw new IllegalArgumentException("idleTimeout must be at most 2147483647");
             }
             this.idleTimeout = idleTimeout;
             return this;
@@ -517,10 +523,11 @@ public final class RpcPool {
 
 
         /**
-         * The OkHttp client of the connections and of the redirect fetches, shared. Optional: without one, the redirect
-         * fetches share a default client of the process, and each connection builds its own. The interceptors of this
-         * client apply to the redirect fetches too, so an interceptor which adds credentials sends them to the host of
-         * each hop.
+         * The OkHttp client of the connections, shared with the redirect fetches for its transport settings only: the
+         * dispatcher, the connection pool, TLS, the proxy and DNS. A redirect fetch runs with none of its interceptors,
+         * network interceptors, cookie jar or authenticator, so an application credential of this client is never sent to
+         * a redirect URL. A credential of a fetch goes with {@link Redirect.Builder#header}. Optional: without one, the
+         * redirect fetches share a default client of the process, and each connection builds its own.
          */
         public Builder okHttpClient(OkHttpClient okHttpClient) {
             this.okHttpClient = okHttpClient;
@@ -555,10 +562,19 @@ public final class RpcPool {
             if (tokenFrom != null && ownToken) {
                 throw new IllegalArgumentException("tokenFrom is exclusive with token and tokenGetter");
             }
+            if (idleTimeout > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("idleTimeout must be at most 2147483647");
+            }
             return new RpcPool(this);
         }
     }
 
+
+    // The outcome of placing a call on the key line: placed, settled, or waiting. A waiting call that may open a connection says so.
+    private static final int PLACED = 0;
+    private static final int FAILED = 1;
+    private static final int STOP = 2;
+    private static final int STOP_OPEN = 3;
 
     private static final Backoff BACKOFF = new Backoff();
 
@@ -590,6 +606,8 @@ public final class RpcPool {
     private final Map<String, RpcPoolQueue> queues = new HashMap<>();
     // The calls waiting in all the queues, which the pool-wide bound counts.
     private int queuedCount;
+    // The keys whose queues hold calls: the pool is listening to the main client while there is one.
+    private final Set<String> waitingKeys = new HashSet<>();
     // The calls which have no outcome yet, to settle them on close.
     private final Set<RpcPoolCall> unsettled = new HashSet<>();
     // The endpoints of the keys which resolved, by key: cached until the pool is closed.
@@ -597,12 +615,16 @@ public final class RpcPool {
     private final Map<String, RpcPoolEndpoint> endpoints = new HashMap<>();
     // The connections taken out of their endpoints, which close once their last call settles.
     private final Set<RpcPoolConnection> retiring = new HashSet<>();
+    // The connections with no call, in the order their idle clocks started: the head is the one which expires first.
+    private final Set<RpcPoolConnection> idleSet = new LinkedHashSet<>();
     // The calls whose redirect waits for a fetch slot, in order. They count in the queued calls of the pool.
     private final RpcPoolQueue redirectWaiting = new RpcPoolQueue();
     // The one check of the idle connections, armed while there may be one; never cancelled, so it leaves no cancelled timer.
     private ScheduledFuture<?> idleCheck;
     private OkHttpClient fetchHttpClient;
     private int redirectsInflight;
+    // The key lines the pool examined, for the tests of the lookups.
+    private long keyLookups;
     private boolean closed;
 
 
@@ -669,82 +691,136 @@ public final class RpcPool {
     }
 
 
+    // The main client's event reached a pool which has calls in a key line: each key with calls waiting is drained, and no other.
+    void onMainEvent() {
+        if (closed || waitingKeys.isEmpty()) {
+            return;
+        }
+        for (String key : waitingKeys.toArray(new String[0])) {
+            pumpKey(key);
+        }
+    }
+
+
+    // The number of key lines the pool examined, read on its thread. For the tests.
+    long keyLookups() throws Exception {
+        return executor.submit(() -> keyLookups).get();
+    }
+
+
+    // The transport of a connection is lost and its client reconnects. A stale connection is retired before its client reuses
+    // the token it stored. The calls on the wire were lost before this event, and are decided here.
     void onConnecting(RpcPoolConnection conn) {
-        if (!conn.removed) {
-            conn.connecting = true;
-            releaseLost(conn);
-            pumpEndpoint(conn.endpoint);
-        }
-    }
-
-
-    void onConnected(RpcPoolConnection conn) {
-        if (!conn.removed) {
-            conn.connecting = false;
-            conn.endpoint.closes = 0;
-            releaseLost(conn);
-            pumpEndpoint(conn.endpoint);
-            if (idle(conn)) {
-                markIdle(conn);
-            }
-        }
-    }
-
-
-    // The connection is gone for good: the client does not reconnect it. A frame over the size limit settles
-    // the calls on the wire with no resend, since the chunk would be over the limit again, and opens no replacement.
-    // Any other close is reported, and holds the opens of the endpoint back for a backoff delay: the calls on the
-    // wire are sent again as their attempts end, and a server which closes each connection at once is not dialled in a loop.
-    void onDisconnected(RpcPoolConnection conn, int code, String reason) {
         if (conn.removed) {
             return;
         }
-        report(conn.endpoint.url(), new IOException(reason));
-        remove(conn);
-        if (code == Client.DISCONNECTED_MESSAGE_SIZE_LIMIT) {
-            conn.noResend = true;
-            conn.closeReason = reason;
-            // The attempts of the client failed before this event, and are lost calls already; the rest are settled too.
-            conn.lost.addAll(conn.calls);
-            conn.calls.clear();
-        } else {
-            if (code == Client.DISCONNECTED_UNAUTHORIZED) {
-                conn.noResend = true;
-                conn.closeReason = reason;
-            }
-            hold(conn.endpoint);
+        conn.connecting = true;
+        if (stale(conn)) {
+            retire(conn);
         }
         releaseLost(conn);
         pumpEndpoint(conn.endpoint);
     }
 
 
-    // Decides the calls whose attempt the connection lost, on the connection's event: a message-size close settles
-    // them, and any other loss sends them again while the bound of the call allows.
-    private void releaseLost(RpcPoolConnection conn) {
-        if (conn.lost.isEmpty()) {
+    // The connection is connected. Without a token source it is live at once. With one, the identity the server confirmed must
+    // be the one the pool recorded for the connection's generation: a connection of another identity is retired, and one of a
+    // generation which ended is retired silently.
+    void onConnected(RpcPoolConnection conn, String user, String authClass) {
+        if (conn.removed) {
             return;
         }
-        List<RpcPoolCall> lost = new ArrayList<>(conn.lost);
-        conn.lost.clear();
-        for (RpcPoolCall call : lost) {
-            call.connection = null;
-            if (call.settled) {
-                continue;
+        if (source != null) {
+            TokenSource.Stamp stamp = source.stamp();
+            if (conn.generation < 0 || conn.generation != stamp.generation || !stamp.recorded) {
+                retire(conn);
+                pumpEndpoint(conn.endpoint);
+                return;
             }
-            if (conn.noResend) {
-                finishAttempt(call, null, new IOException(conn.closeReason));
-            } else if (canResend(call)) {
-                call.resends++;
-                enqueue(call, false);
-            } else {
-                finishAttempt(call, null, new IOException("rpc connection lost"));
+            if (!user.equals(stamp.user) || !authClass.equals(stamp.authClass)) {
+                // The token leads to another identity than the main client's: the token is unusable until the main client confirms another.
+                source.unusable(conn.token);
+                retire(conn);
+                report(conn.endpoint.url(), new IOException("identity mismatch"));
+                pumpEndpoint(conn.endpoint);
+                return;
             }
         }
+        conn.connecting = false;
+        conn.endpoint.closes = 0;
+        releaseLost(conn);
+        pumpEndpoint(conn.endpoint);
     }
 
 
-    // Whether the connection has no call on the wire and none waiting for its event: only then it may go idle.
+    // The connection is gone for good: the client does not reconnect it. A retired connection is removed with no error and no
+    // hold. A frame over the size limit settles the calls with no resend, since the chunk would be over the limit again, and
+    // opens no replacement. Any other close is reported, and holds the opens of the endpoint back for a backoff delay.
+    void onDisconnected(RpcPoolConnection conn, int code, String reason) {
+        if (conn.removed) {
+            return;
+        }
+        // The calls which the client has not reported yet are lost with the connection: no answer will come for them.
+        conn.lost.addAll(conn.calls);
+        conn.calls.clear();
+        if (conn.retired) {
+            remove(conn);
+            releaseLost(conn);
+            return;
+        }
+        if (code == Client.DISCONNECTED_MESSAGE_SIZE_LIMIT) {
+            report(conn.endpoint.url(), new IOException(reason));
+            remove(conn);
+            conn.noResend = true;
+            conn.closeReason = reason;
+            releaseLost(conn);
+            pumpEndpoint(conn.endpoint);
+            return;
+        }
+        if (code == Client.DISCONNECTED_DISCONNECT_CALLED) {
+            remove(conn);
+            releaseLost(conn);
+            pumpEndpoint(conn.endpoint);
+            return;
+        }
+        report(conn.endpoint.url(), new IOException(reason));
+        if (code == Client.DISCONNECTED_UNAUTHORIZED) {
+            conn.noResend = true;
+            conn.closeReason = reason;
+        }
+        remove(conn);
+        hold(conn.endpoint);
+        releaseLost(conn);
+        pumpEndpoint(conn.endpoint);
+    }
+
+
+    // Decides the calls whose attempt the connection lost, on the connection's event: a message-size close or an unauthorized
+    // close settles them, a retired or stale connection settles them, and any other loss sends them again while the bound of
+    // the call allows.
+    private void releaseLost(RpcPoolConnection conn) {
+        if (!conn.lost.isEmpty()) {
+            List<RpcPoolCall> lost = new ArrayList<>(conn.lost);
+            conn.lost.clear();
+            for (RpcPoolCall call : lost) {
+                call.connection = null;
+                if (call.settled) {
+                    continue;
+                }
+                if (conn.noResend || stale(conn)) {
+                    finishAttempt(call, null, new IOException(conn.closeReason != null ? conn.closeReason : "rpc connection lost"));
+                } else if (canResend(call)) {
+                    call.resends++;
+                    resend(call, false);
+                } else {
+                    finishAttempt(call, null, new IOException("rpc connection lost"));
+                }
+            }
+        }
+        refreshIdle(conn);
+    }
+
+
     private static boolean idle(RpcPoolConnection conn) {
         return conn.calls.isEmpty() && conn.lost.isEmpty();
     }
@@ -825,15 +901,23 @@ public final class RpcPool {
     }
 
 
+    // Admission of a call, by the order of the table: closed, the main client's ended and disconnected states, the options,
+    // the key, and then the placement or the queue bound.
     private void start(RpcPoolCall call) {
         if (closed) {
             settle(call, null, cancelled());
             return;
         }
-        // The main client's session ended as unauthorized: the call fails at once, and opens nothing.
-        if (source != null && source.ended()) {
-            settle(call, null, new IOException("unauthorized"));
-            return;
+        if (source != null) {
+            TokenSource.Phase phase = source.mainState();
+            if (phase == TokenSource.Phase.ENDED) {
+                settle(call, null, new IOException("unauthorized"));
+                return;
+            }
+            if (phase == TokenSource.Phase.DISCONNECTED) {
+                settle(call, null, new IOException("client disconnected"));
+                return;
+            }
         }
         if (call.affinity != null && affinityHeader == null) {
             settle(call, null, badConfiguration("affinity needs the affinityHeader option"));
@@ -841,6 +925,10 @@ public final class RpcPool {
         }
         if (affinityHeader != null && hasHeaderIgnoreCase(call.headers, affinityHeader)) {
             settle(call, null, badConfiguration("affinity header is given as a header of the call"));
+            return;
+        }
+        if (call.timeoutMillis > options.getTimeout()) {
+            settle(call, null, badConfiguration("call timeout is over the connection timeout"));
             return;
         }
         List<RpcPoolEndpoint> eps;
@@ -857,11 +945,13 @@ public final class RpcPool {
         unsettled.add(call);
         // The timer runs on the deadline of the call, which started at its submit: the time it waited for the pool's thread is spent.
         call.deadlineTask = executor.schedule(() -> onDeadline(call), call.remainingNanos(), TimeUnit.NANOSECONDS);
+        RpcPoolQueue line = queues.get(call.endpointKey);
         // A call goes out at once only when no call of its key waits: the waiting calls are older, and go first.
-        retireStale(eps);
-        RpcPoolQueue waiting = queues.get(call.endpointKey);
-        if ((waiting == null || waiting.isEmpty()) && tryAssign(call, eps)) {
-            return;
+        if (line == null || line.isEmpty()) {
+            int outcome = place(call, eps);
+            if (outcome == PLACED || outcome == FAILED) {
+                return;
+            }
         }
         // The queue bound applies to a call which cannot open a connection: a call which can is queued and opens one.
         if (queuedCount >= maxQueued && openable(eps) == null) {
@@ -883,45 +973,85 @@ public final class RpcPool {
     }
 
 
-    // A connection event of an endpoint: only the queues of the keys which resolved to it can have a call to place.
-    // Index loop over the keys, which a call's resolution may extend, so nothing is allocated here.
+    // A connection event of an endpoint: only the queues of its keys with calls waiting can have a call to place. An
+    // endpoint with no waiting call costs one check, and nothing is copied for it. The walk copies the keys, since a
+    // pass empties the queues it places from, and is bounded by the calls waiting, which maxQueued bounds.
     private void pumpEndpoint(RpcPoolEndpoint endpoint) {
-        List<String> keys = endpoint.keys();
-        for (int i = 0; i < keys.size(); i++) {
-            pumpKey(keys.get(i));
+        Set<String> keys = endpoint.queuedKeys();
+        if (keys.isEmpty()) {
+            return;
+        }
+        for (String key : keys.toArray(new String[0])) {
+            pumpKey(key);
         }
     }
 
 
-    // Sends the waiting calls of one key, in order, to the connections with room, and opens the connections they need. The
-    // calls of a key share its endpoints, so the first call which finds no room and no endpoint to open ends the pass: none
-    // of the later calls of the key can go either. A key with an empty queue costs one map lookup.
+    // Places the waiting calls of one key, in order, and stops at the first call which can be neither placed nor settled. The
+    // calls of a key share its endpoints, so a call which must wait ends the pass: none of the later calls can go either. The
+    // connection the waiting call needs is opened here, when the placement allows it.
     private void pumpKey(String endpointKey) {
+        keyLookups++;
         RpcPoolQueue queue = queues.get(endpointKey);
         // A queued call's key has resolved: it resolved when the call was started or rerouted, and the resolution is kept.
         List<RpcPoolEndpoint> eps = resolved.get(endpointKey);
         if (closed || queue == null || queue.isEmpty() || eps == null) {
             return;
         }
-        // The main client's session ended as unauthorized: the waiting calls fail, as a call started now does, and none opens a connection.
-        if (source != null && source.ended()) {
-            while (!queue.isEmpty()) {
-                settle(queue.first(), null, new IOException("unauthorized"));
+        while (!queue.isEmpty()) {
+            RpcPoolCall call = queue.first();
+            int outcome = place(call, eps);
+            if (outcome == PLACED || outcome == FAILED) {
+                continue;
+            }
+            if (outcome == STOP_OPEN) {
+                RpcPoolEndpoint endpoint = openable(eps);
+                if (endpoint != null) {
+                    // The call waits for the connection to connect: the connection's event pumps the key again.
+                    open(endpoint);
+                }
             }
             return;
         }
-        retireStale(eps);
-        while (!queue.isEmpty()) {
-            RpcPoolCall call = queue.first();
-            if (tryAssign(call, eps)) {
-                continue;
-            }
-            RpcPoolEndpoint endpoint = openable(eps);
-            if (endpoint != null) {
-                // The call waits for the connection to connect: the connection's event pumps the key again.
-                open(endpoint);
-            }
-            return;
+    }
+
+
+    // Places one call by the rows of the table for the main client's state and the binding of the call. A call which the main
+    // client's state refuses is settled with that row's error; a call bound to another identity is settled as the identity changed.
+    private int place(RpcPoolCall call, List<RpcPoolEndpoint> eps) {
+        if (source == null) {
+            return tryAssign(call, eps) ? PLACED : STOP_OPEN;
+        }
+        switch (source.mainState()) {
+            case ENDED:
+                settle(call, null, new IOException("unauthorized"));
+                return FAILED;
+            case DISCONNECTED:
+                settle(call, null, new IOException("client disconnected"));
+                return FAILED;
+            case CONNECTING:
+                // Not confirmed yet: a bound call goes on a live connection of its identity only, and an unbound call waits.
+                if (call.generation < 0) {
+                    return STOP;
+                }
+                if (call.generation != source.generation()) {
+                    settle(call, null, new IOException("identity changed"));
+                    return FAILED;
+                }
+                return tryAssign(call, eps) ? PLACED : STOP;
+            default:
+                // Confirmed: an unbound call takes the identity now, and a call bound to another identity fails.
+                if (call.generation < 0) {
+                    call.generation = source.generation();
+                } else if (call.generation != source.generation()) {
+                    settle(call, null, new IOException("identity changed"));
+                    return FAILED;
+                }
+                retireStale(eps);
+                if (tryAssign(call, eps)) {
+                    return PLACED;
+                }
+                return source.canLend() ? STOP_OPEN : STOP;
         }
     }
 
@@ -949,7 +1079,6 @@ public final class RpcPool {
             }
             if (!eps.contains(endpoint)) {
                 eps.add(endpoint);
-                endpoint.addKey(endpointKey);
             }
         }
         resolved.put(endpointKey, eps);
@@ -963,12 +1092,19 @@ public final class RpcPool {
     }
 
 
-    // Sends the call on the connection with the fewest calls among those with room, if there is one.
+    // Sends the call on the live connection with the fewest calls among those with room, if there is one. With a token source
+    // the connection must carry the call's identity: a connection which is connecting takes no call.
     private boolean tryAssign(RpcPoolCall call, List<RpcPoolEndpoint> eps) {
         RpcPoolConnection best = null;
         for (RpcPoolEndpoint endpoint : eps) {
             for (RpcPoolConnection conn : endpoint.connections()) {
-                if (conn.calls.size() < maxInflightPerConnection && (best == null || conn.calls.size() < best.calls.size())) {
+                if (conn.connecting || conn.calls.size() >= maxInflightPerConnection) {
+                    continue;
+                }
+                if (source != null && conn.generation != call.generation) {
+                    continue;
+                }
+                if (best == null || conn.calls.size() < best.calls.size()) {
                     best = conn;
                 }
             }
@@ -981,8 +1117,12 @@ public final class RpcPool {
     }
 
 
-    // The first endpoint of the list which may open a connection now, or null when none may. The opens of an endpoint are serialised.
+    // The first endpoint of the list which may open a connection now, or null when none may. The opens of an endpoint are
+    // serialised, and with a token source a connection opens only while the main client is connected and can lend its token.
     private RpcPoolEndpoint openable(List<RpcPoolEndpoint> eps) {
+        if (source != null && !source.canLend()) {
+            return null;
+        }
         for (RpcPoolEndpoint endpoint : eps) {
             if (mayOpen(endpoint)) {
                 return endpoint;
@@ -997,19 +1137,20 @@ public final class RpcPool {
     }
 
 
-    // A connection with no call is closed after the idle timeout from the open, so that a connection whose calls all
-    // time out while it connects does not stay open.
+    // Opens a connection to the endpoint: the client, its listeners, the endpoint, then the connect. Its idle clock starts now,
+    // so a connection whose calls all time out while it connects is closed after the idle timeout.
     private void open(RpcPoolEndpoint endpoint) {
         RpcPoolConnection conn = new RpcPoolConnection(this, endpoint, options, source);
         endpoint.connections().add(conn);
-        conn.connect();
         markIdle(conn);
+        conn.connect();
     }
 
 
     private void attach(RpcPoolCall call, RpcPoolConnection conn) {
         unqueue(call);
         conn.calls.add(call);
+        idleSet.remove(conn);
         call.connection = conn;
         call.endpointUrl = conn.endpoint.url();
         RpcOptions.Builder builder = new RpcOptions.Builder().timeout(call.remainingMillis());
@@ -1043,7 +1184,10 @@ public final class RpcPool {
                 // connection says whether the call is sent again. The call keeps the connection until then.
                 call.connection = conn;
                 conn.lost.add(call);
-                if (conn.removed) {
+                // The client reports a loss after the events of its transport, possibly after the connection connected again. A
+                // retired or removed connection has no further event to decide the loss, and its outcome is known. A connection
+                // which is connected again has lost the transport the call was on, which is the reconnect the loss waits for.
+                if (conn.removed || conn.retired || !conn.connecting) {
                     releaseLost(conn);
                 }
             } else {
@@ -1054,13 +1198,7 @@ public final class RpcPool {
         if (stale(conn)) {
             retire(conn);
         }
-        if (conn.retired) {
-            if (idle(conn)) {
-                remove(conn);
-            }
-        } else if (idle(conn)) {
-            markIdle(conn);
-        }
+        refreshIdle(conn);
         pumpEndpoint(conn.endpoint);
     }
 
@@ -1101,9 +1239,7 @@ public final class RpcPool {
         conn.endpoint.connections().remove(conn);
         retiring.add(conn);
         source.forget(conn);
-        if (idle(conn)) {
-            remove(conn);
-        }
+        refreshIdle(conn);
     }
 
 
@@ -1136,7 +1272,7 @@ public final class RpcPool {
 
     private void onReplyError(RpcPoolCall call, ReplyError error) {
         if (canResend(call)) {
-            if (Extensions.RPC_RETRY_LATER.equals(Extensions.retrySignal(error))) {
+            if (Extensions.RPC_RETRY_LATER.equals(retrySignal(error))) {
                 scheduleLater(call);
                 return;
             }
@@ -1151,6 +1287,12 @@ public final class RpcPool {
             }
         }
         finishAttempt(call, null, error);
+    }
+
+
+    // The retry value of an error of a reply, or null when the server set none: the same rule as the client's retrySignal.
+    private static String retrySignal(ReplyError error) {
+        return error.getMetadata().get(Extensions.RPC_RETRY_METADATA_KEY);
     }
 
 
@@ -1173,9 +1315,31 @@ public final class RpcPool {
     private void onResendDue(RpcPoolCall call) {
         call.resendTask = null;
         if (!call.settled) {
-            enqueue(call, false);
-            pumpKey(call.endpointKey);
+            resend(call, false);
         }
+    }
+
+
+    // Sends a call again: a call which can never be placed settles now, by the row of the main client's state or the binding
+    // that refuses it, and any other joins its line, at the front for a reroute and at the back otherwise.
+    private void resend(RpcPoolCall call, boolean first) {
+        if (source != null) {
+            TokenSource.Phase phase = source.mainState();
+            if (phase == TokenSource.Phase.ENDED) {
+                settle(call, null, new IOException("unauthorized"));
+                return;
+            }
+            if (phase == TokenSource.Phase.DISCONNECTED) {
+                settle(call, null, new IOException("client disconnected"));
+                return;
+            }
+            if (call.generation >= 0 && call.generation != source.generation()) {
+                settle(call, null, new IOException("identity changed"));
+                return;
+            }
+        }
+        enqueue(call, first);
+        pumpKey(call.endpointKey);
     }
 
 
@@ -1186,40 +1350,69 @@ public final class RpcPool {
             queue = new RpcPoolQueue();
             queues.put(call.endpointKey, queue);
         }
+        boolean wasEmpty = queue.isEmpty();
         if (first) {
             queue.addFirst(call);
         } else {
             queue.addLast(call);
         }
         queuedCount++;
-    }
-
-
-    // Takes the call out of its queue, if it waits in one.
-    private void unqueue(RpcPoolCall call) {
-        if (call.queue != null) {
-            call.queue.remove(call);
-            queuedCount--;
+        if (wasEmpty) {
+            setWaitingKey(call.endpointKey, true);
         }
     }
 
 
-    // Queues a rerouted call at the front of its new key, after the key has resolved: a key which resolves to nothing
+    // Takes the call out of its queue, if it waits in one. The key of a queue which empties stops being waited for.
+    private void unqueue(RpcPoolCall call) {
+        RpcPoolQueue queue = call.queue;
+        if (queue != null) {
+            queue.remove(call);
+            queuedCount--;
+            if (queue != redirectWaiting && queue.isEmpty()) {
+                setWaitingKey(call.endpointKey, false);
+            }
+        }
+    }
+
+
+    // Records that a key gets its first waiting call, or its last one leaves. The key is on each endpoint it resolved to, and the
+    // pool listens to the main client while any key waits.
+    private void setWaitingKey(String endpointKey, boolean waiting) {
+        List<RpcPoolEndpoint> eps = resolved.get(endpointKey);
+        if (eps != null) {
+            for (RpcPoolEndpoint endpoint : eps) {
+                if (waiting) {
+                    endpoint.addQueuedKey(endpointKey);
+                } else {
+                    endpoint.removeQueuedKey(endpointKey);
+                }
+            }
+        }
+        if (waiting) {
+            boolean wasEmpty = waitingKeys.isEmpty();
+            if (waitingKeys.add(endpointKey) && wasEmpty && source != null) {
+                source.listen(this);
+            }
+        } else if (waitingKeys.remove(endpointKey) && waitingKeys.isEmpty() && source != null) {
+            source.unlisten(this);
+        }
+    }
+
+
+    // Resends a rerouted call at the front of its new key, after the key has resolved: a key which resolves to nothing
     // settles the call here, as a call of an unknown key does.
     private void routeFirst(RpcPoolCall call) {
-        List<RpcPoolEndpoint> eps;
         try {
-            eps = resolveKey(call.endpointKey);
+            if (resolveKey(call.endpointKey) == null) {
+                settle(call, null, badConfiguration("endpoint key has no endpoint"));
+                return;
+            }
         } catch (RuntimeException e) {
             settle(call, null, e);
             return;
         }
-        if (eps == null) {
-            settle(call, null, badConfiguration("endpoint key has no endpoint"));
-            return;
-        }
-        enqueue(call, true);
-        pumpKey(call.endpointKey);
+        resend(call, true);
     }
 
 
@@ -1304,7 +1497,10 @@ public final class RpcPool {
         call.redirectCall = null;
         if (!call.settled) {
             if (failure != null) {
-                settle(call, null, new ReplyError(REDIRECT_FAILED, "redirect failed: " + failure.getMessage(), false));
+                // The read error stays the cause of the redirect error, for the application to see what broke.
+                ReplyError error = new ReplyError(REDIRECT_FAILED, "redirect failed: " + failure.getMessage(), false);
+                error.initCause(failure);
+                settle(call, null, error);
             } else {
                 RPCResult result = new RPCResult();
                 result.setData(body);
@@ -1352,9 +1548,7 @@ public final class RpcPool {
             // A lost call waiting for its connection's event leaves the connection with its outcome.
             RpcPoolConnection conn = call.connection;
             call.connection = null;
-            if (idle(conn)) {
-                markIdle(conn);
-            }
+            refreshIdle(conn);
         }
         if (call.redirectCall != null) {
             call.redirectCall.cancel();
@@ -1404,10 +1598,32 @@ public final class RpcPool {
     }
 
 
-    // Called when a connection may have become idle: it records the moment, and arms the one idle check of the pool if
-    // none is armed. Nothing is cancelled here, so a call does not leave a timer behind it.
+    // Brings a connection in line with its calls: one with no call is idle, from the moment its last call (or its open) let go of it,
+    // and joins the idle set once, so that its clock is not restarted by the events in between. A retired one closes once idle.
+    private void refreshIdle(RpcPoolConnection conn) {
+        if (conn.removed) {
+            return;
+        }
+        if (!idle(conn)) {
+            idleSet.remove(conn);
+            return;
+        }
+        if (conn.retired) {
+            remove(conn);
+            return;
+        }
+        if (!idleSet.contains(conn)) {
+            markIdle(conn);
+        }
+    }
+
+
+    // Starts the idle clock of a connection which has no call: it is the last in the idle set, and the one check is armed
+    // when none is.
     private void markIdle(RpcPoolConnection conn) {
         conn.idleSince = System.nanoTime();
+        idleSet.remove(conn);
+        idleSet.add(conn);
         if (idleTimeoutMillis > 0L && idleCheck == null && !closed) {
             armIdleCheck(TimeUnit.MILLISECONDS.toNanos(idleTimeoutMillis));
         }
@@ -1419,8 +1635,8 @@ public final class RpcPool {
     }
 
 
-    // Closes the connections which have been idle for the timeout, and arms the check again for the next of the others.
-    // It runs only while a connection may be idle, and each run sweeps the connections of the pool once.
+    // Closes the connections of the idle set whose clock has run out, from the head of the set, and arms the check for the head
+    // which is left. A fire costs the connections it closes, and one look at the head which is left.
     private void onIdleCheck() {
         idleCheck = null;
         if (closed) {
@@ -1430,18 +1646,13 @@ public final class RpcPool {
         long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(idleTimeoutMillis);
         long nextNanos = -1L;
         List<RpcPoolConnection> expired = new ArrayList<>();
-        for (RpcPoolEndpoint endpoint : endpoints.values()) {
-            for (RpcPoolConnection conn : endpoint.connections()) {
-                if (!idle(conn)) {
-                    continue;
-                }
-                long remaining = conn.idleSince + timeoutNanos - now;
-                if (remaining <= 0L) {
-                    expired.add(conn);
-                } else if (nextNanos < 0L || remaining < nextNanos) {
-                    nextNanos = remaining;
-                }
+        for (RpcPoolConnection conn : idleSet) {
+            long remaining = conn.idleSince + timeoutNanos - now;
+            if (remaining > 0L) {
+                nextNanos = remaining;
+                break;
             }
+            expired.add(conn);
         }
         for (RpcPoolConnection conn : expired) {
             remove(conn);
@@ -1464,6 +1675,7 @@ public final class RpcPool {
         conn.removed = true;
         conn.endpoint.connections().remove(conn);
         retiring.remove(conn);
+        idleSet.remove(conn);
         if (source != null) {
             source.forget(conn);
         }
@@ -1476,12 +1688,13 @@ public final class RpcPool {
             return;
         }
         closed = true;
+        if (source != null) {
+            source.unlisten(this);
+        }
+        waitingKeys.clear();
         for (RpcPoolCall call : new ArrayList<>(unsettled)) {
-            if (call.connection != null) {
-                settle(call, null, new IOException("rpc pool closed"));
-            } else {
-                settle(call, null, cancelled());
-            }
+            boolean inFlight = call.connection != null || call.redirectCall != null;
+            settle(call, null, inFlight ? new IOException("rpc pool closed") : cancelled());
         }
         for (RpcPoolEndpoint endpoint : endpoints.values()) {
             for (RpcPoolConnection conn : new ArrayList<>(endpoint.connections())) {
@@ -1491,6 +1704,7 @@ public final class RpcPool {
         for (RpcPoolConnection conn : new ArrayList<>(retiring)) {
             remove(conn);
         }
+        idleSet.clear();
         executor.shutdown();
     }
 
@@ -1524,11 +1738,20 @@ public final class RpcPool {
     }
 
 
-    // The client does not follow a redirect itself: the pool checks each hop's scheme and host, and sets the headers of each hop.
+    // The client of the redirect fetches: the transport settings of the pool's client, and none of its application hooks. The
+    // fetch follows no redirect, and carries no interceptor, cookie or credential of the application.
     private OkHttpClient fetchClient() {
         if (fetchHttpClient == null) {
             OkHttpClient base = httpClient != null ? httpClient : defaultHttpClient();
-            fetchHttpClient = base.newBuilder().followRedirects(false).followSslRedirects(false).build();
+            OkHttpClient.Builder builder = base.newBuilder();
+            builder.interceptors().clear();
+            builder.networkInterceptors().clear();
+            fetchHttpClient = builder
+                    .cookieJar(CookieJar.NO_COOKIES)
+                    .authenticator(Authenticator.NONE)
+                    .followRedirects(false)
+                    .followSslRedirects(false)
+                    .build();
         }
         return fetchHttpClient;
     }
@@ -1559,6 +1782,4 @@ public final class RpcPool {
     private static ReplyError badConfiguration(String message) {
         return new ReplyError(BAD_CONFIGURATION, message, false);
     }
-
-
 }

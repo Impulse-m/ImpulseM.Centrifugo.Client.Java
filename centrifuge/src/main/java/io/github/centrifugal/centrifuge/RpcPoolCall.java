@@ -18,6 +18,11 @@ final class RpcPoolCall {
     ResultCallback<RPCResult> callback;
     // The deadline on the nano clock. It starts at the submit, so it holds across resends and the redirect fetch.
     final long deadlineNanos;
+    // The timeout the call asked for, in milliseconds, checked against the connection timeout at its start.
+    final long timeoutMillis;
+    // The identity generation the call is bound to, -1 while it is unbound. Set when the main client confirms its identity
+    // at the placement of the call, and kept across the resends of the call.
+    int generation = -1;
     // The endpoint key the call goes to now: the key of the call, or the key a reroute named.
     String endpointKey;
     // Resends so far. A lost connection, a later refusal and a reroute count against the one bound.
@@ -59,6 +64,7 @@ final class RpcPoolCall {
         this.headers = headers;
         this.affinity = affinity;
         this.callback = callback;
+        this.timeoutMillis = timeoutMillis;
         this.deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
     }
 

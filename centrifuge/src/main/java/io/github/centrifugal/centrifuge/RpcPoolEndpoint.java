@@ -1,7 +1,9 @@
 package io.github.centrifugal.centrifuge;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ScheduledFuture;
 
 
@@ -12,8 +14,9 @@ import java.util.concurrent.ScheduledFuture;
 final class RpcPoolEndpoint {
     private final String url;
     private final List<RpcPoolConnection> connections = new ArrayList<>();
-    // The endpoint keys which resolved to this endpoint: a connection event looks at the queues of these keys only.
-    private final List<String> keys = new ArrayList<>();
+    // The endpoint keys which resolved to this endpoint and have calls waiting: a connection event looks at the queues of
+    // these keys only. A key joins when its queue gets its first call, and leaves when the queue empties.
+    private final Set<String> queuedKeys = new LinkedHashSet<>();
     // The connections the client closed for good since one of them connected: the count sets the next hold.
     int closes;
     // The timer which ends the hold of the opens, set while the opens are held back.
@@ -35,16 +38,20 @@ final class RpcPoolEndpoint {
     }
 
 
-    List<String> keys() {
-        return keys;
+    Set<String> queuedKeys() {
+        return queuedKeys;
     }
 
 
-    // Records a key which resolved to this endpoint, once: a key is resolved once until the pool is closed.
-    void addKey(String key) {
-        if (!keys.contains(key)) {
-            keys.add(key);
-        }
+    // Records that a key of this endpoint has its first call waiting.
+    void addQueuedKey(String key) {
+        queuedKeys.add(key);
+    }
+
+
+    // Records that the queue of a key of this endpoint is empty.
+    void removeQueuedKey(String key) {
+        queuedKeys.remove(key);
     }
 
 

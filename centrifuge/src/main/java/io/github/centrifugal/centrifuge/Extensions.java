@@ -113,12 +113,6 @@ final class Extensions {
     }
 
 
-    /** The retry value of an error of a reply, or null when the server set none: the same rule as {@link #retrySignal(Protocol.Error)}. */
-    static String retrySignal(ReplyError error) {
-        return error.getMetadata().get(RPC_RETRY_METADATA_KEY);
-    }
-
-
     /**
      * The reply of a call the client did not send, with no command id: the call's own future takes it.
      * The server would have answered it with {@link ReplyError#UNSUPPORTED}.
