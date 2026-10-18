@@ -1144,7 +1144,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
         assertTrue("B waits on its connection", !b.isDone());
         // P1's token expires while B is in flight: its refresh is refused by the spent source, P1 ends, and B is lost, not resent.
         awaitCondition("P1 ends as unauthorized", () -> poolErrors.size() == 2);
-        assertTrue("B settles with the lost connection", errorOf(b) != null);
+        assertEquals("B settles with the connection loss, not refused", "unauthorized", errorOf(b).getMessage());
         assertEquals("B is not written again", 2, rpcCount(first));
         // D on key a has no live connection left, so it fails at once.
         assertEquals("token refused", errorOf(submitTo(pool, "a")).getMessage());
