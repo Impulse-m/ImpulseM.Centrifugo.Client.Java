@@ -178,7 +178,7 @@ public class RpcPoolTest extends RpcTestBase {
             }
             return rpcReply(cmd.getId(), "ok");
         };
-        RpcPool pool = build(builder());
+        RpcPool pool = build(builder().reconnectDelays(0, 0));
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
         assertEquals("ok", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
@@ -214,6 +214,35 @@ public class RpcPoolTest extends RpcTestBase {
         pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
         assertEquals(111, replyErrorOf(future).getCode());
         assertEquals("one send and two moves", 3, sentRpcRequests().size());
+    }
+
+
+    @Test
+    public void aMoveWinsOverTheLaterSignal() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        List<String> keys = Collections.synchronizedList(new ArrayList<>());
+        server.onCommand = cmd -> {
+            if (!cmd.hasRpc()) {
+                return null;
+            }
+            if (calls.incrementAndGet() == 1) {
+                return laterAndMoveReply(cmd.getId(), "other-key");
+            }
+            return rpcReply(cmd.getId(), "ok");
+        };
+        RpcPool pool = build(new RpcPool.Builder(endpointKey -> {
+            keys.add(endpointKey);
+            return Collections.singletonList(server.url());
+        })
+                .random(maximumDraws())
+                .reroute(error -> error.getMetadata().get("x-example-relocate"))
+                .errorListener((endpoint, error) -> {
+                }));
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
+        assertEquals("ok", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+        assertTrue("the call was moved to the key the server named, not resent under its own key", keys.contains("other-key"));
+        assertEquals("one send and one move", 2, sentRpcRequests().size());
     }
 
 
@@ -564,7 +593,8 @@ public class RpcPoolTest extends RpcTestBase {
     // T14
     @Test
     public void callWaitsForItsConnectionToConnect() throws Exception {
-        answerRpcs("payload");
+        // The call is answered by the unhandled hook, so that a held call command is still unanswered when its written state is read.
+        server.onUnhandled = cmd -> cmd.hasRpc() ? rpcReply(cmd.getId(), "payload") : null;
         server.deferCommand = cmd -> cmd.hasConnect();
         RpcPool pool = build(builder());
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
@@ -572,6 +602,10 @@ public class RpcPoolTest extends RpcTestBase {
         awaitCondition("the call waits for its connection", () -> pool.stats().getQueued() == 1);
         awaitHeld(server);
         assertEquals("not written before the reply", 0, pool.stats().getInflight());
+        server.deferCommand = cmd -> cmd.hasRpc();
+        server.releaseDeferredCommands();
+        awaitCondition("the call is written on its connection", () -> pool.stats().getInflight() == 1);
+        assertEquals("the written call is no longer queued", 0, pool.stats().getQueued());
         server.releaseDeferredCommands();
         assertEquals("payload", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
         assertEquals(1, connectsOf(server));
@@ -661,6 +695,8 @@ public class RpcPoolTest extends RpcTestBase {
                     .tokenFrom(main)
                     .maxConnectionsPerEndpoint(1)
                     .maxInflightPerConnection(2)
+                    // A hold of a minute: if the stale end held the endpoint, C would not complete in time (2.4, T31).
+                    .reconnectDelays(60_000, 60_000)
                     .errorListener((String url, Throwable error) -> errors.add(error)));
             CompletableFuture<RPCResult> a = submitTo(pool, "svc.a", "");
             CompletableFuture<RPCResult> b = submitTo(pool, "svc.b", "");
@@ -721,6 +757,10 @@ public class RpcPoolTest extends RpcTestBase {
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(5001L).build(), into(future));
         assertEquals(RpcPool.BAD_CONFIGURATION, ((ReplyError) errorOf(future)).getCode());
+        // A negative call timeout is refused the same way, at the call (3.23), not when the options are built.
+        CompletableFuture<RPCResult> negative = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(-1L).build(), into(negative));
+        assertEquals(RpcPool.BAD_CONFIGURATION, ((ReplyError) errorOf(negative)).getCode());
         assertEquals("the fleet sees no connect", 0, connectsOf(server));
     }
 
@@ -903,6 +943,20 @@ public class RpcPoolTest extends RpcTestBase {
 
     private static Protocol.Reply moveReply(int id, String key) {
         return errorReply(id, "x-example-relocate", key);
+    }
+
+
+    // An error that carries the later signal and a move: the move wins (2.6, R4.1).
+    private static Protocol.Reply laterAndMoveReply(int id, String key) {
+        return Protocol.Reply.newBuilder()
+                .setId(id)
+                .setError(Protocol.Error.newBuilder()
+                        .setCode(111)
+                        .setMessage("too many requests")
+                        .setTemporary(true)
+                        .putMetadata(Extensions.RPC_RETRY_METADATA_KEY, Extensions.RPC_RETRY_LATER)
+                        .putMetadata("x-example-relocate", key))
+                .build();
     }
 
 
