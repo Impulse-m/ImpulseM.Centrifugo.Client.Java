@@ -1019,9 +1019,13 @@ public class RpcPoolTokenTest extends RpcTestBase {
         Client main = clientWithToken("static-1");
         connect(main);
         RpcPool pool = build(builderOn(main, endpoint));
-        CompletableFuture<RPCResult> a = submit(pool);
+        // A and B outlive the reconnect of the connection: the client's reconnect backoff can stretch past the short call timeout,
+        // and a call that times out first is settled by its deadline, which this case does not test.
+        CompletableFuture<RPCResult> a = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(WAIT_MILLIS).build(), into(a));
         awaitCondition("A is on the wire", () -> rpcCount(endpoint) == 1);
-        CompletableFuture<RPCResult> b = submit(pool);
+        CompletableFuture<RPCResult> b = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(WAIT_MILLIS).build(), into(b));
         assertEquals("B waits behind A", 1, pool.stats().getQueued());
         // The transport drops, and the fleet refuses the static token from now on: the reconnect is refused with 109.
         serveFleet(endpoint, "static-1");
