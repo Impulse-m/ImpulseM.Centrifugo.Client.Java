@@ -1,5 +1,6 @@
 package io.github.centrifugal.centrifuge;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
@@ -8,6 +9,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
@@ -292,30 +294,69 @@ public class RpcPoolRedirectTest extends RpcTestBase {
     // T43
     @Test
     public void redirectFailureKeepsItsCauseAndReleasesTheBody() throws Exception {
+        // The calls of the application's client: a fetch which ends has released its body, so the ends match the starts.
+        CallCounter calls = new CallCounter();
+        OkHttpClient counted = new OkHttpClient.Builder().eventListener(calls).build();
         // A body which breaks after its first chunk: the read error stays the cause of the redirect error.
         redirects.enqueue(new MockResponse().setBody("first-chunk").setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY));
-        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).build());
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).build(), counted);
         ReplyError broken = failureOf();
         assertEquals(RpcPool.REDIRECT_FAILED, broken.getCode());
         assertNotNull("the read error is the cause", broken.getCause());
-        // A declared length over the bound: refused before the body is read.
+        assertEquals("the body of the broken fetch is released", calls.started.get(), calls.ended.get());
+        // A declared length over the bound: refused before the body is read, and released.
         pool.close();
         redirects.enqueue(new MockResponse().setBody("chunk-bytes"));
-        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).maxBytes(10L).build());
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).maxBytes(10L).build(), counted);
         assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
+        assertEquals("the body of the refused fetch is released", calls.started.get(), calls.ended.get());
         // A chunked body which passes the bound while it is read.
         pool.close();
         redirects.enqueue(new MockResponse().setChunkedBody("chunk-bytes", 4));
-        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).maxBytes(10L).build());
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).maxBytes(10L).build(), counted);
         assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
+        assertEquals("the body of the bounded fetch is released", calls.started.get(), calls.ended.get());
     }
 
 
     private RpcPool redirectingPool(final RpcPool.Redirect redirect) {
-        return new RpcPool.Builder(endpointKey -> Collections.singletonList(server.url()))
+        return redirectingPool(redirect, null);
+    }
+
+
+    private RpcPool redirectingPool(final RpcPool.Redirect redirect, final OkHttpClient client) {
+        RpcPool.Builder builder = new RpcPool.Builder(endpointKey -> Collections.singletonList(server.url()))
                 .random(maximumDraws())
-                .redirect((reply, error) -> reply != null ? redirect : null)
-                .build();
+                .redirect((reply, error) -> reply != null ? redirect : null);
+        if (client != null) {
+            builder.okHttpClient(client);
+        }
+        return builder.build();
+    }
+
+
+    // Counts the calls of a client: started, and ended by a response's end or a failure.
+    private static final class CallCounter extends okhttp3.EventListener {
+        final AtomicInteger started = new AtomicInteger();
+        final AtomicInteger ended = new AtomicInteger();
+
+
+        @Override
+        public void callStart(okhttp3.Call call) {
+            started.incrementAndGet();
+        }
+
+
+        @Override
+        public void callEnd(okhttp3.Call call) {
+            ended.incrementAndGet();
+        }
+
+
+        @Override
+        public void callFailed(okhttp3.Call call, IOException ioe) {
+            ended.incrementAndGet();
+        }
     }
 
 
