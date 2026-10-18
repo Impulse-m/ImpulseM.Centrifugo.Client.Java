@@ -25,9 +25,13 @@ final class RpcPoolConnection {
     boolean removed;
     // When the connection last became idle (nanoTime), read by the pool's idle check; not meaningful while it has a call.
     long idleSince;
-    // The token the connection was given last, and the identity generation stamped at its first delivery (-1 before it).
+    // The token the connection presented at its last connect attempt, recorded when the source delivers it for that attempt
+    // (an answer for an attempt the client has left is dropped by the client, and records nothing). A refusal names this token.
     // Written on the main client's executor, and read from the client's threads and the pool's.
     volatile String token = "";
+    // The number of connect attempts the client has started: it moves on at each connecting event, on the client's thread.
+    volatile int attempt;
+    // The identity generation stamped at the connection's first delivery (-1 before it).
     volatile int generation = -1;
     // The pool takes the connection out of its endpoint: it takes no call, and closes once its calls settle.
     boolean retired;
@@ -91,6 +95,7 @@ final class RpcPoolConnection {
 
         @Override
         public void onConnecting(Client c, ConnectingEvent event) {
+            attempt++;
             pool.post(() -> pool.onConnecting(RpcPoolConnection.this));
         }
 

@@ -940,6 +940,8 @@ public class RpcPoolTokenTest extends RpcTestBase {
         server.releaseDeferredMatching((Protocol.Command cmd) -> cmd.hasRpc());
         awaitCondition("P1 connects with the renewed token", () -> connectTokensOf(endpoint).size() == 3);
         assertEquals(Arrays.asList(ACCESS_TOKEN, ACCESS_TOKEN, "access-2"), connectTokensOf(endpoint));
+        // The refusal of the reconnect names the token the connection presented, not the renewed one, so it starts no second renewal.
+        assertEquals("one renewal in total", 2, exchanges.get());
         assertTrue("no error event for a replaced answer", poolErrors.isEmpty());
         assertEquals("payload", payloadOf(submit(pool)));
     }

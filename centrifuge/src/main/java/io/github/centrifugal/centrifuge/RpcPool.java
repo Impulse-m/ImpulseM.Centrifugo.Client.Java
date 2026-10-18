@@ -1283,6 +1283,9 @@ public final class RpcPool {
             cb.Done(new UnauthorizedException(), null);
             return;
         }
+        // The attempt the request serves. An answer that comes after the client started another attempt is dropped by the client,
+        // so it records no token: the token of a refusal is one the connection presented.
+        int attempt = conn.attempt;
         source.token(conn, conn.token, (Throwable error, String token, int delivered) -> {
             if (error != null) {
                 cb.Done(error, null);
@@ -1295,7 +1298,9 @@ public final class RpcPool {
                 cb.Done(new UnauthorizedException(), null);
                 return;
             }
-            conn.token = token;
+            if (conn.attempt == attempt) {
+                conn.token = token;
+            }
             cb.Done(null, token);
         });
     }
