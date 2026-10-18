@@ -151,6 +151,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
         CompletableFuture<RPCResult> future = submit(pool);
         assertEquals("no pool socket before the reply", 0, connectTokensOf(endpoint).size());
         assertEquals("the call is queued", 1, pool.stats().getQueued());
+        assertEquals("the only timer in the window is the call's deadline", 1, pool.timerDelays().size());
         server.releaseDeferredCommands();
         assertEquals("payload", payloadOf(future));
         assertEquals(Collections.singletonList(ACCESS_TOKEN), connectTokensOf(endpoint));
@@ -192,7 +193,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
         FakeCentrifugoServer endpoint = newPoolServer();
         serveFleet(endpoint);
         endpoint.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && rpcCount(endpoint) <= 2;
-        Client main = clientWithToken(ACCESS_TOKEN);
+        Client main = clientWithToken(ACCESS_TOKEN, fastReconnect());
         connect(main);
         RpcPool pool = build(builderOn(main, endpoint).maxInflightPerConnection(2));
         CompletableFuture<RPCResult> a = submit(pool);
@@ -299,9 +300,9 @@ public class RpcPoolTokenTest extends RpcTestBase {
         FakeCentrifugoServer endpoint = newPoolServer();
         serveFleet(endpoint);
         endpoint.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && rpcCount(endpoint) <= 1;
-        Client main = clientWithToken(ACCESS_TOKEN);
+        Client main = clientWithToken(ACCESS_TOKEN, fastReconnect());
         connect(main);
-        RpcPool pool = build(builderOn(main, endpoint));
+        RpcPool pool = build(builderOn(main, endpoint).reconnectDelays(0, 0));
         CompletableFuture<RPCResult> a = submit(pool);
         awaitCondition("A is on the wire", () -> rpcCount(endpoint) == 1);
         // The main transport and the pool transport drop together; the main client's reconnect is held.
@@ -324,7 +325,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
         serveFleet(endpoint);
         serveFleet(server);
         endpoint.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();
-        Client main = clientWithToken("alice-token");
+        Client main = clientWithToken("alice-token", fastReconnect());
         connect(main);
         // The hold of the endpoint is 0 here, so the endpoint's next open would come at once if the main client allowed it.
         RpcPool pool = build(builderOn(main, endpoint).reconnectDelays(0, 0));
@@ -501,6 +502,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
         connect(main);
         RpcPool pool = build(new RpcPool.Builder(endpointKey -> Collections.singletonList("a".equals(endpointKey) ? first.url() : second.url()))
                 .tokenFrom(main)
+                .reconnectDelays(0, 0)
                 .errorListener((String url, Throwable error) -> poolErrors.add(error)));
         // Both connections are opened, and refused the token, before the one renewal answers them.
         CompletableFuture<RPCResult> a = submitTo(pool, "a");
@@ -581,7 +583,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
         serveFleet(endpoint, ACCESS_TOKEN);
         refreshErrorCode = CODE_PERMISSION_DENIED;
         renewedUser = "other";
-        Client main = exchangeClient(new Storage("refresh-1"), null);
+        Client main = exchangeClient(new Storage("refresh-1"), null, fastReconnect());
         connect(main);
         RpcPool pool = build(builderOn(main, endpoint).errorListener((String url, Throwable error) -> poolErrors.add(error)));
         // A is the opener of the connection, and B waits behind it in the window of one.
@@ -675,7 +677,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
         server.connectResult = Protocol.ConnectResult.newBuilder().setClient("fake-client").setVersion("0.0.0").setPing(25)
                 .setExpires(true).setTtl(1).build();
         serveFleet(server);
-        Options options = new Options();
+        Options options = fastReconnect();
         setScriptedGetter(options, (ConnectionTokenEvent event, TokenCallback cb) -> {
             int call = getterCalls.incrementAndGet();
             if (call == 1) {
@@ -921,11 +923,13 @@ public class RpcPoolTokenTest extends RpcTestBase {
         // P1's token lasts a second, so that its refresh at expiry asks the pool while B is in flight. The connections which
         // connect after P1 do not expire, so that only P1 ends at its expiry.
         expiringConnects(endpoint, 1);
-        endpoint.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && rpcCount(endpoint) == 2;
+        // A and B are held on P1: A is answered after the identity change, B is held past P1's expiry. C is answered at once.
+        endpoint.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && rpcCount(endpoint) <= 2;
         Client main = clientWithToken("alice-token");
         connect(main);
         RpcPool pool = build(builderOn(main, endpoint).maxInflightPerConnection(2));
-        assertEquals("A completes on P1", "payload", payloadOf(submit(pool)));
+        CompletableFuture<RPCResult> a = submit(pool);
+        awaitCondition("A is on the wire", () -> rpcCount(endpoint) == 1);
         endpoint.connectResult = endpoint.connectResult.toBuilder().setExpires(false).build();
         CompletableFuture<RPCResult> b = submit(pool);
         awaitCondition("B is on the wire, held past P1's expiry", () -> rpcCount(endpoint) == 2);
@@ -935,6 +939,10 @@ public class RpcPoolTokenTest extends RpcTestBase {
         assertEquals("C opens P2 with bob's token and completes", "payload", payloadOf(c));
         assertEquals(Arrays.asList("alice-token", "bob-token"), connectTokensOf(endpoint));
         assertEquals("C was written on the bob connection", 3, rpcCount(endpoint));
+        // A was in flight across the change: it completes on P1, under alice's connection, with the reply it was written with.
+        int aId = firstRpcId(endpoint);
+        endpoint.releaseDeferredMatching((Protocol.Command cmd) -> cmd.hasRpc() && cmd.getId() == aId);
+        assertEquals("A completes on P1 after the identity change", "payload", payloadOf(a));
         // P1's token expires: its refresh asks the pool, which answers unauthorized without asking the main client, and P1 ends.
         awaitCondition("B settles when P1 ends at its token's expiry", b::isDone);
         assertTrue("B is lost with the connection", errorOf(b) instanceof IOException);
@@ -955,7 +963,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
         expiringConnects(endpoint, 1);
         Client main = exchangeClient(new Storage("refresh-1"), null);
         connect(main);
-        RpcPool pool = build(builderOn(main, endpoint));
+        RpcPool pool = build(builderOn(main, endpoint).reconnectDelays(0, 0));
         assertEquals("payload", payloadOf(submit(pool)));
         // P1's refresh at expiry waits in the source for the renewal, whose exchange reply is held.
         server.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && METHOD.equals(cmd.getRpc().getMethod());
@@ -1047,9 +1055,9 @@ public class RpcPoolTokenTest extends RpcTestBase {
         endpoint.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && rpcCount(endpoint) == 1;
         Client main = clientWithToken("static-1");
         connect(main);
-        RpcPool pool = build(builderOn(main, endpoint));
-        // A and B outlive the reconnect of the connection: the client's reconnect backoff can stretch past the short call timeout,
-        // and a call that times out first is settled by its deadline, which this case does not test.
+        RpcPool pool = build(builderOn(main, endpoint).reconnectDelays(0, 0));
+        // A and B outlive the reconnect of the connection: the reconnect delays are zero here (R4.3), so the case does not wait for
+        // the real backoff, and a call that times out first is settled by its deadline, which this case does not test.
         CompletableFuture<RPCResult> a = new CompletableFuture<>();
         pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(WAIT_MILLIS).build(), into(a));
         awaitCondition("A is on the wire", () -> rpcCount(endpoint) == 1);
@@ -1131,7 +1139,8 @@ public class RpcPoolTokenTest extends RpcTestBase {
         serveFleet(server);
         Client main = clientWithToken("alice-token");
         connect(main);
-        RpcPool pool = build(builderOn(main, endpoint));
+        // A hold of a minute: if the stale end held the endpoint, the next call would miss its deadline (2.4, T46).
+        RpcPool pool = build(builderOn(main, endpoint).reconnectDelays(60_000, 60_000));
         assertEquals("payload", payloadOf(submit(pool)));
         awaitRefresh(main, "bob-token");
         // The fleet closes P1 for good before any other event of P1: the end is the event which retires it.
@@ -1181,6 +1190,8 @@ public class RpcPoolTokenTest extends RpcTestBase {
         assertEquals("B is not written again", 2, rpcCount(first));
         // D on key a has no live connection left, so it fails at once.
         assertEquals("token refused", errorOf(submitTo(pool, "a")).getMessage());
+        // No connection opened on b's URL after C's refusal, before or after D (2.2, 3.24).
+        assertEquals("no connection opens on b's URL after the refusal", 1, connectTokensOf(second).size());
     }
 
 
@@ -1302,9 +1313,11 @@ public class RpcPoolTokenTest extends RpcTestBase {
         Client main = clientWithToken(ACCESS_TOKEN);
         RpcPool first = build(builder(main));
         RpcPool second = build(builder(main));
-        assertNotNull(first);
-        assertNotNull(second);
-        assertSame(main.auth.tokenSource(), main.auth.tokenSource());
+        Field sourceField = RpcPool.class.getDeclaredField("source");
+        sourceField.setAccessible(true);
+        // Both pools hold the one source of the client, so both hear its identity events (2.7).
+        assertSame("the first pool shares the client's source", main.auth.tokenSource(), sourceField.get(first));
+        assertSame("the second pool shares the client's source", main.auth.tokenSource(), sourceField.get(second));
     }
 
 
@@ -1360,6 +1373,16 @@ public class RpcPoolTokenTest extends RpcTestBase {
     }
 
 
+    // The main client's options with the reconnect delays at zero (R4.3): a case that waits across a main reconnect does not wait
+    // for the real backoff.
+    private static Options fastReconnect() {
+        Options options = new Options();
+        options.setMinReconnectDelay(0);
+        options.setMaxReconnectDelay(0);
+        return options;
+    }
+
+
     private static void assertAllZero(RpcPool pool) {
         RpcPool.Stats stats = pool.stats();
         assertEquals(0, stats.getConnections());
@@ -1370,7 +1393,12 @@ public class RpcPoolTokenTest extends RpcTestBase {
 
 
     private Client clientWithToken(String token) {
-        Options options = new Options();
+        return clientWithToken(token, new Options());
+    }
+
+
+    // A main client with a static token, on the given options: a test that waits across a reconnect sets the delays small.
+    private Client clientWithToken(String token, Options options) {
         options.setToken(token);
         client = new Client(server.url(), options, new EventListener() {
             @Override
@@ -1384,7 +1412,11 @@ public class RpcPoolTokenTest extends RpcTestBase {
 
     // A main client with the token exchange of the storage, on the fake server. A clock, when given, runs its timers.
     private Client exchangeClient(Storage storage, ManualScheduler clock) {
-        Options options = new Options();
+        return exchangeClient(storage, clock, new Options());
+    }
+
+
+    private Client exchangeClient(Storage storage, ManualScheduler clock, Options options) {
         options.setTokenExchange(storage);
         EventListener listener = new EventListener() {
             @Override
