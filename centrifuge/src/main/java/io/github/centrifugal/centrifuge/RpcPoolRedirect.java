@@ -54,6 +54,8 @@ final class RpcPoolRedirect {
      * The body of a successful response, read up to the limit. A redirect answer is not successful, so it fails here. The
      * segments of the body are read into a buffer which holds at most the limit and one byte more to detect an overflow, and
      * the bytes are copied once at the end. The response is closed by the caller, which releases the body on every outcome.
+     * A fetch holds at most 2 times the limit at its peak, held briefly during a growth step or the final copy; the pool's peak
+     * is its in-flight count of fetches times that.
      *
      * @throws IOException when the status is not 2xx, the body is over the limit, or it cannot be read.
      */

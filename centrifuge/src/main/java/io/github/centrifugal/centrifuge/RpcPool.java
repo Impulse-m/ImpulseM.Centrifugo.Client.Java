@@ -510,7 +510,10 @@ public final class RpcPool {
         }
 
 
-        /** Redirect fetches in flight at most, over the pool, from 1. Default 4. */
+        /**
+         * Redirect fetches in flight at most, over the pool, from 1. Default 4. The pool's peak for redirect bodies is this
+         * count times 2 times the body limit, held briefly during a buffer growth step or the final copy.
+         */
         public Builder maxRedirectsInflight(int maxRedirectsInflight) {
             if (maxRedirectsInflight < 1) {
                 throw new IllegalArgumentException("maxRedirectsInflight must be at least 1");
@@ -783,6 +786,8 @@ public final class RpcPool {
         conn.calls.clear();
         // The client's close reason is the error of the calls which the close loses (E-loss).
         conn.closeReason = reason;
+        // An end over the size limit or as unauthorized settles its lost calls with E-loss, whatever the source state (R3.5).
+        conn.noResend = code == Client.DISCONNECTED_MESSAGE_SIZE_LIMIT || code == Client.DISCONNECTED_UNAUTHORIZED;
         // A stale connection's end is its next event: it is retired, with no error, no hold and no drain of its endpoint.
         if (conn.retired || stale(conn)) {
             retire(conn);
@@ -793,7 +798,6 @@ public final class RpcPool {
         if (code == Client.DISCONNECTED_MESSAGE_SIZE_LIMIT) {
             report(conn.endpoint.url(), new IOException(reason));
             remove(conn);
-            conn.noResend = true;
             releaseLost(conn);
             pumpEndpoint(conn.endpoint);
             return;
@@ -805,9 +809,6 @@ public final class RpcPool {
             return;
         }
         report(conn.endpoint.url(), new IOException(reason));
-        if (code == Client.DISCONNECTED_UNAUTHORIZED) {
-            conn.noResend = true;
-        }
         remove(conn);
         hold(conn.endpoint);
         releaseLost(conn);
@@ -829,7 +830,8 @@ public final class RpcPool {
                 if (call.settled) {
                     continue;
                 }
-                if (conn.noResend || stale(conn)) {
+                // The lost calls of a retired or stale connection settle with E-loss and no resend, whatever the source state (R5.1).
+                if (conn.noResend || conn.retired || stale(conn)) {
                     finishAttempt(call, null, new IOException(lossReason));
                 } else if (canResend(call)) {
                     call.resends++;
@@ -1285,7 +1287,6 @@ public final class RpcPool {
             return;
         }
         conn.retired = true;
-        conn.noResend = true;
         conn.endpoint.connections().remove(conn);
         retiring.add(conn);
         source.forget(conn);

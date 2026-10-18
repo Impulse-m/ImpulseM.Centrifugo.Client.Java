@@ -35,8 +35,8 @@ final class RpcPoolConnection {
     volatile int generation = -1;
     // The pool takes the connection out of its endpoint: it takes no call, and closes once its calls settle.
     boolean retired;
-    // The lost calls of the connection are settled, not sent again: the connection was closed for a frame over its size limit,
-    // ended as unauthorized, or retired. The reason is the error of those calls.
+    // The lost calls of the connection are settled, not sent again: the connection ended for a frame over its size limit, or
+    // as unauthorized. The reason is the error of those calls.
     boolean noResend;
     String closeReason;
 
@@ -58,6 +58,8 @@ final class RpcPoolConnection {
         copy.setName(options.getName());
         copy.setVersion(options.getVersion());
         copy.setTimeout(options.getTimeout());
+        copy.setMinReconnectDelay(options.getMinReconnectDelay());
+        copy.setMaxReconnectDelay(options.getMaxReconnectDelay());
         copy.setOkHttpClient(options.getOkHttpClient());
         copy.setTokenGetter(new ConnectionTokenGetter() {
             @Override
