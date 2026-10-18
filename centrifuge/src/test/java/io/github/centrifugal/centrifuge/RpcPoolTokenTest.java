@@ -489,6 +489,39 @@ public class RpcPoolTokenTest extends RpcTestBase {
     }
 
 
+    // T18b: the token found unusable is set on the pool's thread at once, so the next placement opens nothing even while the
+    // main client's executor is busy.
+    @Test
+    public void unusableTokenIsSetBeforeTheNextPlacement() throws Exception {
+        users.put("tA", "other");
+        FakeCentrifugoServer endpoint = newPoolServer();
+        serveFleet(endpoint);
+        Client main = clientWithToken("tA");
+        connect(main);
+        RpcPool pool = build(builderOn(main, endpoint));
+        endpoint.deferCommand = (Protocol.Command cmd) -> cmd.hasConnect();
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(CALL_TIMEOUT_MILLIS).build(), into(first));
+        awaitCondition("the pool connection carries its connect", () -> connectTokensOf(endpoint).size() == 1);
+        CountDownLatch hold = new CountDownLatch(1);
+        main.getExecutor().submit(() -> {
+            try {
+                hold.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        CompletableFuture<RPCResult> second = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(CALL_TIMEOUT_MILLIS).build(), into(second));
+        endpoint.releaseDeferredCommands();
+        awaitCondition("the mismatch is reported", () -> !poolErrors.isEmpty());
+        assertEquals("identity mismatch", poolErrors.get(0).getMessage());
+        assertEquals("no connection is opened with the unusable token", 0, pool.stats().getConnections());
+        assertEquals("no second connect", 1, connectTokensOf(endpoint).size());
+        hold.countDown();
+    }
+
+
     // T19
     @Test
     public void oneRenewalPerConfirmedTokenPerMainConnection() throws Exception {

@@ -221,9 +221,17 @@ final class TokenSource {
     }
 
 
-    /** A pool connection connected with the token and the identity of another one: the token is unusable until the next confirmation. */
+    /**
+     * A pool connection connected with the token and the identity of another one: the token is unusable until the next
+     * confirmation. Written on the pool's thread at once, so that the pool places no call on a connection of that token
+     * before the write is visible. A token the main client has moved on from records nothing.
+     */
     void unusable(String token) {
-        Extensions.submitOrIgnore(host.executor(), () -> unusable = token);
+        synchronized (this) {
+            if (token != null && token.equals(confirmed)) {
+                unusable = token;
+            }
+        }
     }
 
 
@@ -249,8 +257,8 @@ final class TokenSource {
     // identity and clears the renewal; both clear the unusable token, and move the confirmed token on.
     void onAuth(String user, String authClass, boolean always) {
         String token = auth.confirmedToken();
-        boolean unusableCleared = unusable != null;
         String spentBefore = spent;
+        boolean unusableCleared;
         int before = stamp.generation;
         if (always) {
             renewedFor = null;
@@ -265,9 +273,12 @@ final class TokenSource {
                 nextSpent = token;
             }
         }
-        confirmed = token;
-        unusable = null;
-        spent = nextSpent;
+        synchronized (this) {
+            unusableCleared = unusable != null;
+            confirmed = token;
+            unusable = null;
+            spent = nextSpent;
+        }
         observe(user, authClass);
         boolean changed = stamp.generation != before;
         evaluateAll();
