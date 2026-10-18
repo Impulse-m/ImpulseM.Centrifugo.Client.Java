@@ -192,22 +192,22 @@ public class RpcPoolTokenTest extends RpcTestBase {
     public void placesBoundCallOnLiveConnectionWhileMainReconnects() throws Exception {
         FakeCentrifugoServer endpoint = newPoolServer();
         serveFleet(endpoint);
-        endpoint.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && rpcCount(endpoint) <= 2;
+        // Only A is held: B is answered at once, so P1 has a free slot when C is submitted.
+        endpoint.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && rpcCount(endpoint) <= 1;
         Client main = clientWithToken(ACCESS_TOKEN, fastReconnect());
         connect(main);
         RpcPool pool = build(builderOn(main, endpoint).maxInflightPerConnection(2));
         CompletableFuture<RPCResult> a = submit(pool);
-        CompletableFuture<RPCResult> b = submit(pool);
-        awaitCondition("two calls on the wire", () -> rpcCount(endpoint) == 2);
+        awaitCondition("A is on the wire", () -> rpcCount(endpoint) == 1);
+        assertEquals("payload", payloadOf(submit(pool)));
         server.deferCommand = (Protocol.Command cmd) -> cmd.hasConnect();
         server.closeConnection();
         awaitCondition("the main client is reconnecting", () -> main.getState() == ClientState.CONNECTING);
         awaitHeld(server);
+        endpoint.releaseDeferredCommands();
+        assertEquals("payload", payloadOf(a));
         CompletableFuture<RPCResult> c = new CompletableFuture<>();
         pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(WAIT_MILLIS).build(), into(c));
-        endpoint.releaseDeferredCommands();
-        a.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
-        b.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
         assertEquals("c is not written before the main connect", 2, rpcCount(endpoint));
         server.releaseDeferredCommands();
         assertEquals("payload", payloadOf(c));
@@ -312,6 +312,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
         awaitCondition("the pool connection reconnects first and A is written again", () -> rpcCount(endpoint) == 2);
         assertEquals("payload", payloadOf(a));
         assertEquals("written twice", 2, rpcCount(endpoint));
+        assertEquals("exactly one resend of the lost call", 1, pool.lostResends());
         server.releaseDeferredCommands();
     }
 
@@ -429,7 +430,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
         endpoint.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc() && rpcCount(endpoint) <= 1;
         Client main = clientWithToken(ACCESS_TOKEN);
         connect(main);
-        RpcPool pool = build(builderOn(main, endpoint).maxQueued(2));
+        RpcPool pool = build(builderOn(main, endpoint).maxQueued(2).reconnectDelays(0, 0));
         // A's deadline covers the reconnect of its connection, so that its resend is still allowed.
         CompletableFuture<RPCResult> a = new CompletableFuture<>();
         pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(WAIT_MILLIS).build(), into(a));
@@ -630,8 +631,11 @@ public class RpcPoolTokenTest extends RpcTestBase {
         assertEquals("neither call is written", 0, rpcCount(endpoint));
         assertEquals("the connection is not connected again", 1, connectTokensOf(endpoint).size());
         assertEquals("the connection ends once, with one error", 1, poolErrors.size());
+        // The endpoint is held after the end: the hold is the pool's one timer, and a call made in the hold opens no connection.
+        awaitCondition("the endpoint is held", () -> pool.timerDelays().size() == 1);
         // A new call fails at once on the spent source: no connection opens, and no token is asked for.
         assertEquals("token refused", errorOf(submit(pool)).getMessage());
+        assertEquals("the hold is still the only timer", 1, pool.timerDelays().size());
         assertEquals("no connection opened on the spent source", 1, connectTokensOf(endpoint).size());
         assertEquals("no second renewal", 2, exchanges.get());
         // The main client reconnects, and the fleet accepts its token: the connect clears the spent source, and a call opens a connection.
@@ -779,9 +783,33 @@ public class RpcPoolTokenTest extends RpcTestBase {
     }
 
 
-    // T26
+    // T26: the token request of a pool connection that is made while the main client connects waits, and close() answers it
+    // unauthorized and leaves the source. The main transport is dropped first, so the request is made in the window.
     @Test
     public void forgottenWaiterIsAnsweredUnauthorized() throws Exception {
+        FakeCentrifugoServer endpoint = newPoolServer();
+        serveFleet(endpoint);
+        // The pool connection's token expires one second after its connect, which the main client's window is open for.
+        expiringConnects(endpoint, 1);
+        Client main = clientWithToken(ACCESS_TOKEN);
+        connect(main);
+        RpcPool pool = build(builderOn(main, endpoint));
+        assertEquals("payload", payloadOf(submit(pool)));
+        server.deferCommand = (Protocol.Command cmd) -> cmd.hasConnect();
+        server.closeConnection();
+        awaitCondition("the main client is reconnecting", () -> main.getState() == ClientState.CONNECTING);
+        awaitHeld(server);
+        awaitCondition("the pool connection's token request waits in the window", () -> waitingCountOf(main) == 1);
+        pool.close();
+        awaitCondition("the waiting request was answered and left", () -> waitingCountOf(main) == 0);
+        server.releaseDeferredCommands();
+    }
+
+
+    // T38: the token request of a pool connection that waits for a renewal is answered unauthorized after close(), and the
+    // source stops listing the pool.
+    @Test
+    public void closeAnswersAWaitingTokenRequest() throws Exception {
         FakeCentrifugoServer endpoint = newPoolServer();
         serveFleet(endpoint, "tA");
         AtomicInteger getterCalls = new AtomicInteger();
@@ -816,8 +844,10 @@ public class RpcPoolTokenTest extends RpcTestBase {
         RpcPool pool = build(builderOn(client, endpoint));
         submit(pool);
         awaitCondition("the pool connection waits for its token", () -> pool.stats().getConnections() == 1 && waitingCountOf(client) == 1);
+        awaitCondition("the source lists the pool with its waiting call", () -> listeningOf(client).contains(pool));
         pool.close();
         awaitCondition("the waiting request was answered and left", () -> waitingCountOf(client) == 0);
+        awaitCondition("the source no longer lists the closed pool", () -> !listeningOf(client).contains(pool));
         gate.countDown();
     }
 

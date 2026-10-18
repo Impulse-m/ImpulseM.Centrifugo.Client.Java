@@ -1,6 +1,5 @@
 package io.github.centrifugal.centrifuge;
 
-import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
@@ -19,11 +18,15 @@ import javax.net.ssl.X509TrustManager;
 import okhttp3.Cookie;
 import okhttp3.CookieJar;
 import okhttp3.HttpUrl;
+import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
 import okhttp3.mockwebserver.RecordedRequest;
 import okhttp3.mockwebserver.SocketPolicy;
+import okio.BufferedSource;
 
 import org.junit.After;
 import org.junit.Before;
@@ -291,31 +294,55 @@ public class RpcPoolRedirectTest extends RpcTestBase {
     }
 
 
+    @Test
+    public void closeSettlesAWaitingFetchWithTheClosedError() throws Exception {
+        // The first fetch is held open by the fixture, so the second call waits for the one fetch slot.
+        redirects.enqueue(new MockResponse().setBody("held").setBodyDelay(5, TimeUnit.SECONDS));
+        pool = new RpcPool.Builder(endpointKey -> Collections.singletonList(server.url()))
+                .random(maximumDraws())
+                .maxRedirectsInflight(1)
+                .redirect((reply, error) -> reply != null ? RpcPool.Redirect.builder(redirects.url("/data").toString()).build() : null)
+                .build();
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        CompletableFuture<RPCResult> second = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(first));
+        awaitCondition("the first fetch is on the wire", () -> redirects.getRequestCount() == 1);
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(second));
+        awaitCondition("the second fetch waits for the slot", () -> pool.stats().getQueued() == 1);
+        pool.close();
+        assertEquals("rpc pool closed", errorOf(first).getMessage());
+        assertEquals("a waiting fetch settles with the closed error too", "rpc pool closed", errorOf(second).getMessage());
+        assertEquals("the second fetch is never requested", 1, redirects.getRequestCount());
+    }
+
+
     // T43
     @Test
     public void redirectFailureKeepsItsCauseAndReleasesTheBody() throws Exception {
-        // The calls of the application's client: a fetch which ends has released its body, so the ends match the starts.
-        CallCounter calls = new CallCounter();
-        OkHttpClient counted = new OkHttpClient.Builder().eventListener(calls).build();
+        // Each answer of a fetch passes through the spy, which wraps its body and records the close of that body.
+        BodyCounter bodies = new BodyCounter();
         // A body which breaks after its first chunk: the read error stays the cause of the redirect error.
         redirects.enqueue(new MockResponse().setBody("first-chunk").setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY));
-        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).build(), counted);
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).build(), null, bodies);
         ReplyError broken = failureOf();
         assertEquals(RpcPool.REDIRECT_FAILED, broken.getCode());
         assertNotNull("the read error is the cause", broken.getCause());
-        assertEquals("the body of the broken fetch is released", calls.started.get(), calls.ended.get());
-        // A declared length over the bound: refused before the body is read, and released.
+        assertEquals("the broken fetch opened one body", 1, bodies.opened.get());
+        assertEquals("the body of the broken fetch is closed by the pool", 1, bodies.closed.get());
+        // A declared length over the bound: refused before the body is read, and its body is closed.
         pool.close();
         redirects.enqueue(new MockResponse().setBody("chunk-bytes"));
-        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).maxBytes(10L).build(), counted);
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).maxBytes(10L).build(), null, bodies);
         assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
-        assertEquals("the body of the refused fetch is released", calls.started.get(), calls.ended.get());
+        assertEquals("the refused fetch opened one body", 2, bodies.opened.get());
+        assertEquals("the body of the refused fetch is closed by the pool", 2, bodies.closed.get());
         // A chunked body which passes the bound while it is read.
         pool.close();
         redirects.enqueue(new MockResponse().setChunkedBody("chunk-bytes", 4));
-        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).maxBytes(10L).build(), counted);
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).maxBytes(10L).build(), null, bodies);
         assertEquals(RpcPool.REDIRECT_FAILED, failureOf().getCode());
-        assertEquals("the body of the bounded fetch is released", calls.started.get(), calls.ended.get());
+        assertEquals("the bounded fetch opened one body", 3, bodies.opened.get());
+        assertEquals("the body of the bounded fetch is closed by the pool", 3, bodies.closed.get());
     }
 
 
@@ -325,37 +352,71 @@ public class RpcPoolRedirectTest extends RpcTestBase {
 
 
     private RpcPool redirectingPool(final RpcPool.Redirect redirect, final OkHttpClient client) {
+        return redirectingPool(redirect, client, null);
+    }
+
+
+    private RpcPool redirectingPool(final RpcPool.Redirect redirect, final OkHttpClient client, final BodyCounter bodies) {
         RpcPool.Builder builder = new RpcPool.Builder(endpointKey -> Collections.singletonList(server.url()))
                 .random(maximumDraws())
                 .redirect((reply, error) -> reply != null ? redirect : null);
         if (client != null) {
             builder.okHttpClient(client);
         }
+        if (bodies != null) {
+            builder.responseTap(bodies::wrap);
+        }
         return builder.build();
     }
 
 
-    // Counts the calls of a client: started, and ended by a response's end or a failure.
-    private static final class CallCounter extends okhttp3.EventListener {
-        final AtomicInteger started = new AtomicInteger();
-        final AtomicInteger ended = new AtomicInteger();
+    // Wraps the body of each answer of a fetch in a spy, which counts the bodies opened and the bodies closed.
+    private static final class BodyCounter {
+        final AtomicInteger opened = new AtomicInteger();
+        final AtomicInteger closed = new AtomicInteger();
 
 
-        @Override
-        public void callStart(okhttp3.Call call) {
-            started.incrementAndGet();
+        Response wrap(final Response answer) {
+            opened.incrementAndGet();
+            return answer.newBuilder().body(new BodySpy(answer.body(), this)).build();
+        }
+    }
+
+
+    // A body which records its close, and passes everything else to the body it wraps.
+    private static final class BodySpy extends ResponseBody {
+        private final ResponseBody delegate;
+        private final BodyCounter counter;
+
+
+        BodySpy(ResponseBody delegate, BodyCounter counter) {
+            this.delegate = delegate;
+            this.counter = counter;
         }
 
 
         @Override
-        public void callEnd(okhttp3.Call call) {
-            ended.incrementAndGet();
+        public MediaType contentType() {
+            return delegate.contentType();
         }
 
 
         @Override
-        public void callFailed(okhttp3.Call call, IOException ioe) {
-            ended.incrementAndGet();
+        public long contentLength() {
+            return delegate.contentLength();
+        }
+
+
+        @Override
+        public BufferedSource source() {
+            return delegate.source();
+        }
+
+
+        @Override
+        public void close() {
+            counter.closed.incrementAndGet();
+            delegate.close();
         }
     }
 
