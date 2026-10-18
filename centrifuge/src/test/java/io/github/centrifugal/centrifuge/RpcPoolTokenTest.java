@@ -243,6 +243,34 @@ public class RpcPoolTokenTest extends RpcTestBase {
     }
 
 
+    // T6b: a call admitted while the main client is connected keeps that identity while it waits behind another call.
+    @Test
+    public void failsCallQueuedBehindAnotherWhenIdentityChanges() throws Exception {
+        users.put("alice-token", "alice");
+        users.put("bob-token", "bob");
+        FakeCentrifugoServer endpoint = newPoolServer();
+        serveFleet(endpoint);
+        serveFleet(server);
+        endpoint.deferCommand = (Protocol.Command cmd) -> cmd.hasRpc();
+        Client main = clientWithToken("alice-token");
+        connect(main);
+        RpcPool pool = build(builderOn(main, endpoint));
+        CompletableFuture<RPCResult> a = submit(pool);
+        awaitCondition("A is on the wire", () -> rpcCount(endpoint) == 1);
+        CompletableFuture<RPCResult> b = submit(pool);
+        CompletableFuture<RPCResult> c = submit(pool);
+        assertEquals("B and C are queued", 2, pool.stats().getQueued());
+        awaitRefresh(main, "bob-token");
+        assertEquals("B fails with the identity change", "identity changed", errorOf(b).getMessage());
+        assertEquals("C fails with the identity change, though it waits behind B", "identity changed", errorOf(c).getMessage());
+        assertEquals("neither B nor C is written", 1, rpcCount(endpoint));
+        assertFalse("no connection opens with bob's token", connectTokensOf(endpoint).contains("bob-token"));
+        endpoint.releaseDeferredCommandsOnTheirSockets();
+        assertEquals("payload", payloadOf(a));
+        assertEquals("A is written once", 1, rpcCount(endpoint));
+    }
+
+
     // T7
     @Test
     public void doesNotResendCallLostOnStaleConnection() throws Exception {
@@ -259,7 +287,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
         awaitCondition("A is on the wire", () -> rpcCount(endpoint) == 1);
         awaitRefresh(main, "bob-token");
         endpoint.closeConnection();
-        assertEquals("A settles with the loss", "rpc connection retired", errorOf(a).getMessage());
+        assertEquals("A settles with the loss", "rpc connection lost", errorOf(a).getMessage());
         assertEquals("A is written once", 1, rpcCount(endpoint));
         assertEquals("no connect with alice's token after the change", Collections.singletonList("alice-token"), connectTokensOf(endpoint));
     }
@@ -909,7 +937,8 @@ public class RpcPoolTokenTest extends RpcTestBase {
         assertEquals("C was written on the bob connection", 3, rpcCount(endpoint));
         // P1's token expires: its refresh asks the pool, which answers unauthorized without asking the main client, and P1 ends.
         awaitCondition("B settles when P1 ends at its token's expiry", b::isDone);
-        assertTrue("B is lost with the connection", errorOf(b) != null);
+        assertTrue("B is lost with the connection", errorOf(b) instanceof IOException);
+        assertEquals("B settles with the close reason of its connection", "unauthorized", errorOf(b).getMessage());
         assertEquals("B is never written again", 3, rpcCount(endpoint));
         assertEquals("no renewal of the main client", mainRefreshes, refreshTokensOf(server).size());
         assertTrue("the retired connection reports no error", poolErrors.isEmpty());
@@ -1082,9 +1111,13 @@ public class RpcPoolTokenTest extends RpcTestBase {
         connect(confirmed);
         FakeCentrifugoServer other = newPoolServer();
         serveFleet(other);
+        int exchangesBefore = exchanges.get();
+        int refreshesBefore = refreshTokensOf(server).size();
         RpcPool otherPool = build(builderOn(confirmed, other));
         assertEquals("payload", payloadOf(submit(otherPool)));
         assertEquals(Collections.singletonList("tA"), connectTokensOf(other));
+        assertEquals("no renewal of the main client", refreshesBefore, refreshTokensOf(server).size());
+        assertEquals("no token exchange", exchangesBefore, exchanges.get());
     }
 
 

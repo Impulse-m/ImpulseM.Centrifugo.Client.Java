@@ -19,6 +19,7 @@ import org.junit.After;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -415,6 +416,30 @@ public class RpcPoolTest extends RpcTestBase {
     }
 
 
+    // A pool the application never closes is collected once its call settles and its connection closes at idleTimeout.
+    @Test
+    public void anUnclosedPoolIsCollectedOnceItsConnectionCloses() throws Exception {
+        answerRpcs("ok");
+        WeakReference<RpcPool> dropped = callOnUnclosedPool();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10L);
+        while (dropped.get() != null && System.nanoTime() < deadline) {
+            System.gc();
+            Thread.sleep(50L);
+        }
+        assertNull("the dropped pool is collected", dropped.get());
+    }
+
+
+    // The pool is not kept by the test: only the weak reference to it leaves this method.
+    private WeakReference<RpcPool> callOnUnclosedPool() throws Exception {
+        RpcPool pool = builder().idleTimeout(100L).build();
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
+        future.get(5, TimeUnit.SECONDS);
+        return new WeakReference<>(pool);
+    }
+
+
     @Test
     public void aQueueWithoutRoomStillOpensAConnectionForACall() throws Exception {
         answerRpcs("ok");
@@ -656,7 +681,7 @@ public class RpcPoolTest extends RpcTestBase {
             assertEquals("ok", new String(a.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
             awaitCondition("B is still on the wire", () -> pool.stats().getInflight() == 1);
             endpoint.disconnect(3501, "terminal");
-            assertEquals("B settles with the loss", "rpc connection retired", errorOf(b).getMessage());
+            assertEquals("B settles with the loss, the close reason of its connection's client", "terminal", errorOf(b).getMessage());
             CompletableFuture<RPCResult> c = submitTo(pool, "svc.c", "");
             assertEquals("ok", new String(c.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
             assertTrue("no error for the retired connection", errors.isEmpty());
