@@ -247,13 +247,11 @@ public final class RpcPool {
 
 
             /**
-             * The deadline of the call in milliseconds, which holds across its resends and its redirect fetch. At most the
-             * connect timeout of the pool: a longer deadline is refused with {@link RpcPool#BAD_CONFIGURATION}.
+             * The deadline of the call in milliseconds, which holds across its resends and its redirect fetch. 0 takes the
+             * timeout of the pool. A value that is negative, or longer than the connect timeout of the pool, is refused with
+             * {@link RpcPool#BAD_CONFIGURATION} when the call is made.
              */
             public Builder timeout(long timeout) {
-                if (timeout <= 0) {
-                    throw new IllegalArgumentException("timeout must be positive");
-                }
                 this.timeout = timeout;
                 return this;
             }
@@ -654,8 +652,14 @@ public final class RpcPool {
         Objects.requireNonNull(data, "data");
         Objects.requireNonNull(cb, "callback");
         CallOptions opts = callOptions != null ? callOptions : CallOptions.NONE;
-        long timeout = opts.getTimeout() > 0 ? opts.getTimeout() : options.getTimeout();
+        // 0 is not given: the pool's timeout. Any other value is checked on the pool's thread (2.1 row 4).
+        long timeout = opts.getTimeout() != 0 ? opts.getTimeout() : options.getTimeout();
         final RpcPoolCall call = new RpcPoolCall(method, data, opts.getEndpointKey(), opts.getHeaders(), opts.getAffinity(), timeout, cb);
+        // A call made while the main client is connected is bound to its identity here, on the caller's thread (2.1 row 5): an
+        // identity change between this call and the pool's thread does not move it.
+        if (source != null && source.mainState() == TokenSource.Phase.CONNECTED) {
+            call.generation = source.generation();
+        }
         Extensions.submitOrRun(executor, () -> start(call), () -> call.callback.onDone(cancelled(), null));
         return new Call(this, call);
     }
@@ -949,6 +953,10 @@ public final class RpcPool {
             settle(call, null, badConfiguration("affinity header is given as a header of the call"));
             return;
         }
+        if (call.timeoutMillis <= 0) {
+            settle(call, null, badConfiguration("call timeout must be positive"));
+            return;
+        }
         if (call.timeoutMillis > options.getTimeout()) {
             settle(call, null, badConfiguration("call timeout is over the connection timeout"));
             return;
@@ -967,11 +975,6 @@ public final class RpcPool {
         unsettled.add(call);
         // The timer runs on the deadline of the call, which started at its submit: the time it waited for the pool's thread is spent.
         call.deadlineTask = executor.schedule(() -> onDeadline(call), call.remainingNanos(), TimeUnit.NANOSECONDS);
-        // A call admitted while the main client is connected is bound to its identity here (2.1 row 5), even when it waits behind
-        // other calls: a bound call that waits keeps the identity it was admitted under.
-        if (source != null && source.mainState() == TokenSource.Phase.CONNECTED) {
-            call.generation = source.generation();
-        }
         RpcPoolQueue line = queues.get(call.endpointKey);
         // A call goes out at once only when no call of its key waits: the waiting calls are older, and go first.
         if (line == null || line.isEmpty()) {
@@ -1307,6 +1310,11 @@ public final class RpcPool {
                 cb.Done(error, null);
                 return;
             }
+            // An answer for an attempt the client abandoned records nothing: neither its token nor its generation (R3.5).
+            if (conn.attempt != attempt) {
+                cb.Done(null, token);
+                return;
+            }
             if (conn.generation < 0) {
                 conn.generation = delivered;
             } else if (conn.generation != delivered) {
@@ -1314,9 +1322,7 @@ public final class RpcPool {
                 cb.Done(new UnauthorizedException(), null);
                 return;
             }
-            if (conn.attempt == attempt) {
-                conn.token = token;
-            }
+            conn.token = token;
             cb.Done(null, token);
         });
     }
@@ -1324,10 +1330,7 @@ public final class RpcPool {
 
     private void onReplyError(RpcPoolCall call, ReplyError error) {
         if (canResend(call)) {
-            if (Extensions.RPC_RETRY_LATER.equals(retrySignal(error))) {
-                scheduleLater(call);
-                return;
-            }
+            // A move the reroute hook maps wins over the later signal (2.6, R4.1): the call goes to the new key at once.
             if (reroute != null && isServerError(error)) {
                 String key = applyReroute(call, error);
                 if (key != null) {
@@ -1336,6 +1339,10 @@ public final class RpcPool {
                     routeFirst(call);
                     return;
                 }
+            }
+            if (Extensions.RPC_RETRY_LATER.equals(retrySignal(error))) {
+                scheduleLater(call);
+                return;
             }
         }
         finishAttempt(call, null, error);
