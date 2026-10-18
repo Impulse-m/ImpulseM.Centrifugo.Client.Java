@@ -586,6 +586,9 @@ public final class RpcPool {
 
     private static final Backoff BACKOFF = new Backoff();
 
+    // How long the pool's thread stays without a task before it ends. A pending timer keeps it, whatever this is.
+    private static final long POOL_THREAD_KEEP_ALIVE_MILLIS = 1000L;
+
     // The client of the redirect fetches of the pools without an OkHttp client of their own, created on the first fetch.
     private static OkHttpClient sharedHttpClient;
 
@@ -774,6 +777,8 @@ public final class RpcPool {
         // The calls which the client has not reported yet are lost with the connection: no answer will come for them.
         conn.lost.addAll(conn.calls);
         conn.calls.clear();
+        // The client's close reason is the error of the calls which the close loses (E-loss).
+        conn.closeReason = reason;
         // A stale connection's end is its next event: it is retired, with no error, no hold and no drain of its endpoint.
         if (conn.retired || stale(conn)) {
             retire(conn);
@@ -785,7 +790,6 @@ public final class RpcPool {
             report(conn.endpoint.url(), new IOException(reason));
             remove(conn);
             conn.noResend = true;
-            conn.closeReason = reason;
             releaseLost(conn);
             pumpEndpoint(conn.endpoint);
             return;
@@ -799,7 +803,6 @@ public final class RpcPool {
         report(conn.endpoint.url(), new IOException(reason));
         if (code == Client.DISCONNECTED_UNAUTHORIZED) {
             conn.noResend = true;
-            conn.closeReason = reason;
         }
         remove(conn);
         hold(conn.endpoint);
@@ -815,18 +818,20 @@ public final class RpcPool {
         if (!conn.lost.isEmpty()) {
             List<RpcPoolCall> lost = new ArrayList<>(conn.lost);
             conn.lost.clear();
+            // The E-loss of the calls: the close reason of the client, or the fixed text when the connection did not end.
+            String lossReason = conn.closeReason != null ? conn.closeReason : "rpc connection lost";
             for (RpcPoolCall call : lost) {
                 call.connection = null;
                 if (call.settled) {
                     continue;
                 }
                 if (conn.noResend || stale(conn)) {
-                    finishAttempt(call, null, new IOException(conn.closeReason != null ? conn.closeReason : "rpc connection lost"));
+                    finishAttempt(call, null, new IOException(lossReason));
                 } else if (canResend(call)) {
                     call.resends++;
                     resend(call, false);
                 } else {
-                    finishAttempt(call, null, new IOException("rpc connection lost"));
+                    finishAttempt(call, null, new IOException(lossReason));
                 }
             }
         }
@@ -861,7 +866,9 @@ public final class RpcPool {
 
 
     // The pool's thread is created with the first task, and is a daemon: an idle pool keeps the process alive
-    // no more than the clients of its connections do.
+    // no more than the clients of its connections do. The thread times out when no task is left, so a pool that is
+    // never closed is collected once its calls settle and its connections close: a live thread would keep it reachable.
+    // A pending timer keeps the thread alive, since the queue is not empty.
     private ScheduledThreadPoolExecutor createExecutor() {
         ThreadFactory factory = (Runnable runnable) -> {
             Thread thread = new Thread(runnable, "centrifuge-rpc-pool");
@@ -871,6 +878,8 @@ public final class RpcPool {
         };
         ScheduledThreadPoolExecutor executor = newScheduler(factory, removeCancelledTimers);
         executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+        executor.setKeepAliveTime(POOL_THREAD_KEEP_ALIVE_MILLIS, TimeUnit.MILLISECONDS);
+        executor.allowCoreThreadTimeOut(true);
         return executor;
     }
 
@@ -958,6 +967,11 @@ public final class RpcPool {
         unsettled.add(call);
         // The timer runs on the deadline of the call, which started at its submit: the time it waited for the pool's thread is spent.
         call.deadlineTask = executor.schedule(() -> onDeadline(call), call.remainingNanos(), TimeUnit.NANOSECONDS);
+        // A call admitted while the main client is connected is bound to its identity here (2.1 row 5), even when it waits behind
+        // other calls: a bound call that waits keeps the identity it was admitted under.
+        if (source != null && source.mainState() == TokenSource.Phase.CONNECTED) {
+            call.generation = source.generation();
+        }
         RpcPoolQueue line = queues.get(call.endpointKey);
         // A call goes out at once only when no call of its key waits: the waiting calls are older, and go first.
         if (line == null || line.isEmpty()) {
@@ -1269,7 +1283,6 @@ public final class RpcPool {
         }
         conn.retired = true;
         conn.noResend = true;
-        conn.closeReason = "rpc connection retired";
         conn.endpoint.connections().remove(conn);
         retiring.add(conn);
         source.forget(conn);
@@ -1542,8 +1555,8 @@ public final class RpcPool {
         call.redirectCall = null;
         if (!call.settled) {
             if (failure != null) {
-                // The read error stays the cause of the redirect error, for the application to see what broke.
-                ReplyError error = new ReplyError(REDIRECT_FAILED, "redirect failed: " + failure.getMessage(), false);
+                // The read error stays the cause of the redirect error, for the application to see what broke. The message is fixed.
+                ReplyError error = new ReplyError(REDIRECT_FAILED, "redirect failed", false);
                 error.initCause(failure);
                 settle(call, null, error);
             } else {
