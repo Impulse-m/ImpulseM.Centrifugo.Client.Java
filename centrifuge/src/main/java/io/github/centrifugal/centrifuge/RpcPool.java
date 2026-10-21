@@ -849,8 +849,10 @@ public final class RpcPool {
                 if (call.settled) {
                     continue;
                 }
-                // A call lost on a retired or stale connection is not sent again, whatever the token state: it was written under an
-                // older identity generation, and a loss error is the truthful answer for a call that was written.
+                // A call lost on a connection that ended over its size limit or as unauthorized, or on a retired or stale connection,
+                // is not sent again, whatever the token state: it was written and its outcome is unknown, so the loss error is the
+                // truthful answer. The calls of a stale connection are also bound to an older identity, which the token state does
+                // not concern.
                 if (conn.noResend || conn.retired || stale(conn)) {
                     finishAttempt(call, null, new IOException(lossReason));
                 } else if (canResend(call)) {
