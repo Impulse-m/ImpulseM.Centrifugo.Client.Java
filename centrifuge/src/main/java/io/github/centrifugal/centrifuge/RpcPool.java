@@ -386,6 +386,12 @@ public final class RpcPool {
          *
          * <p>A pool and its client: the pool follows the client's connect, disconnect and logout. A call made while the
          * client's session has ended as unauthorized fails at once, and a call made after the client connects again goes out.
+         *
+         * <p>The token is handed over unchanged, so the fleet must accept its claims as they are, including any channels or
+         * subscriptions it carries. A fleet that refuses such a claim closes the connection with code 102: the pool reports the
+         * reason through its error listener, and the calls end in a timeout, not as {@code token refused}. The token getter
+         * route, {@link #tokenGetter(ConnectionTokenGetter)}, does not follow the client's session, and costs one getter call
+         * per connect and per refresh.
          */
         public Builder tokenFrom(Client client) {
             this.tokenFrom = Objects.requireNonNull(client, "tokenFrom");
