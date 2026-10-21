@@ -800,8 +800,11 @@ public class RpcPoolTokenTest extends RpcTestBase {
         awaitCondition("the main client is reconnecting", () -> main.getState() == ClientState.CONNECTING);
         awaitHeld(server);
         awaitCondition("the pool connection's token request waits in the window", () -> waitingCountOf(main) == 1);
+        List<Throwable> answers = new CopyOnWriteArrayList<>();
+        recordAnswers(main, answers);
         pool.close();
         awaitCondition("the waiting request was answered and left", () -> waitingCountOf(main) == 0);
+        awaitCondition("the waiting request was answered unauthorized", () -> answers.size() == 1 && answers.get(0) instanceof UnauthorizedException);
         server.releaseDeferredCommands();
     }
 
@@ -937,7 +940,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
         awaitCondition("the pool connection waits for its token", () -> waitingCountOf(main) == 1);
         awaitCondition("the source lists the pool with its waiting calls", () -> listeningOf(main).equals(Collections.singleton(pool)));
         List<Throwable> answers = new CopyOnWriteArrayList<>();
-        recordAnswerOfWaiter(main, answers);
+        recordAnswers(main, answers);
         pool.close();
         assertEquals("rpc pool closed", errorOf(inFlight).getMessage());
         assertEquals("queued call is cancelled", ReplyError.CANCELLED, ((ReplyError) errorOf(queued)).getCode());
@@ -950,23 +953,13 @@ public class RpcPoolTokenTest extends RpcTestBase {
     }
 
 
-    // Wraps the callback of the waiting request of the main client, on its executor, so that the test reads the answer it is given.
-    private void recordAnswerOfWaiter(Client main, List<Throwable> answers) throws Exception {
-        Callable<Void> wrap = () -> {
-            Field waitingField = TokenSource.class.getDeclaredField("waiting");
-            waitingField.setAccessible(true);
-            Map<?, ?> waiting = (Map<?, ?>) waitingField.get(main.auth.tokenSource());
-            Object waiter = waiting.values().iterator().next();
-            Field callbackField = waiter.getClass().getDeclaredField("callback");
-            callbackField.setAccessible(true);
-            TokenSource.Callback original = (TokenSource.Callback) callbackField.get(waiter);
-            callbackField.set(waiter, (TokenSource.Callback) (Throwable error, String token, int generation) -> {
-                answers.add(error);
-                original.done(error, token, generation);
-            });
+    // Records the errors of the requests which the main client's token source answers as unauthorized, through the test seam.
+    private void recordAnswers(Client main, List<Throwable> answers) throws Exception {
+        Callable<Void> install = () -> {
+            main.auth.tokenSource().setAnswerTap(answers::add);
             return null;
         };
-        main.getExecutor().submit(wrap).get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        main.getExecutor().submit(install).get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
     }
 
 
@@ -1646,10 +1639,16 @@ public class RpcPoolTokenTest extends RpcTestBase {
     }
 
 
-    private static int waitingCount(TokenSource source) throws Exception {
+    // The waiting requests of a token source, by requester, read through reflection: the test reads the source's own state.
+    private static Map<?, ?> waitingOf(TokenSource source) throws Exception {
         Field field = TokenSource.class.getDeclaredField("waiting");
         field.setAccessible(true);
-        return ((Map<?, ?>) field.get(source)).size();
+        return (Map<?, ?>) field.get(source);
+    }
+
+
+    private static int waitingCount(TokenSource source) throws Exception {
+        return waitingOf(source).size();
     }
 
 
@@ -1657,9 +1656,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
     // when a request replaces it.
     private Object waiterOf(Client main) {
         Callable<Object> waiter = () -> {
-            Field field = TokenSource.class.getDeclaredField("waiting");
-            field.setAccessible(true);
-            Map<?, ?> waiting = (Map<?, ?>) field.get(main.auth.tokenSource());
+            Map<?, ?> waiting = waitingOf(main.auth.tokenSource());
             return waiting.isEmpty() ? null : waiting.values().iterator().next();
         };
         try {
