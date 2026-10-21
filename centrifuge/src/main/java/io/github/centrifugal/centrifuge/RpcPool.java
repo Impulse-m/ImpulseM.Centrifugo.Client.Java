@@ -647,7 +647,7 @@ public final class RpcPool {
     private int redirectsInflight;
     // The key lines the pool examined, for the tests of the lookups.
     private long keyLookups;
-    // The calls resent after their connection was lost, for the tests (T8).
+    // The calls resent after their connection was lost, counted for the tests.
     private int lostResends;
     private boolean closed;
 
@@ -667,11 +667,11 @@ public final class RpcPool {
         Objects.requireNonNull(data, "data");
         Objects.requireNonNull(cb, "callback");
         CallOptions opts = callOptions != null ? callOptions : CallOptions.NONE;
-        // 0 is not given: the pool's timeout. Any other value is checked on the pool's thread (2.1 row 4).
+        // 0 is not given: the pool's timeout. Any other value is checked on the pool's thread, with the other admission checks.
         long timeout = opts.getTimeout() != 0 ? opts.getTimeout() : options.getTimeout();
         final RpcPoolCall call = new RpcPoolCall(method, data, opts.getEndpointKey(), opts.getHeaders(), opts.getAffinity(), timeout, cb);
-        // A call made while the main client is connected is bound to its identity here, on the caller's thread (2.1 row 5): an
-        // identity change between this call and the pool's thread does not move it.
+        // A call made while the main client is connected is bound to its identity here, on the caller's thread: an identity
+        // change between this call and the pool's thread does not move it.
         if (source != null && source.mainState() == TokenSource.Phase.CONNECTED) {
             call.generation = source.generation();
         }
@@ -802,9 +802,10 @@ public final class RpcPool {
         // The calls which the client has not reported yet are lost with the connection: no answer will come for them.
         conn.lost.addAll(conn.calls);
         conn.calls.clear();
-        // The client's close reason is the error of the calls which the close loses (E-loss).
+        // The client's close reason is the error of the calls which the close loses.
         conn.closeReason = reason;
-        // An end over the size limit or as unauthorized settles its lost calls with E-loss, whatever the source state (R3.5).
+        // A size-limit or unauthorized end settles its lost calls with the loss error and no resend, whatever the token state: a
+        // chunk over the limit would be over it again, and a connection that ended as unauthorized cannot carry the call.
         conn.noResend = code == Client.DISCONNECTED_MESSAGE_SIZE_LIMIT || code == Client.DISCONNECTED_UNAUTHORIZED;
         // A stale connection's end is its next event: it is retired, with no error, no hold and no drain of its endpoint.
         if (conn.retired || stale(conn)) {
@@ -841,14 +842,15 @@ public final class RpcPool {
         if (!conn.lost.isEmpty()) {
             List<RpcPoolCall> lost = new ArrayList<>(conn.lost);
             conn.lost.clear();
-            // The E-loss of the calls: the close reason of the client, or the fixed text when the connection did not end.
+            // The loss error of the calls: the close reason of the client, or the fixed text when the connection did not end.
             String lossReason = conn.closeReason != null ? conn.closeReason : "rpc connection lost";
             for (RpcPoolCall call : lost) {
                 call.connection = null;
                 if (call.settled) {
                     continue;
                 }
-                // The lost calls of a retired or stale connection settle with E-loss and no resend, whatever the source state (R5.1).
+                // A call lost on a retired or stale connection is not sent again, whatever the token state: it was written under an
+                // older identity generation, and a loss error is the truthful answer for a call that was written.
                 if (conn.noResend || conn.retired || stale(conn)) {
                     finishAttempt(call, null, new IOException(lossReason));
                 } else if (canResend(call)) {
@@ -949,8 +951,8 @@ public final class RpcPool {
     }
 
 
-    // Admission of a call, by the order of the table: closed, the main client's ended and disconnected states, the options,
-    // the key, and then the placement or the queue bound.
+    // Admission of a call, in a fixed order: closed, the main client's ended and disconnected states, the options, the key,
+    // and then the placement or the queue bound.
     private void start(RpcPoolCall call) {
         if (closed) {
             settle(call, null, cancelled());
@@ -1068,8 +1070,8 @@ public final class RpcPool {
     }
 
 
-    // Places one call by the rows of the table for the main client's state and the binding of the call. A call which the main
-    // client's state refuses is settled with that row's error; a call bound to another identity is settled as the identity changed.
+    // Places one call by the main client's state and the binding of the call. A call which the main client's state refuses is
+    // settled with that state's error; a call bound to another identity is settled as the identity changed.
     private int place(RpcPoolCall call, List<RpcPoolEndpoint> eps) {
         if (source == null) {
             return tryAssign(call, eps) ? PLACED : STOP_OPEN;
@@ -1331,7 +1333,7 @@ public final class RpcPool {
                 cb.Done(error, null);
                 return;
             }
-            // An answer for an attempt the client abandoned records nothing: neither its token nor its generation (R3.5).
+            // An answer for an attempt the client abandoned records nothing: neither its token nor its generation.
             if (conn.attempt != attempt) {
                 cb.Done(null, token);
                 return;
@@ -1343,10 +1345,10 @@ public final class RpcPool {
                 cb.Done(new UnauthorizedException(), null);
                 return;
             }
-            // Recorded at delivery to the client's current connect attempt, since the Client has no connect-frame hook (I6). An
-            // attempt the client abandons before its connect is replaced by the next attempt's delivery. So a refusal may name
-            // the token of a delivery whose connect never ran: at most one extra renewal, which the one-renewal rule of 2.5
-            // bounds (R5.4).
+            // Recorded at delivery to the client's current connect attempt, because the client offers no hook at its connect
+            // frame. An attempt the client abandons before its connect is replaced by the next attempt's delivery, so a refusal
+            // may name a token whose connect never ran. That costs at most one extra renewal, which the token source's
+            // one-renewal rule bounds.
             conn.token = token;
             cb.Done(null, token);
         });
@@ -1355,7 +1357,7 @@ public final class RpcPool {
 
     private void onReplyError(RpcPoolCall call, ReplyError error) {
         if (canResend(call)) {
-            // A move the reroute hook maps wins over the later signal (2.6, R4.1): the call goes to the new key at once.
+            // A move the reroute hook maps wins over the later signal: the call goes to the new key at once.
             if (reroute != null && isServerError(error)) {
                 String key = applyReroute(call, error);
                 if (key != null) {
@@ -1404,8 +1406,8 @@ public final class RpcPool {
     }
 
 
-    // Sends a call again: a call which can never be placed settles now, by the row of the main client's state or the binding
-    // that refuses it, and any other joins its line, at the front for a reroute and at the back otherwise.
+    // Sends a call again: a call which can never be placed settles now, by the main client's state or the binding that refuses
+    // it, and any other joins its line, at the front for a reroute and at the back otherwise.
     private void resend(RpcPoolCall call, boolean first) {
         if (source != null) {
             TokenSource.Phase phase = source.mainState();
@@ -1784,7 +1786,8 @@ public final class RpcPool {
         }
         waitingKeys.clear();
         for (RpcPoolCall call : new ArrayList<>(unsettled)) {
-            // A call waiting for a redirect fetch slot is in redirect (1.4): it settles with the closed error, as a running fetch (R5.3).
+            // A call waiting for a redirect fetch slot counts as in flight: close settles it with the closed error, as it settles a
+            // running fetch.
             boolean inFlight = call.connection != null || call.redirectCall != null || call.queue == redirectWaiting;
             settle(call, null, inFlight ? new IOException("rpc pool closed") : cancelled());
         }
