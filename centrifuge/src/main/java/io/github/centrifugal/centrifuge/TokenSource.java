@@ -8,6 +8,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 
 /**
@@ -97,6 +98,8 @@ final class TokenSource {
     private volatile Stamp stamp = new Stamp(0, false, "", "");
     // Whether the source took the state of the main client, on the executor. Until then the pools read the client's own state.
     private volatile boolean initialized;
+    // A test seam: sees the error of each request answered as unauthorized. Null in production.
+    private Consumer<Throwable> answerTap;
 
 
     TokenSource(ClientHost host, AuthRefresh auth) {
@@ -199,13 +202,6 @@ final class TokenSource {
     }
 
 
-    /** Whether the identity recorded for the current generation is the given one. Any thread. */
-    boolean identityMatches(String user, String authClass) {
-        Stamp current = stamp;
-        return current.recorded && current.user.equals(user) && current.authClass.equals(authClass);
-    }
-
-
     /**
      * Drops the waiting request of a requester which left its pool. The request's callback is answered as unauthorized,
      * so that the connection's token request settles and the connection ends, with the client ignoring the answer
@@ -232,6 +228,12 @@ final class TokenSource {
                 unusable = token;
             }
         }
+    }
+
+
+    /** Test seam: sets the tap that sees each request answered as unauthorized. Runs on the main client's executor. */
+    void setAnswerTap(Consumer<Throwable> tap) {
+        answerTap = tap;
     }
 
 
@@ -377,8 +379,8 @@ final class TokenSource {
     }
 
 
-    // Answers one request by the rules of the table, and reports whether it was answered (so that it leaves the waiting set).
-    // The rules run in order: the main client's phase first, then the confirmed token, then the one renewal.
+    // Answers one request, and reports whether it was answered (so that it leaves the waiting set). The rules run in order:
+    // the main client's phase first, then the confirmed token, then the one renewal.
     private boolean answer(Object requester, Waiter waiter) {
         Phase state = mainState();
         if (state == Phase.ENDED || state == Phase.DISCONNECTED) {
@@ -435,7 +437,11 @@ final class TokenSource {
 
 
     private void fail(Waiter waiter) {
-        waiter.callback.done(new UnauthorizedException(), null, stamp.generation);
+        Throwable error = new UnauthorizedException();
+        if (answerTap != null) {
+            answerTap.accept(error);
+        }
+        waiter.callback.done(error, null, stamp.generation);
     }
 
 
