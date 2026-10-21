@@ -18,8 +18,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.UnaryOperator;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.X509TrustManager;
@@ -76,11 +74,7 @@ public class Client {
     private final ScheduledExecutorService scheduler;
     int pingInterval;
     boolean sendPong;
-    ScheduledFuture<?> pingTask;
-    // Set by every decoded reply, cleared by each watchdog check.
-    private final AtomicBoolean replySeen = new AtomicBoolean();
-    // Bumped when a connection ends, so a watchdog check left over from it exits without rescheduling.
-    private final AtomicLong watchdogGeneration = new AtomicLong();
+    private final PingWatchdog watchdog;
     private ScheduledFuture<?> reconnectTask;
     private int reconnectAttempts = 0;
     boolean refreshRequired = false;
@@ -185,6 +179,7 @@ public class Client {
         this.instance = opts.getInstance();
         this.listener = listener;
         this.scheduler = scheduler;
+        this.watchdog = new PingWatchdog(this);
         this.backoff = new Backoff();
         ClientHost host = new ClientHost(this);
         this.host = host;
@@ -336,11 +331,7 @@ public class Client {
 
         ClientState previousState = this.getState();
 
-        this.watchdogGeneration.incrementAndGet();
-        if (this.pingTask != null) {
-            this.pingTask.cancel(true);
-            this.pingTask = null;
-        }
+        this.watchdog.cancel();
         this.auth.onDisconnect(code, !shouldReconnect);
         if (this.reconnectTask != null) {
             this.reconnectTask.cancel(true);
@@ -902,28 +893,6 @@ public class Client {
         }
     }
 
-    private void _waitServerPing(long generation, int idleChecks) {
-        if (generation != this.watchdogGeneration.get() || this.getState() != ClientState.CONNECTED) {
-            return;
-        }
-        int idle = this.replySeen.getAndSet(false) ? 0 : idleChecks + 1;
-        if (idle >= 2) {
-            Client.this.processDisconnect(CONNECTING_NO_PING, "no ping", true);
-            return;
-        }
-        this.scheduleWatchdog(generation, idle);
-    }
-
-    private void waitServerPing(long generation, int idleChecks) {
-        this.executor.submit(() -> this._waitServerPing(generation, idleChecks));
-    }
-
-    // One check per half window, so a reply is seen within one or one and a half windows of it.
-    private void scheduleWatchdog(long generation, int idleChecks) {
-        long halfWindowMillis = (this.pingInterval + this.opts.getMaxServerPingDelay() + 1) / 2;
-        this.pingTask = this.scheduler.schedule(() -> this.waitServerPing(generation, idleChecks), halfWindowMillis, TimeUnit.MILLISECONDS);
-    }
-
     void handleConnectReply(Protocol.Reply reply) {
         if (this.getState() != ClientState.CONNECTING) {
             return;
@@ -1045,7 +1014,7 @@ public class Client {
         }
         this.connectAsyncCommands.clear();
 
-        this.scheduleWatchdog(this.watchdogGeneration.get(), 0);
+        this.watchdog.start();
 
         this.auth.scheduleExpiry(result.getExpires(), result.getTtl());
 
@@ -1124,7 +1093,7 @@ public class Client {
 
     void processReply(Protocol.Reply reply) throws Exception {
         this.observeServerTime(reply);
-        this.replySeen.set(true);
+        this.watchdog.markReply();
         if (reply.getId() > 0) {
             CompletableFuture<Protocol.Reply> cf = this.futures.get(reply.getId());
             if (cf != null) cf.complete(reply);

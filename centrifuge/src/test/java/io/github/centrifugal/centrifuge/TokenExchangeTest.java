@@ -1567,7 +1567,7 @@ public class TokenExchangeTest extends RpcTestBase {
         storage.held.onDone(null, new TokenExchangeResult("access-1", null));
         awaitCondition("connected", () -> connected.size() == 1);
         // The watchdog of the connected state is the one check chain: exactly one check is pending, one half window away.
-        assertEquals(1, clock.pendingWithDelay((25000L + options.getMaxServerPingDelay() + 1) / 2));
+        assertEquals(1, clock.pendingWithDelay(PingWatchdog.halfWindowMillis(25000L, options.getMaxServerPingDelay())));
 
         // The server pings on schedule after the connect. Each ping is answered, and the connection stays up past the
         // window of the server ping, which the bootstrap ping did not restart.
