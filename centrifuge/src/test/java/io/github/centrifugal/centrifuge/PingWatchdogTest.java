@@ -127,6 +127,33 @@ public class PingWatchdogTest extends RpcTestBase {
     }
 
 
+    // A check which would close the connection is queued before the connection ends, and runs after the client has
+    // reconnected. It finds the generation changed and closes nothing, so the new connection stays open.
+    @Test
+    public void staleCheckThatWouldCloseLeavesTheNewConnectionOpen() throws Exception {
+        Client c = connectOnClock();
+        // The first check finds no reply and arms the second one.
+        advanceTo(halfWindowMillis());
+        CountDownLatch release = new CountDownLatch(1);
+        c.getExecutor().submit(() -> {
+            release.await();
+            return null;
+        });
+        // The second check would be the second empty one, so it would close the connection, and it queues behind the latch.
+        clock.advance(halfWindowMillis());
+        c.processDisconnect(Client.CONNECTING_TRANSPORT_CLOSED, "transport closed", false);
+        assertTrue("the disconnect is reported", disconnectedSignals.tryAcquire(WAIT_MILLIS, TimeUnit.MILLISECONDS));
+        c.connect();
+        release.countDown();
+        assertTrue("the connection is re-established", connectedSignals.tryAcquire(WAIT_MILLIS, TimeUnit.MILLISECONDS));
+        drainExecutor();
+        // The new connection runs its own checks and stays open through its first one.
+        advanceTo(3 * halfWindowMillis());
+        assertEquals(ClientState.CONNECTED, c.getState());
+        assertEquals("no disconnect after the reconnect", 0, disconnectedSignals.availablePermits());
+    }
+
+
     // Connects on the clock with the default allowed delay of the server ping.
     private Client connectOnClock() throws InterruptedException {
         return connectOnClock(instanceOptions().getMaxServerPingDelay());

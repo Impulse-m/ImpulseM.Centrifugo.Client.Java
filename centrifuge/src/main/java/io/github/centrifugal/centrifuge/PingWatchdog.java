@@ -14,7 +14,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * a half windows.
  * <p>
  * Only {@link #markReply} runs without the lock of this object. The rest runs under it, so a check left over from
- * an ended connection cannot schedule another check after {@link #cancel}.
+ * an ended connection cannot schedule another check after {@link #cancel}, and the no-ping close is made under it
+ * too, so it cannot close a connection which started after the check was decided.
  */
 final class PingWatchdog {
 
@@ -49,6 +50,8 @@ final class PingWatchdog {
 
     /** Starts the checks of the connection which has just connected. */
     synchronized void start() {
+        // A reply decoded before this connection, during bootstrap or on the previous connection, does not count.
+        this.replySeen.set(false);
         this.scheduleCheck(this.generation, 0);
     }
 
@@ -66,24 +69,23 @@ final class PingWatchdog {
     private synchronized void scheduleCheck(final long checkGeneration, final int idleChecks) {
         final long halfWindow = halfWindowMillis(this.client.pingInterval, this.client.getOpts().getMaxServerPingDelay());
         this.check = this.client.getScheduler().schedule(
-                () -> this.client.getExecutor().submit(() -> this.runCheck(checkGeneration, idleChecks)),
+                () -> Extensions.submitOrIgnore(this.client.getExecutor(), () -> this.runCheck(checkGeneration, idleChecks)),
                 halfWindow,
                 TimeUnit.MILLISECONDS
         );
     }
 
 
-    // Runs on the client executor.
-    private void runCheck(final long checkGeneration, final int idleChecks) {
-        synchronized (this) {
-            if (checkGeneration != this.generation || this.client.getState() != ClientState.CONNECTED) {
-                return;
-            }
-            final int idle = this.replySeen.getAndSet(false) ? 0 : idleChecks + 1;
-            if (idle < MISSED_CHECKS_TO_CLOSE) {
-                this.scheduleCheck(checkGeneration, idle);
-                return;
-            }
+    // Runs on the client executor. The close is decided and made under the lock, so a connection which starts
+    // after the check was decided cannot be closed by it: start and cancel wait for the lock.
+    private synchronized void runCheck(final long checkGeneration, final int idleChecks) {
+        if (checkGeneration != this.generation || this.client.getState() != ClientState.CONNECTED) {
+            return;
+        }
+        final int idle = this.replySeen.getAndSet(false) ? 0 : idleChecks + 1;
+        if (idle < MISSED_CHECKS_TO_CLOSE) {
+            this.scheduleCheck(checkGeneration, idle);
+            return;
         }
         this.client.processDisconnect(Client.CONNECTING_NO_PING, "no ping", true);
     }
