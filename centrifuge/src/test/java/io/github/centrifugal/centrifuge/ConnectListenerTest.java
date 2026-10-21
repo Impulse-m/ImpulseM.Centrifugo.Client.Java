@@ -32,7 +32,8 @@ public class ConnectListenerTest extends RpcTestBase {
         answerRpcs("{}", System::currentTimeMillis);
         final int ttlSeconds = 60;
         final long expiryMillis = TimeUnit.SECONDS.toMillis(ttlSeconds);
-        final long pingMillis = server.connectResult.getPing() * 1000L + instanceOptions().getMaxServerPingDelay();
+        // The watchdog checks every half window, so its first check is armed at half the window.
+        final long pingMillis = (server.connectResult.getPing() * 1000L + instanceOptions().getMaxServerPingDelay() + 1) / 2;
         server.connectResult = server.connectResult.toBuilder().setExpires(true).setTtl(ttlSeconds).build();
         AtomicBoolean failOnConnect = new AtomicBoolean();
         BlockingQueue<Throwable> reported = new LinkedBlockingQueue<>();
