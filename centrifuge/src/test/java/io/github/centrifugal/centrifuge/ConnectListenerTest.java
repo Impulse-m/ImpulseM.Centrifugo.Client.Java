@@ -25,7 +25,7 @@ public class ConnectListenerTest extends RpcTestBase {
 
 
     // A listener which throws from onConnected leaves the handshake whole: the call queued while disconnected is written,
-    // the ping and expiry timers are armed when the failure is reported, and the failure is reported after them.
+    // the watchdog and expiry timers are armed when the failure is reported, and the failure is reported after them.
     @Test
     public void listenerFailureInOnConnectedLeavesTheHandshakeWhole() throws Exception {
         enableRpcOptions();
@@ -77,7 +77,7 @@ public class ConnectListenerTest extends RpcTestBase {
         assertTrue("the listener failure is reported", failure instanceof IllegalStateException);
         awaitCondition("the queued call is written", () -> sentRpcRequests().size() == 1);
         assertTrue("the expiry timer is armed when the failure is reported", expiryArmedAtReport.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) > 0);
-        assertTrue("the ping timer is armed when the failure is reported", pingArmedAtReport.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) > 0);
+        assertTrue("the watchdog timer is armed when the failure is reported", pingArmedAtReport.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) > 0);
     }
 
 

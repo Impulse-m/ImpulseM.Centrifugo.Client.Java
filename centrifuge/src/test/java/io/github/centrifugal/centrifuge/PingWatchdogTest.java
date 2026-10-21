@@ -26,9 +26,8 @@ public class PingWatchdogTest extends RpcTestBase {
     }
 
 
-    // The ping of the connect reply of the fake server, in seconds.
-    private static final int PING_SECONDS = 25;
-    // The allowed delay of the server ping which makes the window odd: 25 s + 10.001 s, so the half window is rounded up.
+    // The allowed delay of the server ping which makes the window odd: the ping is whole seconds, so with 10.001 s the
+    // window is odd and the half window is rounded up.
     private static final int ODD_MAX_SERVER_PING_DELAY_MILLIS = 10_001;
     // Checks a test moves through before it fails. A connection closes within three half windows of its last reply.
     private static final int MAX_CHECKS = 10;
@@ -55,24 +54,14 @@ public class PingWatchdogTest extends RpcTestBase {
 
 
     // With no reply after the last one at L, the connection closes at the second empty check, within the bounds of
-    // assertClosedWithinBounds. The last reply is a server ping.
+    // assertClosedWithinBounds, whichever kind the last reply is. Each kind runs on its own connection.
     @Test
-    public void silenceClosesAtTheSecondEmptyCheck() throws Exception {
-        assertClosedWithinBounds(connectOnClock(), 5_000L, ReplyKind.SERVER_PING);
-    }
-
-
-    // The last reply is a push, so a push alone keeps the watchdog from closing the connection.
-    @Test
-    public void silenceAfterAPushClosesWithinTheBounds() throws Exception {
-        assertClosedWithinBounds(connectOnClock(), 5_000L, ReplyKind.PUSH);
-    }
-
-
-    // The last reply is a command reply, which keeps the watchdog from closing the connection in the same way.
-    @Test
-    public void silenceAfterACommandReplyClosesWithinTheBounds() throws Exception {
-        assertClosedWithinBounds(connectOnClock(), 5_000L, ReplyKind.COMMAND_REPLY);
+    public void silenceAfterAnyReplyClosesWithinTheBounds() throws Exception {
+        for (ReplyKind kind : ReplyKind.values()) {
+            Client c = connectOnClock();
+            assertClosedWithinBounds(c, 5_000L, kind);
+            c.close(0L);
+        }
     }
 
 
@@ -191,15 +180,21 @@ public class PingWatchdogTest extends RpcTestBase {
     }
 
 
+    // The ping interval of the connect reply of the fake server, in milliseconds.
+    private long pingIntervalMillis() {
+        return server.connectResult.getPing() * 1000L;
+    }
+
+
     // The watchdog window: the server ping interval plus the allowed delay of the server ping.
     private long windowMillis() {
-        return PING_SECONDS * 1000L + options.getMaxServerPingDelay();
+        return pingIntervalMillis() + options.getMaxServerPingDelay();
     }
 
 
     // The half window of the watchdog, from the same two values as the client.
     private long halfWindowMillis() {
-        return PingWatchdog.halfWindowMillis(PING_SECONDS * 1000L, options.getMaxServerPingDelay());
+        return PingWatchdog.halfWindowMillis(pingIntervalMillis(), options.getMaxServerPingDelay());
     }
 
 

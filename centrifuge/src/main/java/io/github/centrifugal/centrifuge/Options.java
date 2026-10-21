@@ -205,7 +205,8 @@ public class Options {
     }
 
     /**
-     * Set max time of ping delay from server in milliseconds. By default, 10000 is used.
+     * Set the allowed silence from the server in milliseconds, counted from the last decoded message: a reply, a push
+     * or a ping. By default, 10000 is used.
      */
     public void setMaxServerPingDelay(int maxServerPingDelay) {
         this.maxServerPingDelay = maxServerPingDelay;
