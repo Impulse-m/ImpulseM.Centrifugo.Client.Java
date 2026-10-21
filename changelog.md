@@ -32,6 +32,8 @@ Unreleased
 * `RpcPool` follows no redirect of a fetch: a 3xx answer fails the fetch with `REDIRECT_FAILED`. The calls waiting for a redirect fetch slot count in `maxQueued` and `stats().queued`.
 * `RpcPool` with `tokenFrom` lends only the main client's confirmed token. A call is admitted by the main client's state, and bound to the identity its connection confirmed: a call made while the main client is disconnected fails at once with `client disconnected`, and a connection of another identity is retired. A token the fleet refused, which no renewal can replace, spends the source: the calls no connection can take fail with `token refused`, and the main client stays connected.
 * `RpcPool` shares its connections per endpoint URL, notifies only the pools and keys with calls waiting when the main client changes, and retires a connection which is stale at its end without an error.
+* `RpcPool.close()` settles a redirect waiting for a fetch slot with `IOException("rpc pool closed")`, as it settles a fetch which is running.
+* `RpcPool` settles a call lost on a retired or stale connection with the connection's loss error and no resend, whatever the token state.
 
 0.3.1
 =====
