@@ -13,9 +13,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * the last reply. The half window is rounded up, so for an odd window the close can come 1 ms later than one and
  * a half windows.
  * <p>
- * Only {@link #markReply} runs without the lock of this object. The rest runs under it, so a check left over from
- * an ended connection cannot schedule another check after {@link #cancel}, and the no-ping close is made under it
- * too, so it cannot close a connection which started after the check was decided.
+ * Only {@link #markReply} and the no-ping close run without the lock of this object. The rest runs under it, so a
+ * check left over from an ended connection cannot schedule another check after {@link #cancel}. Checks run on the
+ * client executor, which also connects and disconnects, so a check cannot close a connection which started after it
+ * was decided.
  */
 final class PingWatchdog {
 
@@ -76,16 +77,19 @@ final class PingWatchdog {
     }
 
 
-    // Runs on the client executor. The close is decided and made under the lock, so a connection which starts
-    // after the check was decided cannot be closed by it: start and cancel wait for the lock.
-    private synchronized void runCheck(final long checkGeneration, final int idleChecks) {
-        if (checkGeneration != this.generation || this.client.getState() != ClientState.CONNECTED) {
-            return;
-        }
-        final int idle = this.replySeen.getAndSet(false) ? 0 : idleChecks + 1;
-        if (idle < MISSED_CHECKS_TO_CLOSE) {
-            this.scheduleCheck(checkGeneration, idle);
-            return;
+    // Runs on the client executor, the single thread which also connects and disconnects, so no connection can
+    // start between the decision and the close. The close runs outside the lock, so disconnect listeners never run
+    // while it is held.
+    private void runCheck(final long checkGeneration, final int idleChecks) {
+        synchronized (this) {
+            if (checkGeneration != this.generation || this.client.getState() != ClientState.CONNECTED) {
+                return;
+            }
+            final int idle = this.replySeen.getAndSet(false) ? 0 : idleChecks + 1;
+            if (idle < MISSED_CHECKS_TO_CLOSE) {
+                this.scheduleCheck(checkGeneration, idle);
+                return;
+            }
         }
         this.client.processDisconnect(Client.CONNECTING_NO_PING, "no ping", true);
     }
