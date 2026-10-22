@@ -655,7 +655,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void aSettledCallDropsItsPayloadWhileItsLateReplyIsKept() throws Exception {
+    public void aSettledCallDropsItsPayload() throws Exception {
         enableRpcOptions();
         serveDedup();
         Client c = newClient();
@@ -668,7 +668,17 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         call.cancel();
 
         assertEquals(ReplyError.CANCELLED, replyErrorOf(future).getCode());
-        assertNull("the settled call holds no payload for the late reply", call.data);
+        awaitCondition("the settled call drops its payload", () -> payloadOnExecutor(c, call) == null);
+    }
+
+
+    // The payload of the call, read on the client's executor: the call drops it there, when it finishes.
+    private static byte[] payloadOnExecutor(Client c, RpcCall call) {
+        try {
+            return c.getExecutor().submit(() -> call.data).get(5, TimeUnit.SECONDS);
+        } catch (InterruptedException | ExecutionException | TimeoutException e) {
+            return new byte[0];
+        }
     }
 
 
