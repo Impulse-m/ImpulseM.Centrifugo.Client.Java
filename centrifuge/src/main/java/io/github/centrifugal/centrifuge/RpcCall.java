@@ -19,7 +19,8 @@ import java8.util.concurrent.CompletableFuture;
 public final class RpcCall {
     private final RpcSession session;
     final String method;
-    // Dropped when the call settles, since a late reply needs only the msg_id of the call.
+    // Dropped when the call settles, since a late reply needs only the msg_id of the call. Every writer checks that the
+    // future is not done before it reads this, so a settled call never sends it.
     byte[] data;
     final Map<String, String> headers;
     final long timeout;
