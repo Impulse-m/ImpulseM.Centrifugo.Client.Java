@@ -221,14 +221,15 @@ public class Options {
 
     /**
      * Set the longest delay in milliseconds before a failed timer token fetch or refresh is tried again. The delay
-     * doubles with each failure in a row, up to this value; a success starts it again. By default, 0 keeps the flat
-     * retry of 10 to 20 seconds, and a value at or below 20000 keeps it too.
+     * doubles with each failure in a row, up to this value; a success starts it again. By default, 300000 (5 minutes)
+     * is used, so a getter which keeps failing is retried less and less often. A value at or below 20000 keeps the
+     * flat retry of 10 to 20 seconds, as before.
      */
     public void setTokenRetryCap(int tokenRetryCap) {
         this.tokenRetryCap = tokenRetryCap;
     }
 
-    private int tokenRetryCap = 0;
+    private int tokenRetryCap = 300000;
 
     public OkHttpClient getOkHttpClient() {
         return this.okHttpClient;

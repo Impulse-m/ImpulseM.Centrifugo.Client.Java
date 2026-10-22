@@ -1343,6 +1343,35 @@ public class AuthTest extends RpcTestBase {
 
 
     @Test
+    public void timerRetryCeilingGrowsByDefault() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        ManualScheduler clock = new ManualScheduler();
+        Options options = timerGetterOptions(new AtomicBoolean(true));
+        assertEquals("the default retry cap is 5 minutes", 300000, options.getTokenRetryCap());
+        newAuthClientOnClock(options, clock);
+        connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+
+        int seen = clock.requestedDelays().size();
+        clock.advance(1000);
+        List<Long> retries = failTimerRetries(clock, seen, 8);
+
+        // Without a cap set, the ceiling of the k-th retry is 100 ms doubled k - 1 times, with no limit below 300000 ms.
+        for (int i = 0; i < retries.size(); i++) {
+            long ceiling = 100L << i;
+            assertTrue("retry " + (i + 1) + " is within its ceiling, the scheduled delays are " + clock.requestedDelays(),
+                    retries.get(i) <= ceiling);
+        }
+        assertEquals("every failure counts one step: the timer fetch and its eight retries", 9, retryStepOf(client));
+        boolean grewPastFirstCeiling = false;
+        for (int i = 4; i < retries.size(); i++) {
+            grewPastFirstCeiling |= retries.get(i) > 100;
+        }
+        assertTrue("a later retry waits past the first ceiling, which a flat retry never does", grewPastFirstCeiling);
+    }
+
+
+    @Test
     public void timerRetryCeilingStartsAgainAfterASuccessfulExpiry() throws Exception {
         server.connectResult = expiringResult("u1", "authenticated", 1);
         ManualScheduler clock = new ManualScheduler();
@@ -1390,9 +1419,16 @@ public class AuthTest extends RpcTestBase {
 
 
     private Options timerGetterOptions(final AtomicBoolean failing, int retryCapMillis) {
+        Options options = timerGetterOptions(failing);
+        options.setTokenRetryCap(retryCapMillis);
+        return options;
+    }
+
+
+    // Options with a timer token getter and the default retry cap, which the test does not set.
+    private Options timerGetterOptions(final AtomicBoolean failing) {
         Options options = new Options();
         options.setToken("token-initial");
-        options.setTokenRetryCap(retryCapMillis);
         options.setTokenGetter(new ConnectionTokenGetter() {
             @Override
             public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
