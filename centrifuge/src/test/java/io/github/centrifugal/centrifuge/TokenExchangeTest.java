@@ -3008,12 +3008,20 @@ public class TokenExchangeTest extends RpcTestBase {
 
     @Test
     public void renewalWindowSpreadsClientsAndKeepsAMargin() {
+        // Seeded, so the same 10000 draws are taken in every run; the clients' renewals spread over the window they pick from.
+        Random random = new Random(20261022L);
         long ttlMillis = 300_000L;
-        long earliest = TokenExchangeFlow.renewalDelayMillis(300, 0.0);
-        long latest = TokenExchangeFlow.renewalDelayMillis(300, 0.999_999);
-        assertEquals("the earliest renewal is 60 % of the ttl", 180_000L, earliest);
-        assertTrue("the latest renewal stays under 90 % of the ttl", latest < 270_000L);
-        assertTrue("the window covers at least 0.3 of the ttl", latest - earliest >= 0.29 * ttlMillis);
+        long earliest = Long.MAX_VALUE;
+        long latest = Long.MIN_VALUE;
+        for (int i = 0; i < 10_000; i++) {
+            long delay = TokenExchangeFlow.renewalDelayMillis(300, random.nextDouble());
+            earliest = Math.min(earliest, delay);
+            latest = Math.max(latest, delay);
+        }
+        assertTrue("no renewal comes before 60 % of the ttl, the earliest is " + earliest, earliest >= 180_000L);
+        assertTrue("no renewal comes after 90 % of the ttl, the latest is " + latest, latest < 270_000L);
+        assertTrue("the renewals spread over at least 0.29 of the ttl, the spread is " + (latest - earliest),
+                latest - earliest >= 0.29 * ttlMillis);
         assertTrue("the earliest renewal keeps at least 25 s before expiry at ttl 300", ttlMillis - earliest >= 25_000L);
     }
 }

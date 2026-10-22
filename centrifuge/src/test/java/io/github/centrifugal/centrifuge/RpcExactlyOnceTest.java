@@ -44,7 +44,6 @@ import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -668,16 +667,20 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         call.cancel();
 
         assertEquals(ReplyError.CANCELLED, replyErrorOf(future).getCode());
-        awaitCondition("the settled call drops its payload", () -> payloadOnExecutor(c, call) == null);
+        awaitCondition("the settled call drops its payload", () -> payloadDropped(c, call));
     }
 
 
-    // The payload of the call, read on the client's executor: the call drops it there, when it finishes.
-    private static byte[] payloadOnExecutor(Client c, RpcCall call) {
+    // Whether the call has dropped its payload, read on the client's executor: the call drops it there, when it finishes.
+    // A failure of the read is rethrown with its cause, so the wait does not report it as a plain timeout.
+    private static boolean payloadDropped(Client c, RpcCall call) {
         try {
-            return c.getExecutor().submit(() -> call.data).get(5, TimeUnit.SECONDS);
-        } catch (InterruptedException | ExecutionException | TimeoutException e) {
-            return new byte[0];
+            return c.getExecutor().submit(() -> call.data == null).get(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("the read of the payload was interrupted", e);
+        } catch (ExecutionException | TimeoutException e) {
+            throw new IllegalStateException("the payload could not be read", e);
         }
     }
 

@@ -1353,18 +1353,24 @@ public class AuthTest extends RpcTestBase {
         clock.advance(1000);
         failTimerRetries(clock, seen, 4);
 
-        failing.set(false);
-        answerRefreshWith(Protocol.Reply.newBuilder()
-                .setRefresh(Protocol.RefreshResult.newBuilder().setUser("u1").setAuthClass("authenticated").setExpires(true).setTtl(1)));
-        final int beforeSuccess = clock.requestedDelays().size();
-        clock.advance(lastDelay(clock));
-        awaitCondition("the successful fetch schedules the next expiry", () -> clock.requestedDelays().size() > beforeSuccess);
+        // Each cycle is a successful fetch, then one failure after its expiry. The first retry after a success draws from the
+        // bounds of the configured maximum, which is at most 100 ms. Without the reset the ceiling keeps growing across the
+        // cycles, and a draw stays within 100 ms in only a few percent of the cycles, so a missing reset fails the test in practice.
+        for (int cycle = 0; cycle < 8; cycle++) {
+            failing.set(false);
+            answerRefreshWith(Protocol.Reply.newBuilder()
+                    .setRefresh(Protocol.RefreshResult.newBuilder().setUser("u1").setAuthClass("authenticated").setExpires(true).setTtl(1)));
+            final int beforeSuccess = clock.requestedDelays().size();
+            clock.advance(lastDelay(clock));
+            awaitCondition("the successful fetch schedules the next expiry", () -> clock.requestedDelays().size() > beforeSuccess);
 
-        failing.set(true);
-        final int beforeFailure = clock.requestedDelays().size();
-        clock.advance(1000);
-        awaitCondition("the failure after the expiry schedules a retry", () -> clock.requestedDelays().size() > beforeFailure);
-        assertTrue("the ceiling starts again at the configured maximum", lastDelay(clock) <= 100);
+            failing.set(true);
+            final int beforeFailure = clock.requestedDelays().size();
+            clock.advance(1000);
+            awaitCondition("the failure after the expiry schedules a retry", () -> clock.requestedDelays().size() > beforeFailure);
+            assertTrue("cycle " + cycle + ": the ceiling starts again at the configured maximum, the delays are " + clock.requestedDelays(),
+                    lastDelay(clock) <= 100);
+        }
     }
 
 

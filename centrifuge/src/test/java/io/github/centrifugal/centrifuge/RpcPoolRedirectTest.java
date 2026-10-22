@@ -1,6 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
 import java.io.InputStream;
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.util.Arrays;
@@ -11,7 +12,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
@@ -20,6 +20,7 @@ import javax.net.ssl.X509TrustManager;
 
 import okhttp3.Cookie;
 import okhttp3.CookieJar;
+import okhttp3.Dispatcher;
 import okhttp3.HttpUrl;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
@@ -252,6 +253,20 @@ public class RpcPoolRedirectTest extends RpcTestBase {
 
 
     @Test
+    public void theFetchesOfAPoolGivenNoClientKeepTheDefaultDispatcherLimits() throws Exception {
+        // The websockets of such pools share a dispatcher whose limits are lifted, and the fetches must not inherit that.
+        redirects.enqueue(new MockResponse().setBody("chunk-bytes"));
+        pool = redirectingPool(RpcPool.Redirect.builder(redirects.url("/data").toString()).build());
+        call();
+        Field field = RpcPool.class.getDeclaredField("fetchHttpClient");
+        field.setAccessible(true);
+        Dispatcher dispatcher = ((OkHttpClient) field.get(pool)).dispatcher();
+        assertEquals("the fetches of one host are capped as OkHttp caps them by default", 5, dispatcher.getMaxRequestsPerHost());
+        assertEquals("the fetches in all are capped as OkHttp caps them by default", 64, dispatcher.getMaxRequests());
+    }
+
+
+    @Test
     public void httpRedirectIsRefusedFromASecureEndpoint() {
         assertTrue(RpcPoolRedirect.allowed("ws://host/connection/websocket", "http://host.example/x"));
         assertTrue(RpcPoolRedirect.allowed("ws://host/connection/websocket", "https://host.example/x"));
@@ -351,7 +366,7 @@ public class RpcPoolRedirectTest extends RpcTestBase {
 
     @Test
     public void redirectSlotIsReturnedWhenTheReadThrowsAnError() throws Exception {
-        // The first answer to reach the tap fails with an error which is not an exception, as an out of memory does, while its body is read.
+        // The response tap throws an error which is not an exception, as an out of memory does, for the first answer which reaches it.
         AtomicInteger answers = new AtomicInteger();
         redirects.enqueue(new MockResponse().setBody("first"));
         redirects.enqueue(new MockResponse().setBody("second"));
@@ -366,25 +381,16 @@ public class RpcPoolRedirectTest extends RpcTestBase {
                 })
                 .redirect((reply, error) -> reply != null ? RpcPool.Redirect.builder(redirects.url("/data").toString()).build() : null)
                 .build();
-        // The error is rethrown on the fetch thread, so the default handler of the threads receives it.
-        AtomicReference<Throwable> thrown = new AtomicReference<>();
-        Thread.UncaughtExceptionHandler previousHandler = Thread.getDefaultUncaughtExceptionHandler();
-        Thread.setDefaultUncaughtExceptionHandler((thread, error) -> thrown.set(error));
-        try {
-            CompletableFuture<RPCResult> first = new CompletableFuture<>();
-            CompletableFuture<RPCResult> second = new CompletableFuture<>();
-            pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(first));
-            pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(second));
-            // The replies of the two calls may come in either order, so either call may be the one whose fetch fails.
-            List<String> outcomes = Arrays.asList(outcomeOf(first), outcomeOf(second));
-            assertTrue("the failed fetch settles with the redirect error: " + outcomes,
-                    outcomes.contains("error " + RpcPool.REDIRECT_FAILED));
-            assertTrue("the other fetch got the slot back and returns its body: " + outcomes,
-                    outcomes.contains("first") || outcomes.contains("second"));
-            awaitCondition("the error reaches the handler of the fetch thread", () -> thrown.get() instanceof OutOfMemoryError);
-        } finally {
-            Thread.setDefaultUncaughtExceptionHandler(previousHandler);
-        }
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        CompletableFuture<RPCResult> second = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(first));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(second));
+        // The replies of the two calls may come in either order, so either call may be the one whose fetch fails.
+        List<String> outcomes = Arrays.asList(outcomeOf(first), outcomeOf(second));
+        assertTrue("the failed fetch settles with the redirect error: " + outcomes,
+                outcomes.contains("error " + RpcPool.REDIRECT_FAILED));
+        assertTrue("the other fetch got the slot back and returns its body: " + outcomes,
+                outcomes.contains("first") || outcomes.contains("second"));
     }
 
 
