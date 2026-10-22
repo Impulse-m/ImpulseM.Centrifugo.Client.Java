@@ -51,8 +51,15 @@ final class PingWatchdog {
 
     /** Starts the checks of the connection which has just connected. */
     synchronized void start() {
+        // A check armed by an earlier connection is never left running: one per connection.
+        this.cancel();
         // A reply decoded before this connection, during bootstrap or on the previous connection, does not count.
         this.replySeen.set(false);
+        // A server with pings disabled sends no ping interval: there is nothing to wait for, and checking would
+        // end every connection after maxServerPingDelay.
+        if (this.client.pingInterval <= 0) {
+            return;
+        }
         this.scheduleCheck(this.generation, 0);
     }
 

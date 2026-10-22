@@ -98,7 +98,10 @@ final class ClientHost {
      * dead peer never sends, and the reconnect would wait for it too. The client reconnects when the transport fails.
      */
     void closeTransport() {
-        transport().cancel();
+        WebSocket transport = transport();
+        if (transport != null) {
+            transport.cancel();
+        }
     }
 
 
@@ -208,16 +211,15 @@ final class ClientHost {
 
     /**
      * The task which reports a failure of its own to the listener, instead of letting it go: the executor
-     * would drop it, and nothing else would tell the caller. The failure goes to the listener as it was
-     * thrown, not wrapped in an {@link UnclassifiedError} as {@link #reportUnclassified} does: the task runs
-     * the listener's own callbacks, and their exceptions and errors keep their type for the listener.
+     * would drop it, and nothing else would tell the caller. The failure is wrapped in an {@link UnclassifiedError}
+     * as {@link #reportUnclassified} does: an exception escaping an app callback is reported the same way in every step.
      */
     Runnable reporting(final Runnable task) {
         return () -> {
             try {
                 task.run();
             } catch (Throwable failure) {
-                reportError(failure);
+                reportUnclassified(failure);
             }
         };
     }

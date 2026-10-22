@@ -27,7 +27,8 @@ public class Subscription {
     private int resubscribeAttempts = 0;
     private String token;
     private com.google.protobuf.ByteString data;
-    private FilterNode tagsFilter;
+    // Set from the app's thread, read on the client thread when subscribing.
+    private volatile FilterNode tagsFilter;
     private boolean deltaNegotiated;
     private byte[] prevData;
     // Numeric channel ID assigned by the server when channel compaction is
@@ -42,6 +43,13 @@ public class Subscription {
     private long publishDebounceMillis = 0;
     // Created on the first debounced publish, so subscriptions without debounce allocate nothing.
     private PublishDebounce publishDebounce;
+    // Bumped each time the subscription becomes unsubscribed. A subscribe command
+    // carries the value it was sent with, so its reply is dropped when an
+    // unsubscribe (and possibly a new subscribe) happened meanwhile: that reply
+    // belongs to a subscribe the server was told to end.
+    private long unsubscribeCount = 0;
+    // Removed from the client's registry: it can't subscribe again.
+    private volatile boolean removed = false;
 
     Subscription(final Client client, final String channel, final SubscriptionEventListener listener, final SubscriptionOptions options) {
         this.client = client;
@@ -65,6 +73,14 @@ public class Subscription {
 
     Subscription(final Client client, final String channel, final SubscriptionEventListener listener) {
         this(client, channel, listener, new SubscriptionOptions());
+    }
+
+    void markRemoved() {
+        this.removed = true;
+    }
+
+    long getUnsubscribeCount() {
+        return unsubscribeCount;
     }
 
     void setState(SubscriptionState state) {
@@ -104,6 +120,11 @@ public class Subscription {
         if (this.getState() != SubscriptionState.SUBSCRIBING) {
             return;
         }
+        if (this.resubscribeTask != null && !this.resubscribeTask.isDone()) {
+            // A subscribe error is retried after its backoff, also across a reconnect
+            // (as centrifuge-js): the retry subscribes once it fires.
+            return;
+        }
         this.sendSubscribe();
     }
 
@@ -113,7 +134,7 @@ public class Subscription {
         }
         this.client.getExecutor().submit(() -> {
             final long epoch = ++Subscription.this.subscribeEpoch;
-            Subscription.this.opts.getTokenGetter().getSubscriptionToken(new SubscriptionTokenEvent(Subscription.this.getChannel()), (err, token) -> Subscription.this.client.getExecutor().submit(() -> {
+            Client.fetchSubscriptionToken(Subscription.this.opts.getTokenGetter(), new SubscriptionTokenEvent(Subscription.this.getChannel()), (err, token) -> Subscription.this.client.getExecutor().submit(() -> {
                 if (Subscription.this.subscribeEpoch != epoch) {
                     return;
                 }
@@ -185,7 +206,8 @@ public class Subscription {
     void moveToSubscribing(int code, String reason) {
         this.cancelPublishDebounce();
         if (this.getState() == SubscriptionState.SUBSCRIBING) {
-            this.clearSubscribingState();
+            // Still subscribing (e.g. across a reconnect): a pending resubscribe keeps
+            // its backoff instead of retrying at once on the next connect.
             return;
         }
         if (this.getState() == SubscriptionState.SUBSCRIBED) {
@@ -210,11 +232,15 @@ public class Subscription {
         PublicationEvent event = new PublicationEvent();
         byte[] pubData = pub.getData().toByteArray();
         if (this.deltaNegotiated) {
-            byte[] prevData = this.getPrevData();
-            if (prevData != null && pub.getDelta()) {
+            if (pub.getDelta()) {
+                byte[] prevData = this.getPrevData();
+                if (prevData == null) {
+                    throw new Exception("delta publication without a base");
+                }
                 pubData = Fossil.applyDelta(prevData, pubData);
             }
-            this.setPrevData(pubData);
+            // The app gets its own copy: changing it must not change the next delta's base.
+            this.setPrevData(pubData.clone());
         }
         event.setData(pubData);
         event.setInfo(info);
@@ -222,6 +248,13 @@ public class Subscription {
         event.setTags(pub.getTagsMap());
         if (pub.getOffset() > 0) {
             this.setOffset(pub.getOffset());
+            // A subscribe reply without an epoch (a channel with no stream yet): the epoch
+            // comes with the first publication. Taken with the offset it belongs to, and
+            // only while none is known; a different one means the stream was reset, which
+            // the server reports on recovery (as centrifuge-js).
+            if ((this.epoch == null || this.epoch.isEmpty()) && !pub.getEpoch().isEmpty()) {
+                this.setEpoch(pub.getEpoch());
+            }
         }
         this.listener.onPublication(this, event);
     }
@@ -234,7 +267,10 @@ public class Subscription {
         if (result.getRecoverable()) {
             this.recover = true;
         }
-        this.setEpoch(result.getEpoch());
+        if (!result.getEpoch().isEmpty()) {
+            // A reply without an epoch doesn't drop the one already known.
+            this.setEpoch(result.getEpoch());
+        }
         this.deltaNegotiated = result.getDelta();
         this.publishDebounceMillis = result.getPublishDebounce() & 0xFFFFFFFFL;
         // Channel compaction: register the numeric channel ID assigned by the
@@ -246,15 +282,17 @@ public class Subscription {
         if (result.getData() != null) {
             data = result.getData().toByteArray();
         }
+        // The position of the reply is stored before the subscribed event, as in
+        // centrifuge-js: the event reports it, and a handler that throws stops the
+        // client before anything after the event runs, which made the next recovery
+        // start from an older position. After a recovery it is the position recovered
+        // from, which the recovered publications below move.
+        this.setOffset(result.getOffset());
         SubscribedEvent event = new SubscribedEvent(result.getWasRecovering(), result.getRecovered(), result.getPositioned(), result.getRecoverable(), result.getPositioned() || result.getRecoverable() ? new StreamPosition(result.getOffset(), result.getEpoch()) : null, data);
         this.listener.onSubscribed(this, event);
 
-        if (result.getPublicationsCount() > 0) {
-            for (Protocol.Publication publication : result.getPublicationsList()) {
-                this.client.handlePub(this.channel, publication);
-            }
-        } else {
-            this.setOffset(result.getOffset());
+        for (Protocol.Publication publication : result.getPublicationsList()) {
+            this.client.handlePub(this.channel, publication);
         }
 
         for(Map.Entry<String, CompletableFuture<Throwable>> entry: this.futures.entrySet()) {
@@ -283,6 +321,15 @@ public class Subscription {
             this.scheduleResubscribe();
             return;
         }
+        if (err.getCode() == 109 && this.opts.getTokenGetter() == null) {
+            // The token expired and there is no token getter to get another one: like a
+            // connection, unauthorized, instead of subscribing again without a token (the
+            // server answers 103 and the app sees "permission denied"). As centrifuge-js.
+            this.listener.onError(this, new SubscriptionErrorEvent(new ConfigurationError(
+                    new Exception("subscription token expired but no tokenGetter set in SubscriptionOptions"))));
+            this._unsubscribe(false, Client.UNSUBSCRIBED_UNAUTHORIZED, "unauthorized");
+            return;
+        }
         this.listener.onError(this, new SubscriptionErrorEvent(new SubscriptionSubscribeError(err)));
         if (err.getCode() == 109) { // Token expired.
             this.token = "";
@@ -308,14 +355,32 @@ public class Subscription {
         this.tagsFilter = tagsFilter;
     }
 
+    /**
+     * Subscribe to the channel.
+     *
+     * @throws IllegalStateException if the subscription was removed from the client: the
+     *                               client no longer tracks it, so the server would keep a
+     *                               subscription whose publications are dropped.
+     */
     public void subscribe() {
+        if (this.removed) {
+            throw new IllegalStateException("subscription to the channel " + this.channel + " was removed from the client");
+        }
         this.client.getExecutor().submit(() -> {
+            if (Subscription.this.removed) {
+                return;
+            }
             if (Subscription.this.getState() == SubscriptionState.SUBSCRIBED || Subscription.this.getState() == SubscriptionState.SUBSCRIBING) {
                 return;
             }
             Subscription.this.setState(SubscriptionState.SUBSCRIBING);
-            Subscription.this.listener.onSubscribing(Subscription.this, new SubscribingEvent(Client.SUBSCRIBING_SUBSCRIBE_CALLED, "subscribe called"));
-            Subscription.this.sendSubscribe();
+            try {
+                Subscription.this.listener.onSubscribing(Subscription.this, new SubscribingEvent(Client.SUBSCRIBING_SUBSCRIBE_CALLED, "subscribe called"));
+            } finally {
+                // A handler that throws doesn't stop the subscribe; one that called
+                // unsubscribe() queued it after this step.
+                Subscription.this.sendSubscribe();
+            }
         });
     }
 
@@ -363,6 +428,12 @@ public class Subscription {
     }
 
     void sendSubscribe() {
+        if (this.client.getState() != ClientState.CONNECTED) {
+            // Subscribed once the client connects (the connect reply resubscribes every
+            // subscribing subscription), as centrifuge-js: no token or state requested
+            // while disconnected, and no second request for the same subscribe on connect.
+            return;
+        }
         // State getter: ask the app for its current state position. Only called
         // when we don't have a saved position (first subscribe or after a position
         // reset due to unrecoverable position error 112). On normal reconnects with
@@ -371,7 +442,7 @@ public class Subscription {
         if (this.opts.getStateGetter() != null && !this.getRecover()) {
             final long epoch = ++this.subscribeEpoch;
             SubscriptionGetStateEvent getStateEvent = new SubscriptionGetStateEvent(this.channel);
-            this.opts.getStateGetter().getSubscriptionState(getStateEvent, (err, position) -> Subscription.this.client.getExecutor().submit(() -> {
+            Client.fetchSubscriptionState(this.opts.getStateGetter(), getStateEvent, (err, position) -> Subscription.this.client.getExecutor().submit(() -> {
                 if (Subscription.this.subscribeEpoch != epoch) {
                     return;
                 }
@@ -398,7 +469,7 @@ public class Subscription {
         if (this.token.equals("") && this.opts.getTokenGetter() != null) {
             final long epoch = ++this.subscribeEpoch;
             SubscriptionTokenEvent subscriptionTokenEvent = new SubscriptionTokenEvent(this.channel);
-            this.opts.getTokenGetter().getSubscriptionToken(subscriptionTokenEvent, (err, token) -> Subscription.this.client.getExecutor().submit(() -> {
+            Client.fetchSubscriptionToken(this.opts.getTokenGetter(), subscriptionTokenEvent, (err, token) -> Subscription.this.client.getExecutor().submit(() -> {
                 if (Subscription.this.subscribeEpoch != epoch) {
                     return;
                 }
@@ -437,6 +508,11 @@ public class Subscription {
             this.refreshTask.cancel(true);
             this.refreshTask = null;
         }
+        // Ends a refresh in flight (its token request or its sub_refresh command): a
+        // resubscribe that reuses the token doesn't start a new attempt, so the stale
+        // continuation would otherwise refresh the new subscribed period too and start a
+        // second refresh chain.
+        this.subscribeEpoch++;
     }
 
     private void clearSubscribingState() {
@@ -461,6 +537,7 @@ public class Subscription {
         }
         this.setState(SubscriptionState.UNSUBSCRIBED);
         this.cancelPublishDebounce();
+        this.unsubscribeCount++;
         // Channel compaction ID is no longer valid once unsubscribed.
         this.setPushId(0);
         if (sendUnsubscribe) {
@@ -478,6 +555,11 @@ public class Subscription {
         if (this.getState() != SubscriptionState.SUBSCRIBING) {
             return;
         }
+        if (this.resubscribeTask != null) {
+            // One pending retry at most: an overwritten task fired too, subscribing again
+            // or fetching a token while disconnected.
+            this.resubscribeTask.cancel(false);
+        }
         this.resubscribeTask = this.client.getScheduler().schedule(
                 Subscription.this::startResubscribing,
                 Subscription.this.backoff.duration(this.resubscribeAttempts, this.opts.getMinResubscribeDelay(), this.opts.getMaxResubscribeDelay()),
@@ -487,7 +569,14 @@ public class Subscription {
     }
 
     void startResubscribing() {
-        this.client.getExecutor().submit(this::sendSubscribe);
+        this.client.getExecutor().submit(() -> {
+            // The retry timer may have fired just before the app's unsubscribe() (or a
+            // subscribe reply) ran: it then belongs to an attempt that ended.
+            if (Subscription.this.getState() != SubscriptionState.SUBSCRIBING) {
+                return;
+            }
+            Subscription.this.sendSubscribe();
+        });
     }
 
     boolean getRecover() {
@@ -506,7 +595,7 @@ public class Subscription {
         CompletableFuture<Throwable> f = new CompletableFuture<>();
         String uuid = UUID.randomUUID().toString();
         this.futures.put(uuid, f);
-        f.thenAccept(err -> {
+        this.client.settle(f, err -> {
             if (err != null) {
                 cb.onDone(err, null);
                 return;
@@ -517,7 +606,7 @@ public class Subscription {
             } else {
                 this.client.publish(this.getChannel(), data, cb);
             }
-        }).orTimeout(this.client.getOpts().getTimeout(), TimeUnit.MILLISECONDS).exceptionally(e -> {
+        }, e -> {
             Subscription.this.futures.remove(uuid);
             cb.onDone(e, null);
             return null;
@@ -548,14 +637,14 @@ public class Subscription {
         CompletableFuture<Throwable> f = new CompletableFuture<>();
         String uuid = UUID.randomUUID().toString();
         this.futures.put(uuid, f);
-        f.thenAccept(err -> {
+        this.client.settle(f, err -> {
             if (err != null) {
                 cb.onDone(err, null);
                 return;
             }
             this.futures.remove(uuid);
             this.client.history(this.getChannel(), opts, cb);
-        }).orTimeout(this.client.getOpts().getTimeout(), TimeUnit.MILLISECONDS).exceptionally(e -> {
+        }, e -> {
             Subscription.this.futures.remove(uuid);
             cb.onDone(e, null);
             return null;
@@ -573,14 +662,14 @@ public class Subscription {
         CompletableFuture<Throwable> f = new CompletableFuture<>();
         String uuid = UUID.randomUUID().toString();
         this.futures.put(uuid, f);
-        f.thenAccept(err -> {
+        this.client.settle(f, err -> {
             if (err != null) {
                 cb.onDone(err, null);
                 return;
             }
             this.futures.remove(uuid);
             this.client.presence(this.getChannel(), cb);
-        }).orTimeout(this.client.getOpts().getTimeout(), TimeUnit.MILLISECONDS).exceptionally(e -> {
+        }, e -> {
             Subscription.this.futures.remove(uuid);
             cb.onDone(e, null);
             return null;
@@ -598,14 +687,14 @@ public class Subscription {
         CompletableFuture<Throwable> f = new CompletableFuture<>();
         String uuid = UUID.randomUUID().toString();
         this.futures.put(uuid, f);
-        f.thenAccept(err -> {
+        this.client.settle(f, err -> {
             if (err != null) {
                 cb.onDone(err, null);
                 return;
             }
             this.futures.remove(uuid);
             this.client.presenceStats(this.getChannel(), cb);
-        }).orTimeout(this.client.getOpts().getTimeout(), TimeUnit.MILLISECONDS).exceptionally(e -> {
+        }, e -> {
             Subscription.this.futures.remove(uuid);
             cb.onDone(e, null);
             return null;
@@ -649,7 +738,11 @@ public class Subscription {
     // just resubscribes (the sentinel is not sent). The real epoch/offset are
     // adopted from the subscribe reply. Runs on the client executor thread.
     void invalidateState() {
-        this.token = "";
+        if (this.opts.getTokenGetter() != null) {
+            // Only a token the getter can replace: a static token is kept, and the
+            // server rejects it if it's no longer valid.
+            this.token = "";
+        }
         this.offset = 0;
         this.epoch = "_";
         this.prevData = null;

@@ -79,7 +79,6 @@ public class TokenExchangeTest extends RpcTestBase {
 
     @Before
     public void answerExchangeCommands() {
-        server.completeClose = true;
         server.onUnhandled = this::answerExchangeCommand;
     }
 
@@ -2158,7 +2157,7 @@ public class TokenExchangeTest extends RpcTestBase {
 
         // The socket is closed before the refresh command is written: the write is refused, so its outcome is unknown.
         // The peer does not answer the close frame, so the disconnect cannot overtake the exchange's result on the executor.
-        server.completeClose = false;
+        server.answerClose = false;
         ((WebSocket) fieldOf(client, "ws")).close(1000, "");
         storage.held.onDone(null, new TokenExchangeResult("access-1", "refresh-2"));
 

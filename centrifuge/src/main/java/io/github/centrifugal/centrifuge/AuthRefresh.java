@@ -443,7 +443,12 @@ final class AuthRefresh {
         // The refresh in flight is completed here, unless a refresh command goes out: its callback completes it.
         boolean awaitingCommand = false;
         try {
-            if (transport != host.transport() || host.state() == ClientState.CLOSED) {
+            if (host.state() == ClientState.CLOSED) {
+                return;
+            }
+            // A fetch of a connection which has since been replaced is stale. A fetch which ends while the connection is
+            // down has no transport to compare with: it is kept for the next connect, as the generation allows.
+            if (host.state() == ClientState.CONNECTED && transport != host.transport()) {
                 return;
             }
             // The session is over whatever asked for the token: the application removed its refresh token, or the issuer

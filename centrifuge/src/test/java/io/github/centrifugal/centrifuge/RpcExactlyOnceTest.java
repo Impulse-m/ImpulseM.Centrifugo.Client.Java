@@ -1045,7 +1045,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         });
 
         Throwable failure = reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
-        assertTrue("the failure of the callback is reported", failure instanceof IllegalStateException);
+        assertTrue("the failure of the callback is reported", failure instanceof UnclassifiedError && ((UnclassifiedError) failure).getError() instanceof IllegalStateException);
     }
 
 

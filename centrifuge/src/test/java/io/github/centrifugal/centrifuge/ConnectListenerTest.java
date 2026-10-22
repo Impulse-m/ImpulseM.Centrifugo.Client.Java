@@ -74,7 +74,7 @@ public class ConnectListenerTest extends RpcTestBase {
         c.connect();
 
         Throwable failure = reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
-        assertTrue("the listener failure is reported", failure instanceof IllegalStateException);
+        assertTrue("the listener failure is reported", failure instanceof UnclassifiedError && ((UnclassifiedError) failure).getError() instanceof IllegalStateException);
         awaitCondition("the queued call is written", () -> sentRpcRequests().size() == 1);
         assertTrue("the expiry timer is armed when the failure is reported", expiryArmedAtReport.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) > 0);
         assertTrue("the watchdog timer is armed when the failure is reported", pingArmedAtReport.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) > 0);
@@ -111,7 +111,8 @@ public class ConnectListenerTest extends RpcTestBase {
         ServerPublicationEvent publication = publications.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
         assertTrue("the recovered publication is delivered", publication != null);
         assertEquals(CHANNEL, publication.getChannel());
-        assertTrue("the Error is reported", reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS) instanceof NoClassDefFoundError);
+        Throwable failure = reported.poll(WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        assertTrue("the Error is reported", failure instanceof UnclassifiedError && ((UnclassifiedError) failure).getError() instanceof NoClassDefFoundError);
     }
 
 

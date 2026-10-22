@@ -1509,7 +1509,6 @@ public class RpcPoolTokenTest extends RpcTestBase {
     private FakeCentrifugoServer newPoolServer() throws IOException {
         FakeCentrifugoServer endpoint = new FakeCentrifugoServer();
         // A refused connect reconnects at once only when the server completes the close handshake.
-        endpoint.completeClose = true;
         endpoint.start();
         poolServers.add(endpoint);
         return endpoint;
@@ -1771,7 +1770,6 @@ public class RpcPoolTokenTest extends RpcTestBase {
     // unless the issued tokens say otherwise. The first token lasts firstTtl seconds, the later ones LONG_TTL, and the identity of
     // the later ones is renewedUser. The refresh with the access token of the exchange is answered with its identity.
     private void serveMain() {
-        server.completeClose = true;
         exchangeServed = true;
         server.onUnhandled = (Protocol.Command cmd) -> mainAnswer(cmd);
         server.onCommand = (Protocol.Command cmd) -> isHeld(server, cmd) ? null : mainAnswer(cmd);

@@ -735,7 +735,6 @@ public class RpcPoolTest extends RpcTestBase {
     @Test
     public void retiredConnectionCloseReportsNoErrorAndHoldsNoOpen() throws Exception {
         FakeCentrifugoServer endpoint = new FakeCentrifugoServer();
-        endpoint.completeClose = true;
         endpoint.start();
         try {
             server.onCommand = cmd -> cmd.hasRefresh() ? refreshAs(cmd, "bob") : connectAs(cmd, "alice", false);
