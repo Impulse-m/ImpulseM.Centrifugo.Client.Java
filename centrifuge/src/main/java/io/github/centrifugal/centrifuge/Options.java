@@ -223,7 +223,8 @@ public class Options {
      * Set the longest delay in milliseconds before a failed timer token fetch or refresh is tried again. The delay
      * doubles with each failure in a row, up to this value; a success starts it again. By default, 300000 (5 minutes)
      * is used, so a getter which keeps failing is retried less and less often. A value at or below 20000 keeps the
-     * flat retry of 10 to 20 seconds, as before.
+     * flat retry of 10 to 20 seconds, as before. After a long token getter outage, the next timer retry can be up to
+     * this cap away, so the connection may reconnect when its token expires instead of renewing.
      */
     public void setTokenRetryCap(int tokenRetryCap) {
         this.tokenRetryCap = tokenRetryCap;

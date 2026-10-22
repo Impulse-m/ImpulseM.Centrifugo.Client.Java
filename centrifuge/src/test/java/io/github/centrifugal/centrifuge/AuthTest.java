@@ -1362,7 +1362,7 @@ public class AuthTest extends RpcTestBase {
             assertTrue("retry " + (i + 1) + " is within its ceiling, the scheduled delays are " + clock.requestedDelays(),
                     retries.get(i) <= ceiling);
         }
-        assertEquals("every failure counts one step: the timer fetch and its eight retries", 9, retryStepOf(client));
+        awaitCondition("the ninth failure counts one step", () -> retryStepOf(client) == 9);
         boolean grewPastFirstCeiling = false;
         for (int i = 4; i < retries.size(); i++) {
             grewPastFirstCeiling |= retries.get(i) > 100;
