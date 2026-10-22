@@ -28,6 +28,7 @@ import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import okhttp3.Authenticator;
 import okhttp3.Callback;
 import okhttp3.CookieJar;
+import okhttp3.Dispatcher;
 import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -41,8 +42,10 @@ import okhttp3.Response;
  * which its connection lost, which the server refused for now, or which the server moved.
  *
  * <p>The calls are plain: a pool connection has no instance, so a call carries no msg_id. The pool resends
- * a call which its connection lost on a fresh connection, except in the documented cases where the outcome
- * is known. So a call may run more than once when the server commits it and the reply is lost. The methods
+ * a call which its connection lost on a fresh connection, except in three cases where the outcome is known: the
+ * connection closed for a frame over its size limit, or as unauthorized, or the connection was retired or went
+ * stale (for example after an account switch). Those calls settle with the loss error and are not sent again.
+ * So a call may run more than once when the server commits it and the reply is lost. The methods
  * of the calls must be idempotent; a method which is not should use an exactly-once call on the main client
  * instead. All the state
  * of the pool is confined to one thread of its own, and the callbacks run on that thread, as the
@@ -387,8 +390,9 @@ public final class RpcPool {
          * Works with every token mode of the client: a token exchange, a token getter or a static token. Exclusive with
          * {@link #token(String)} and {@link #tokenGetter(ConnectionTokenGetter)}, which build a pool without a client.
          *
-         * <p>A pool and its client: the pool follows the client's connect, disconnect and logout. A call made while the
+         * <p>A pool and its client: the pool follows the client's connect and disconnect. A call made while the
          * client's session has ended as unauthorized fails at once, and a call made after the client connects again goes out.
+         * After a logout the idle connections of the pool are not closed at once: each closes at {@code idleTimeout}.
          *
          * <p>The token is handed over unchanged, so the fleet must accept its claims as they are, including any channels or
          * subscriptions it carries. A fleet that refuses such a claim closes the connection with code 102: the pool reports the
@@ -514,8 +518,8 @@ public final class RpcPool {
 
 
         /**
-         * A reply or an error which moves the bytes to another path, see {@link RedirectHook}. On a plaintext endpoint
-         * endpoint, a {@code ws://} URL, the redirect body and headers travel unprotected, and an on-path attacker can read them.
+         * A reply or an error which moves the bytes to another path, see {@link RedirectHook}. On a plaintext endpoint,
+         * a {@code ws://} URL, the redirect body and headers travel unprotected, and an on-path attacker can read them.
          */
         public Builder redirect(RedirectHook redirect) {
             this.redirect = redirect;
@@ -759,18 +763,6 @@ public final class RpcPool {
     // The number of key queues the pool holds, read on its thread. For the tests.
     int queueKeys() throws Exception {
         return executor.submit(() -> queues.size()).get();
-    }
-
-
-    // The connections the pool holds, read on its thread. For the tests.
-    List<RpcPoolConnection> connections() throws Exception {
-        return executor.submit(() -> {
-            List<RpcPoolConnection> all = new ArrayList<>();
-            for (RpcPoolEndpoint endpoint : endpoints.values()) {
-                all.addAll(endpoint.connections());
-            }
-            return all;
-        }).get();
     }
 
 
@@ -1492,14 +1484,16 @@ public final class RpcPool {
 
 
     // Takes the call out of its queue, if it waits in one. The key of a queue which empties stops being waited for, and its
-    // queue is dropped, so that the keys of calls which came and went leave no entry behind.
+    // queue is dropped, so that no key which nothing waits for keeps a queue.
     private void unqueue(RpcPoolCall call) {
         RpcPoolQueue queue = call.queue;
         if (queue != null) {
             queue.remove(call);
             queuedCount--;
             if (queue != redirectWaiting && queue.isEmpty()) {
-                queues.remove(call.endpointKey);
+                if (queues.get(call.endpointKey) == queue) {
+                    queues.remove(call.endpointKey);
+                }
                 setWaitingKey(call.endpointKey, false);
             }
         }
@@ -1601,20 +1595,28 @@ public final class RpcPool {
                     Response response = answer;
                     byte[] body = null;
                     IOException failure = null;
+                    Error fatal = null;
                     try {
                         response = responseTap != null ? responseTap.apply(answer) : answer;
                         body = RpcPoolRedirect.readBody(response, maxBytes);
                     } catch (IOException e) {
                         failure = e;
-                    } catch (Throwable e) {
-                        // An error, such as an out of memory, must not leave the fetch slot taken: the call fails like any read error.
+                    } catch (RuntimeException e) {
                         failure = new IOException("redirect body could not be read", e);
+                    } catch (Error e) {
+                        // An error, such as an out of memory, must not leave the fetch slot taken: the call fails like any read error,
+                        // and the error is rethrown once the slot is back, so that the thread's handler sees it.
+                        failure = new IOException("redirect body could not be read", e);
+                        fatal = e;
                     } finally {
+                        final byte[] bodyOnce = body;
+                        final IOException failureOnce = failure;
+                        post(() -> onFetchDone(call, bodyOnce, failureOnce));
                         response.close();
                     }
-                    final byte[] bodyOnce = body;
-                    final IOException failureOnce = failure;
-                    post(() -> onFetchDone(call, bodyOnce, failureOnce));
+                    if (fatal != null) {
+                        throw fatal;
+                    }
                 }
             });
         } catch (IllegalArgumentException e) {
@@ -1896,7 +1898,13 @@ public final class RpcPool {
     // left behind by each pool that is closed.
     private static synchronized OkHttpClient defaultHttpClient() {
         if (sharedHttpClient == null) {
-            sharedHttpClient = new OkHttpClient();
+            // A websocket holds a slot of its dispatcher for the whole connection, and OkHttp counts it against the total limit
+            // of requests (64 by default), which would cap the connections of every pool in the process. The limits are lifted,
+            // so the pool's own maxConnectionsPerEndpoint is the only cap.
+            Dispatcher dispatcher = new Dispatcher();
+            dispatcher.setMaxRequests(Integer.MAX_VALUE);
+            dispatcher.setMaxRequestsPerHost(Integer.MAX_VALUE);
+            sharedHttpClient = new OkHttpClient.Builder().dispatcher(dispatcher).build();
         }
         return sharedHttpClient;
     }

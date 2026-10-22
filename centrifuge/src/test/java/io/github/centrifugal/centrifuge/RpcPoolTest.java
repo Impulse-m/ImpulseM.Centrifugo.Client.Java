@@ -2,11 +2,13 @@ package io.github.centrifugal.centrifuge;
 
 import java.io.IOException;
 import java.lang.ref.WeakReference;
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -114,12 +116,31 @@ public class RpcPoolTest extends RpcTestBase {
         pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(first));
         pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(second));
         awaitCondition("two connections", () -> pool.stats().getConnections() == 2);
-        List<RpcPoolConnection> connections = pool.connections();
+        List<RpcPoolConnection> connections = connectionsOf(pool);
         OkHttpClient firstClient = connections.get(0).client.getOpts().getOkHttpClient();
         OkHttpClient secondClient = connections.get(1).client.getOpts().getOkHttpClient();
         assertNotNull("each connection is given the shared client", firstClient);
         assertSame("the connections share one client, with its dispatcher and pool", firstClient, secondClient);
         awaitAll(Arrays.asList(first, second), true);
+    }
+
+
+    @Test
+    public void connectionsOfTwoPoolsInOneProcessAreNotCappedByTheDispatcher() throws Exception {
+        // Each websocket holds a dispatcher slot for its life, and OkHttp counts it against the total limit of 64 requests.
+        server.deferCommand = cmd -> cmd.hasRpc();
+        RpcPool first = build(builder().maxConnectionsPerEndpoint(33));
+        RpcPool second = build(builder().maxConnectionsPerEndpoint(33));
+        List<CompletableFuture<RPCResult>> futures = new ArrayList<>();
+        for (RpcPool pool : Arrays.asList(first, second)) {
+            for (int i = 0; i < 33; i++) {
+                CompletableFuture<RPCResult> future = new CompletableFuture<>();
+                futures.add(future);
+                pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(future));
+            }
+        }
+        awaitRequestCount(66);
+        awaitAll(futures, true);
     }
 
 
@@ -912,6 +933,19 @@ public class RpcPoolTest extends RpcTestBase {
                 .random(maximumDraws())
                 .errorListener((endpoint, error) -> {
                 });
+    }
+
+
+    // The connections of the pool, read once the pool is steady: the pool's own thread owns them, and the test reads the map by reflection.
+    @SuppressWarnings("unchecked")
+    private static List<RpcPoolConnection> connectionsOf(RpcPool pool) throws Exception {
+        Field field = RpcPool.class.getDeclaredField("endpoints");
+        field.setAccessible(true);
+        List<RpcPoolConnection> all = new ArrayList<>();
+        for (RpcPoolEndpoint endpoint : ((Map<String, RpcPoolEndpoint>) field.get(pool)).values()) {
+            all.addAll(endpoint.connections());
+        }
+        return all;
     }
 
 
