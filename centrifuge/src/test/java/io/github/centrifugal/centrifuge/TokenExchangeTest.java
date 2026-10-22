@@ -60,7 +60,7 @@ public class TokenExchangeTest extends RpcTestBase {
     private static final int CODE_TERMINAL_CLOSE = 3500;
     // The grace of an exchange which publishes none and the option does not set.
     private static final long DEFAULT_GRACE_MILLIS = 30000L;
-    private static final long WINDOW_MIN_MILLIS = 6000L;
+    private static final long WINDOW_MIN_MILLIS = 7000L;
     private static final long WINDOW_MAX_MILLIS = 9000L;
     // The clock moves at most this far per test, so that the ping timer (25 s plus the ping delay) stays idle.
     private static final int PUMP_STEPS = 300;
@@ -3007,14 +3007,34 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
-    public void renewalWindowSpreadsClientsAndKeepsAMargin() {
+    public void renewalWindowDefaultSpreadsClientsAndKeepsAMargin() {
         // Seeded, so the same 10000 draws are taken in every run; the clients' renewals spread over the window they pick from.
         Random random = new Random(20261022L);
         long ttlMillis = 300_000L;
         long earliest = Long.MAX_VALUE;
         long latest = Long.MIN_VALUE;
         for (int i = 0; i < 10_000; i++) {
-            long delay = TokenExchangeFlow.renewalDelayMillis(300, random.nextDouble());
+            long delay = TokenExchangeFlow.renewalDelayMillis(300, 0.7, random.nextDouble());
+            earliest = Math.min(earliest, delay);
+            latest = Math.max(latest, delay);
+        }
+        assertTrue("no renewal comes before 70 % of the ttl, the earliest is " + earliest, earliest >= 210_000L);
+        assertTrue("no renewal comes after 90 % of the ttl, the latest is " + latest, latest < 270_000L);
+        assertTrue("the renewals spread over at least 0.19 of the ttl, the spread is " + (latest - earliest),
+                latest - earliest >= 0.19 * ttlMillis);
+        assertTrue("the earliest renewal keeps at least 25 s before expiry at ttl 300", ttlMillis - earliest >= 25_000L);
+    }
+
+
+    @Test
+    public void renewalWindowWithEarlyRenewalStartsAtSixTenths() {
+        // Seeded, so the same 10000 draws are taken in every run; the early window runs from 0.6 to 0.9 of the ttl.
+        Random random = new Random(20261022L);
+        long ttlMillis = 300_000L;
+        long earliest = Long.MAX_VALUE;
+        long latest = Long.MIN_VALUE;
+        for (int i = 0; i < 10_000; i++) {
+            long delay = TokenExchangeFlow.renewalDelayMillis(300, 0.6, random.nextDouble());
             earliest = Math.min(earliest, delay);
             latest = Math.max(latest, delay);
         }

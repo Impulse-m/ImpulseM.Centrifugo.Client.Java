@@ -71,4 +71,13 @@ public abstract class TokenExchange {
     public int grace() {
         return 30;
     }
+
+
+    /**
+     * Renews the access token from 0.6 of its TTL instead of 0.7, so the renewals of many connections spread
+     * wider. Default false: the renewal is due at a random moment between 0.7 and 0.9 of the TTL.
+     */
+    public boolean earlyRenewal() {
+        return false;
+    }
 }

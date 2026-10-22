@@ -34,10 +34,11 @@ final class TokenExchangeFlow {
     private static final int BOOTSTRAP_RETRY_MIN_MILLIS = 5000;
     private static final int BOOTSTRAP_RETRY_MAX_MILLIS = 60000;
 
-    // Renewal fires at a random share of the ttl in [RENEWAL_MIN_SHARE, RENEWAL_MIN_SHARE + RENEWAL_JITTER). The window is wide
-    // so that clients of one ttl spread out; an issuer can add ttl jitter of its own on top of it.
-    private static final double RENEWAL_MIN_SHARE = 0.6;
-    private static final double RENEWAL_JITTER = 0.3;
+    // Renewal fires at a random share of the ttl in [renewalMinShare, RENEWAL_MAX_SHARE). The default starts at 0.7, and
+    // TokenExchange.earlyRenewal starts at 0.6 so that clients of one ttl spread out wider.
+    private static final double RENEWAL_MIN_SHARE = 0.7;
+    private static final double RENEWAL_EARLY_MIN_SHARE = 0.6;
+    private static final double RENEWAL_MAX_SHARE = 0.9;
 
     // The re-presentations of an unchanged refresh token a refusal run allows: one, at a random moment inside the
     // remaining grace.
@@ -98,6 +99,8 @@ final class TokenExchangeFlow {
     // The server error names that mean a refused refresh token, copied once from the exchange.
     private final Set<String> refusalTypes;
     private final Backoff backoff = new Backoff();
+    // The share of the ttl at which the renewal window starts, from TokenExchange.earlyRenewal.
+    private final double renewalMinShare;
     private Expiry expiry;
     // Set by beforeConnect: the next connect reply is bootstrapped when it is anonymous.
     private boolean anonymousConnect = false;
@@ -144,6 +147,7 @@ final class TokenExchangeFlow {
         this.exchange = exchange;
         this.refusalTypes = new LinkedHashSet<>(refusalTypesOf(exchange));
         this.graceSeconds = clampGrace(exchange.grace());
+        this.renewalMinShare = exchange.earlyRenewal() ? RENEWAL_EARLY_MIN_SHARE : RENEWAL_MIN_SHARE;
         this.renewalGetter = new ConnectionTokenGetter() {
             @Override
             public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
@@ -236,13 +240,16 @@ final class TokenExchangeFlow {
 
     /** Refresh timer delay of a ttl in seconds: a random share of it, in milliseconds. */
     long renewalDelayMillis(int ttl) {
-        return renewalDelayMillis(ttl, ThreadLocalRandom.current().nextDouble());
+        return renewalDelayMillis(ttl, renewalMinShare, ThreadLocalRandom.current().nextDouble());
     }
 
 
-    /** The refresh timer delay for a draw in [0, 1): the share of the ttl the draw picks in the renewal window. */
-    static long renewalDelayMillis(int ttl, double draw) {
-        double share = RENEWAL_MIN_SHARE + RENEWAL_JITTER * draw;
+    /**
+     * The refresh timer delay for a draw in [0, 1) and the window's start share of the ttl: the share of the ttl the draw
+     * picks in the window from minShare to 0.9.
+     */
+    static long renewalDelayMillis(int ttl, double minShare, double draw) {
+        double share = minShare + (RENEWAL_MAX_SHARE - minShare) * draw;
         return (long) (ttl * 1000L * share);
     }
 
