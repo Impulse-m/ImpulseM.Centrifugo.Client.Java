@@ -60,7 +60,7 @@ public class TokenExchangeTest extends RpcTestBase {
     private static final int CODE_TERMINAL_CLOSE = 3500;
     // The grace of an exchange which publishes none and the option does not set.
     private static final long DEFAULT_GRACE_MILLIS = 30000L;
-    private static final long WINDOW_MIN_MILLIS = 7000L;
+    private static final long WINDOW_MIN_MILLIS = 6000L;
     private static final long WINDOW_MAX_MILLIS = 9000L;
     // The clock moves at most this far per test, so that the ping timer (25 s plus the ping delay) stays idle.
     private static final int PUMP_STEPS = 300;
@@ -3003,5 +3003,17 @@ public class TokenExchangeTest extends RpcTestBase {
             }
         }
         return false;
+    }
+
+
+    @Test
+    public void renewalWindowSpreadsClientsAndKeepsAMargin() {
+        long ttlMillis = 300_000L;
+        long earliest = TokenExchangeFlow.renewalDelayMillis(300, 0.0);
+        long latest = TokenExchangeFlow.renewalDelayMillis(300, 0.999_999);
+        assertEquals("the earliest renewal is 60 % of the ttl", 180_000L, earliest);
+        assertTrue("the latest renewal stays under 90 % of the ttl", latest < 270_000L);
+        assertTrue("the window covers at least 0.3 of the ttl", latest - earliest >= 0.29 * ttlMillis);
+        assertTrue("the earliest renewal keeps at least 25 s before expiry at ttl 300", ttlMillis - earliest >= 25_000L);
     }
 }

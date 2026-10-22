@@ -1313,4 +1313,14 @@ public class AuthTest extends RpcTestBase {
         List<String> tokens = refreshTokens();
         return tokens.isEmpty() ? null : tokens.get(tokens.size() - 1);
     }
+
+
+    @Test
+    public void retryCeilingDoublesPerFailureUpToTheCap() {
+        assertEquals("the first retry keeps the configured maximum", 20000, AuthRefresh.retryCeilingMillis(0, 20000));
+        assertEquals("a second failure doubles the ceiling", 40000, AuthRefresh.retryCeilingMillis(1, 20000));
+        assertEquals("a third failure doubles it again", 80000, AuthRefresh.retryCeilingMillis(2, 20000));
+        assertEquals("the ceiling stops at the cap", AuthRefresh.RETRY_CAP_MILLIS, AuthRefresh.retryCeilingMillis(30, 20000));
+        assertEquals("a configured maximum above the cap is kept", 400000, AuthRefresh.retryCeilingMillis(0, 400000));
+    }
 }

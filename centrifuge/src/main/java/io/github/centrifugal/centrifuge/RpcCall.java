@@ -19,7 +19,8 @@ import java8.util.concurrent.CompletableFuture;
 public final class RpcCall {
     private final RpcSession session;
     final String method;
-    final byte[] data;
+    // Dropped when the call settles, since a late reply needs only the msg_id of the call.
+    byte[] data;
     final Map<String, String> headers;
     final long timeout;
     final ResultCallback<RPCResult> callback;

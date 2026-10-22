@@ -15,11 +15,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
+import okhttp3.OkHttpClient;
+
 import org.junit.After;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -77,6 +81,45 @@ public class RpcPoolTest extends RpcTestBase {
         pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(second));
         assertEquals(ReplyError.LIMIT_EXCEEDED, replyErrorOf(second).getCode());
         awaitAll(Collections.singletonList(first), true);
+    }
+
+
+    @Test
+    public void aDrainedKeyLeavesNoQueueBehind() throws Exception {
+        server.deferCommand = cmd -> cmd.hasRpc();
+        RpcPool pool = build(builder().maxConnectionsPerEndpoint(1).maxQueued(64));
+        CompletableFuture<RPCResult> onWire = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("key-0").build(), into(onWire));
+        awaitCondition("the first call on the wire", () -> pool.stats().getInflight() == 1);
+        List<CompletableFuture<RPCResult>> waiting = new ArrayList<>();
+        for (int i = 1; i <= 20; i++) {
+            CompletableFuture<RPCResult> future = new CompletableFuture<>();
+            waiting.add(future);
+            pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("key-" + i).build(), into(future));
+        }
+        awaitCondition("one waiting call per key", () -> pool.stats().getQueued() == 20);
+        assertEquals("each waiting key holds a queue", 20, pool.queueKeys());
+        waiting.add(onWire);
+        awaitAll(waiting, true);
+        assertEquals("a key whose queue drained holds no queue", 0, pool.queueKeys());
+    }
+
+
+    @Test
+    public void poolConnectionsShareOneOkHttpClient() throws Exception {
+        server.deferCommand = cmd -> cmd.hasRpc();
+        RpcPool pool = build(builder().maxConnectionsPerEndpoint(2).maxInflightPerConnection(1));
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        CompletableFuture<RPCResult> second = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(first));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(second));
+        awaitCondition("two connections", () -> pool.stats().getConnections() == 2);
+        List<RpcPoolConnection> connections = pool.connections();
+        OkHttpClient firstClient = connections.get(0).client.getOpts().getOkHttpClient();
+        OkHttpClient secondClient = connections.get(1).client.getOpts().getOkHttpClient();
+        assertNotNull("each connection is given the shared client", firstClient);
+        assertSame("the connections share one client, with its dispatcher and pool", firstClient, secondClient);
+        awaitAll(Arrays.asList(first, second), true);
     }
 
 

@@ -44,6 +44,7 @@ import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -650,6 +651,24 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         Protocol.RPCRequest cancel = awaitCancel(msgId);
         assertEquals("", cancel.getMethod());
         assertEquals(0, cancel.getData().size());
+    }
+
+
+    @Test
+    public void aSettledCallDropsItsPayloadWhileItsLateReplyIsKept() throws Exception {
+        enableRpcOptions();
+        serveDedup();
+        Client c = newClient();
+        connect(c);
+        holdCalls.set(true);
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        RpcCall call = c.rpcCall("long", EMPTY_PAYLOAD, into(future));
+        assertTrue("call arrived", callArrivals.tryAcquire(5, TimeUnit.SECONDS));
+
+        call.cancel();
+
+        assertEquals(ReplyError.CANCELLED, replyErrorOf(future).getCode());
+        assertNull("the settled call holds no payload for the late reply", call.data);
     }
 
 

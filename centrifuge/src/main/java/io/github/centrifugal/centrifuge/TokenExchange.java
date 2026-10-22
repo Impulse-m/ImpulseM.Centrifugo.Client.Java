@@ -11,6 +11,9 @@ import java.util.Set;
  * for an access token. The access token becomes the connection token, and the client renews it before
  * it expires. Set with {@link Options#setTokenExchange}, which is exclusive with
  * {@link Options#setTokenGetter}.
+ * <p>
+ * The callbacks run on the client's executor, so they must not block: a callback which waits stalls the client's
+ * other events, and the timeout of the exchange cannot interrupt it.
  */
 public abstract class TokenExchange {
     /**

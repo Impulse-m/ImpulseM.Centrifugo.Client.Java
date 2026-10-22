@@ -346,6 +346,32 @@ public class RpcPoolRedirectTest extends RpcTestBase {
     }
 
 
+    @Test
+    public void redirectSlotIsReturnedWhenTheReadThrowsAnError() throws Exception {
+        // The first answer fails with an error which is not an exception, as an out of memory does, while its body is read.
+        AtomicInteger answers = new AtomicInteger();
+        redirects.enqueue(new MockResponse().setBody("first"));
+        redirects.enqueue(new MockResponse().setBody("second"));
+        pool = new RpcPool.Builder(endpointKey -> Collections.singletonList(server.url()))
+                .random(maximumDraws())
+                .maxRedirectsInflight(1)
+                .responseTap(answer -> {
+                    if (answers.incrementAndGet() == 1) {
+                        throw new OutOfMemoryError("test error");
+                    }
+                    return answer;
+                })
+                .redirect((reply, error) -> reply != null ? RpcPool.Redirect.builder(redirects.url("/data").toString()).build() : null)
+                .build();
+        CompletableFuture<RPCResult> first = new CompletableFuture<>();
+        CompletableFuture<RPCResult> second = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(first));
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(second));
+        assertEquals("the failed fetch settles with the redirect error", RpcPool.REDIRECT_FAILED, ((ReplyError) errorOf(first)).getCode());
+        assertEquals("the slot of the failed fetch serves the next one", "second", new String(second.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+    }
+
+
     private RpcPool redirectingPool(final RpcPool.Redirect redirect) {
         return redirectingPool(redirect, null);
     }

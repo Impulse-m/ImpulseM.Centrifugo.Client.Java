@@ -160,8 +160,9 @@ public class Options {
      * Set how many rpc calls may be unsettled at once, for a client with an instance. A call counts
      * from its issue until it settles: a reply, an error, a timeout or a cancel. That includes a call which
      * waits for the connection, and a call kept for a resend. A call beyond the bound fails at once with
-     * {@link ReplyError#LIMIT_EXCEEDED} and is not sent. A client without an instance has no bound.
-     * Read when the client is created. Default 32.
+     * {@link ReplyError#LIMIT_EXCEEDED} and is not sent. A client without an instance has no bound: its calls
+     * wait in memory while it is disconnected, so the memory held is about the call rate times the call timeout
+     * times the payload size. Read when the client is created. Default 32.
      *
      * @throws IllegalArgumentException when the bound is less than 1.
      */

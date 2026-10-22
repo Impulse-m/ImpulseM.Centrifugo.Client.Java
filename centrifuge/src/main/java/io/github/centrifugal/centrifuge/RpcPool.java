@@ -40,8 +40,11 @@ import okhttp3.Response;
  * its endpoint key, which the application names; the pool keeps the connections, and resends a call
  * which its connection lost, which the server refused for now, or which the server moved.
  *
- * <p>The calls are plain: a pool connection has no instance, so a call carries no msg_id and is never
- * executed twice by the server on purpose. The methods of the calls must be idempotent. All the state
+ * <p>The calls are plain: a pool connection has no instance, so a call carries no msg_id. The pool resends
+ * a call which its connection lost on a fresh connection, except in the documented cases where the outcome
+ * is known. So a call may run more than once when the server commits it and the reply is lost. The methods
+ * of the calls must be idempotent; a method which is not should use an exactly-once call on the main client
+ * instead. All the state
  * of the pool is confined to one thread of its own, and the callbacks run on that thread, as the
  * callbacks of a {@link Client} run on its executor. The one exception is a call made after {@link #close()}:
  * its callback runs at once on the calling thread, with {@link ReplyError#CANCELLED}.
@@ -510,7 +513,10 @@ public final class RpcPool {
         }
 
 
-        /** A reply or an error which moves the bytes to another path, see {@link RedirectHook}. */
+        /**
+         * A reply or an error which moves the bytes to another path, see {@link RedirectHook}. On a plaintext endpoint
+         * endpoint, a {@code ws://} URL, the redirect body and headers travel unprotected, and an on-path attacker can read them.
+         */
         public Builder redirect(RedirectHook redirect) {
             this.redirect = redirect;
             return this;
@@ -630,7 +636,7 @@ public final class RpcPool {
     private final TokenSource source;
 
     // The state below belongs to the pool's thread.
-    // The waiting calls, one queue per endpoint key which resolved; a queue is kept once made, as the keys are.
+    // The waiting calls, one queue per endpoint key with calls waiting; a queue is dropped when it empties.
     private final Map<String, RpcPoolQueue> queues = new HashMap<>();
     // The calls waiting in all the queues, which the pool-wide bound counts.
     private int queuedCount;
@@ -747,6 +753,24 @@ public final class RpcPool {
     // The number of calls the pool resent after a connection lost them, read on its thread. For the tests.
     int lostResends() throws Exception {
         return executor.submit(() -> lostResends).get();
+    }
+
+
+    // The number of key queues the pool holds, read on its thread. For the tests.
+    int queueKeys() throws Exception {
+        return executor.submit(() -> queues.size()).get();
+    }
+
+
+    // The connections the pool holds, read on its thread. For the tests.
+    List<RpcPoolConnection> connections() throws Exception {
+        return executor.submit(() -> {
+            List<RpcPoolConnection> all = new ArrayList<>();
+            for (RpcPoolEndpoint endpoint : endpoints.values()) {
+                all.addAll(endpoint.connections());
+            }
+            return all;
+        }).get();
     }
 
 
@@ -893,6 +917,10 @@ public final class RpcPool {
         this.redirectHook = builder.redirect;
         this.maxRedirectsInflight = builder.maxRedirectsInflight;
         this.httpClient = builder.okHttpClient;
+        if (builder.okHttpClient == null) {
+            // The connections of a pool given no client share the process's one, so each shares its dispatcher and pool.
+            this.options.setOkHttpClient(defaultHttpClient());
+        }
         this.responseTap = builder.responseTap;
         this.errorListener = builder.errorListener;
         this.random = builder.random != null ? builder.random : new Random();
@@ -1463,13 +1491,15 @@ public final class RpcPool {
     }
 
 
-    // Takes the call out of its queue, if it waits in one. The key of a queue which empties stops being waited for.
+    // Takes the call out of its queue, if it waits in one. The key of a queue which empties stops being waited for, and its
+    // queue is dropped, so that the keys of calls which came and went leave no entry behind.
     private void unqueue(RpcPoolCall call) {
         RpcPoolQueue queue = call.queue;
         if (queue != null) {
             queue.remove(call);
             queuedCount--;
             if (queue != redirectWaiting && queue.isEmpty()) {
+                queues.remove(call.endpointKey);
                 setWaitingKey(call.endpointKey, false);
             }
         }
@@ -1568,14 +1598,16 @@ public final class RpcPool {
 
                 @Override
                 public void onResponse(okhttp3.Call httpCall, Response answer) {
-                    Response response = responseTap != null ? responseTap.apply(answer) : answer;
+                    Response response = answer;
                     byte[] body = null;
                     IOException failure = null;
                     try {
+                        response = responseTap != null ? responseTap.apply(answer) : answer;
                         body = RpcPoolRedirect.readBody(response, maxBytes);
                     } catch (IOException e) {
                         failure = e;
-                    } catch (RuntimeException e) {
+                    } catch (Throwable e) {
+                        // An error, such as an out of memory, must not leave the fetch slot taken: the call fails like any read error.
                         failure = new IOException("redirect body could not be read", e);
                     } finally {
                         response.close();

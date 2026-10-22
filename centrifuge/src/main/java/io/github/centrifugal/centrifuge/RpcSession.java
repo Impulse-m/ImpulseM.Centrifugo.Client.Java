@@ -672,6 +672,8 @@ final class RpcSession {
         queue.remove(call);
         stopResend(call);
         cancelDeadline(call);
+        // The payload is not sent again, and a call kept for its late reply holds only what the reply needs.
+        call.data = null;
         if (reply == null && call.wireTracked && onWire.get(call.commandId) == call) {
             // Settled locally while its attempt is on the wire: a late reply is still acked for one call timeout.
             keepLate(call);

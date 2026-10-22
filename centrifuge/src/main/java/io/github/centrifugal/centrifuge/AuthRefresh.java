@@ -57,6 +57,10 @@ final class AuthRefresh {
     // Bounds of the retry delay after a failed token fetch or refresh, in milliseconds.
     static final int RETRY_MIN_MILLIS = 10000;
     static final int RETRY_MAX_MILLIS = 20000;
+    // The longest ceiling of the retry delay after failed timer refreshes, which double with each failure.
+    static final int RETRY_CAP_MILLIS = 300000;
+    // The failures in a row after which the retry ceiling no longer grows, so the step never overflows.
+    private static final int RETRY_MAX_STEP = 30;
 
     // Error codes below this one are client errors, which the timer retries with a fresh token.
     private static final int SERVER_ERROR_CODE_MIN = 100;
@@ -69,6 +73,8 @@ final class AuthRefresh {
     private final int retryMinMillis;
     private final int retryMaxMillis;
     private final Backoff backoff = new Backoff();
+    // The failed timer refreshes in a row, which set the ceiling of the next retry. A successful expiry schedule clears it.
+    private int retryStep;
     // Null without a token exchange option: the connection token is then fetched by the token getter.
     private final TokenExchangeFlow flow;
     // The refresh in flight is the one which runs now. The refreshes waiting for it run in order.
@@ -285,6 +291,7 @@ final class AuthRefresh {
      * not expire. Replaces the timer scheduled before, so one timer chain runs.
      */
     void scheduleExpiry(boolean expires, int ttl) {
+        retryStep = 0;
         observeExpiry(expires, ttl);
         if (expires) {
             scheduleTimer(renewalDelayMillis(ttl), TimeUnit.MILLISECONDS);
@@ -366,7 +373,21 @@ final class AuthRefresh {
 
 
     private void scheduleRetry() {
-        scheduleTimer(backoff.duration(0, retryMinMillis, retryMaxMillis), TimeUnit.MILLISECONDS);
+        int step = Math.min(retryStep, RETRY_MAX_STEP);
+        scheduleTimer(backoff.duration(step, retryMinMillis, retryCeilingMillis(step, retryMaxMillis)), TimeUnit.MILLISECONDS);
+        if (retryStep < RETRY_MAX_STEP) {
+            retryStep++;
+        }
+    }
+
+
+    /**
+     * The ceiling of the retry delay after the given number of failures in a row: the configured maximum for the first,
+     * doubling with each failure up to {@link #RETRY_CAP_MILLIS}. A configured maximum above the cap is kept.
+     */
+    static int retryCeilingMillis(int step, int retryMaxMillis) {
+        long grown = (long) retryMaxMillis << Math.min(step, RETRY_MAX_STEP);
+        return (int) Math.max(retryMaxMillis, Math.min(RETRY_CAP_MILLIS, grown));
     }
 
 

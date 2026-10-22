@@ -34,9 +34,10 @@ final class TokenExchangeFlow {
     private static final int BOOTSTRAP_RETRY_MIN_MILLIS = 5000;
     private static final int BOOTSTRAP_RETRY_MAX_MILLIS = 60000;
 
-    // Renewal fires at a random share of the ttl in [RENEWAL_MIN_SHARE, RENEWAL_MIN_SHARE + RENEWAL_JITTER).
-    private static final double RENEWAL_MIN_SHARE = 0.7;
-    private static final double RENEWAL_JITTER = 0.2;
+    // Renewal fires at a random share of the ttl in [RENEWAL_MIN_SHARE, RENEWAL_MIN_SHARE + RENEWAL_JITTER). The window is wide
+    // so that clients of one ttl spread out; an issuer can add ttl jitter of its own on top of it.
+    private static final double RENEWAL_MIN_SHARE = 0.6;
+    private static final double RENEWAL_JITTER = 0.3;
 
     // The re-presentations of an unchanged refresh token a refusal run allows: one, at a random moment inside the
     // remaining grace.
@@ -235,7 +236,13 @@ final class TokenExchangeFlow {
 
     /** Refresh timer delay of a ttl in seconds: a random share of it, in milliseconds. */
     long renewalDelayMillis(int ttl) {
-        double share = RENEWAL_MIN_SHARE + RENEWAL_JITTER * ThreadLocalRandom.current().nextDouble();
+        return renewalDelayMillis(ttl, ThreadLocalRandom.current().nextDouble());
+    }
+
+
+    /** The refresh timer delay for a draw in [0, 1): the share of the ttl the draw picks in the renewal window. */
+    static long renewalDelayMillis(int ttl, double draw) {
+        double share = RENEWAL_MIN_SHARE + RENEWAL_JITTER * draw;
         return (long) (ttl * 1000L * share);
     }
 
