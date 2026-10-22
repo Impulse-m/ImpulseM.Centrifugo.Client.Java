@@ -23,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import okhttp3.Authenticator;
@@ -617,6 +618,9 @@ public final class RpcPool {
 
     // How long the pool's thread stays without a task before it ends. A pending timer keeps it, whatever this is.
     private static final long POOL_THREAD_KEEP_ALIVE_MILLIS = 1000L;
+
+    // The cause of a redirect fetch whose body could not be read, whether the read failed with an exception or with an error.
+    private static final String REDIRECT_BODY_UNREADABLE = "redirect body could not be read";
 
     // The client of the connections of the pools without an OkHttp client of their own, created on the first connection.
     private static OkHttpClient sharedHttpClient;
@@ -1603,11 +1607,11 @@ public final class RpcPool {
                     } catch (IOException e) {
                         failure = e;
                     } catch (RuntimeException e) {
-                        failure = new IOException("redirect body could not be read", e);
+                        failure = new IOException(REDIRECT_BODY_UNREADABLE, e);
                     } catch (Error e) {
                         // An error, such as an out of memory, must not leave the fetch slot taken: the call fails like any read error,
                         // and the error is rethrown once the slot is back, so that the thread's handler sees it.
-                        failure = new IOException("redirect body could not be read", e);
+                        failure = new IOException(REDIRECT_BODY_UNREADABLE, e);
                         fatal = e;
                     } finally {
                         final byte[] bodyOnce = body;
@@ -1898,25 +1902,29 @@ public final class RpcPool {
     // The client of the pools which were given none, shared by the process: its dispatcher and connection pool are not
     // left behind by each pool that is closed.
     private static synchronized OkHttpClient defaultHttpClient() {
-        if (sharedHttpClient == null) {
+        sharedHttpClient = sharedClient(sharedHttpClient, () -> {
             // A websocket holds a slot of its dispatcher for the whole connection, and OkHttp counts it against the total limit
             // of requests (64 by default), which would cap the connections of every pool in the process. The limits are lifted,
             // so the pool's own maxConnectionsPerEndpoint is the only cap.
             Dispatcher dispatcher = new Dispatcher();
             dispatcher.setMaxRequests(Integer.MAX_VALUE);
             dispatcher.setMaxRequestsPerHost(Integer.MAX_VALUE);
-            sharedHttpClient = new OkHttpClient.Builder().dispatcher(dispatcher).build();
-        }
+            return new OkHttpClient.Builder().dispatcher(dispatcher).build();
+        });
         return sharedHttpClient;
     }
 
 
     // The client of the redirect fetches of the pools given none, shared by the process like the connections' client.
     private static synchronized OkHttpClient defaultFetchHttpClient() {
-        if (sharedFetchHttpClient == null) {
-            sharedFetchHttpClient = new OkHttpClient();
-        }
+        sharedFetchHttpClient = sharedClient(sharedFetchHttpClient, () -> new OkHttpClient());
         return sharedFetchHttpClient;
+    }
+
+
+    // The client held, or the one the supplier builds when none is held yet.
+    private static OkHttpClient sharedClient(OkHttpClient held, Supplier<OkHttpClient> create) {
+        return held != null ? held : create.get();
     }
 
 
