@@ -498,11 +498,6 @@ public class Subscription {
         this._unsubscribe(sendUnsubscribe, Client.UNSUBSCRIBED_UNAUTHORIZED, "unauthorized");
     }
 
-    /**
-     * Publishes data to the channel. With a publish debounce window set by the server, the first publish goes at once and
-     * the later ones coalesce into the latest value: the callback then reports success before the value is sent, and a
-     * pending value is dropped on unsubscribe or disconnect without an error. The window has no maximum except the 32-bit limit.
-     */
     public void publish(byte[] data, ResultCallback<PublishResult> cb) {
         this.client.getExecutor().submit(() -> Subscription.this.publishSynchronized(data, cb));
     }
