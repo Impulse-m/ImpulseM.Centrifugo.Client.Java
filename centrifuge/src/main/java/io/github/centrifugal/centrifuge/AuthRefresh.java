@@ -375,9 +375,12 @@ final class AuthRefresh {
 
     private void scheduleRetry() {
         // Without a cap above the maximum the step stays 0, so the delay is the flat one of the retry bounds.
-        int step = retryCapMillis > retryMaxMillis ? retryStep : 0;
+        boolean grows = retryCapMillis > retryMaxMillis;
+        int step = grows ? retryStep : 0;
         scheduleTimer(backoff.duration(step, retryMinMillis, retryCeilingMillis(step)), TimeUnit.MILLISECONDS);
-        retryStep = Math.min(retryStep + 1, RETRY_MAX_STEP);
+        if (grows) {
+            retryStep = Math.min(retryStep + 1, RETRY_MAX_STEP);
+        }
     }
 
 

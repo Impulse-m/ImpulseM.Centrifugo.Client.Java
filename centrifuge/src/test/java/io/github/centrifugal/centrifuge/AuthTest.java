@@ -1,6 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -1353,9 +1354,9 @@ public class AuthTest extends RpcTestBase {
         clock.advance(1000);
         failTimerRetries(clock, seen, 4);
 
-        // Each cycle is a successful fetch, then one failure after its expiry. The first retry after a success draws from the
-        // bounds of the configured maximum, which is at most 100 ms. Without the reset the ceiling keeps growing across the
-        // cycles, and a draw stays within 100 ms in only a few percent of the cycles, so a missing reset fails the test in practice.
+        // Each cycle is a successful fetch, then one failure after its expiry. The success resets the failure step, which the
+        // test reads from the field: the first retry after a success draws from the bounds of the configured maximum, at most
+        // 100 ms. Without the reset the step keeps counting across the cycles, which the field check shows on the first cycle.
         for (int cycle = 0; cycle < 8; cycle++) {
             failing.set(false);
             answerRefreshWith(Protocol.Reply.newBuilder()
@@ -1363,13 +1364,27 @@ public class AuthTest extends RpcTestBase {
             final int beforeSuccess = clock.requestedDelays().size();
             clock.advance(lastDelay(clock));
             awaitCondition("the successful fetch schedules the next expiry", () -> clock.requestedDelays().size() > beforeSuccess);
+            assertEquals("cycle " + cycle + ": the success resets the failure step", 0, retryStepOf(client));
 
             failing.set(true);
             final int beforeFailure = clock.requestedDelays().size();
             clock.advance(1000);
             awaitCondition("the failure after the expiry schedules a retry", () -> clock.requestedDelays().size() > beforeFailure);
+            awaitCondition("cycle " + cycle + ": one failure counts one step", () -> retryStepOf(client) == 1);
             assertTrue("cycle " + cycle + ": the ceiling starts again at the configured maximum, the delays are " + clock.requestedDelays(),
                     lastDelay(clock) <= 100);
+        }
+    }
+
+
+    // The failure step of the timer retry: the number of failed timer refreshes in a row, read from the auth refresh.
+    private static int retryStepOf(Client client) {
+        try {
+            Field field = AuthRefresh.class.getDeclaredField("retryStep");
+            field.setAccessible(true);
+            return field.getInt(client.auth);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
         }
     }
 
