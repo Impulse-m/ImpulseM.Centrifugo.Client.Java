@@ -129,7 +129,9 @@ public class RpcPoolTest extends RpcTestBase {
 
     @Test
     public void connectionsOfTwoPoolsInOneProcessAreNotCappedByTheDispatcher() throws Exception {
-        // Each websocket holds a dispatcher slot for its life, and OkHttp counts it against the total limit of 64 requests.
+        // Guards the lifted dispatcher limit of the shared client against a future shared dispatcher with OkHttp's default
+        // total limit of 64 requests: each websocket holds a dispatcher slot for its life, so 66 connections of two pools
+        // would stall on such a dispatcher. Each connection had its own dispatcher before the sharing, so this passes there too.
         server.deferCommand = cmd -> cmd.hasRpc();
         RpcPool first = build(builder().maxConnectionsPerEndpoint(33));
         RpcPool second = build(builder().maxConnectionsPerEndpoint(33));
