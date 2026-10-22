@@ -608,6 +608,35 @@ public class AuthTest extends RpcTestBase {
 
 
     @Test
+    public void timerTokenFetchedAcrossSetTokenWhileConnectedIsDropped() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        ManualScheduler clock = new ManualScheduler();
+        List<TokenCallback> fetches = new CopyOnWriteArrayList<>();
+        newAuthClientOnClock(recordingTokenOptions(fetches), clock);
+        connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+        clock.advance(1000);
+        awaitCondition("timer fetch started", () -> fetches.size() == 1);
+        int scheduled = clock.requestedDelays().size();
+
+        client.setToken("token-C");
+        drainExecutor();
+        fetches.get(0).Done(null, "token-B");
+        drainExecutor();
+
+        awaitCondition("the timer is armed again", () -> clock.requestedDelays().size() > scheduled);
+        syncWithServer();
+        assertFalse("no refresh carries the token of the stale fetch", refreshTokens().contains("token-B"));
+        assertTrue("no refresh is sent for the stale fetch", refreshTokens().isEmpty());
+
+        client.disconnect();
+        awaitCondition("disconnected by the app", () -> client.getState() == ClientState.DISCONNECTED);
+        connect(client);
+        assertEquals("token-C", lastConnectRequest().getToken());
+    }
+
+
+    @Test
     public void refreshAfterCloseCallsBackWithAnError() throws Exception {
         newAuthClient(new Options());
         client.close(1000);

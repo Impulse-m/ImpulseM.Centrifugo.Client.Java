@@ -104,6 +104,9 @@ final class AuthRefresh {
     private boolean timerSuperseded = false;
     // Moves on with each refresh() call accepted and each token accepted. A timer token fetched under an older value is superseded.
     private long refreshGeneration = 0;
+    // Moves on only when the session ends: a setToken, a disconnect, a close or an invalidated state. A timer fetch begun
+    // under an older value is stale in every state, whatever refresh() calls happened since.
+    private long sessionGeneration = 0;
     // Identity the server last reported for the connection, see applyAuth. Used on the executor thread only.
     private String currentUser = "";
     private String currentAuthClass = "";
@@ -194,7 +197,7 @@ final class AuthRefresh {
      * or the invalidated state. Runs on the executor. A timer fetch in flight then completes without storing its token.
      */
     void invalidateTimerFetch() {
-        refreshGeneration++;
+        sessionGeneration++;
     }
 
 
@@ -425,6 +428,7 @@ final class AuthRefresh {
     private void fetchAndRefresh() {
         WebSocket transport = host.transport();
         final long generation = refreshGeneration;
+        final long session = sessionGeneration;
         if (host.state() != ClientState.CONNECTED) {
             complete(false);
             return;
@@ -444,11 +448,11 @@ final class AuthRefresh {
             fetched.completeExceptionally(e);
         }
         fetched.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS)
-                .whenComplete((String token, Throwable err) -> runOnExecutorOrInline(() -> onTokenFetched(transport, generation, Extensions.unwrapCompletion(err), token)));
+                .whenComplete((String token, Throwable err) -> runOnExecutorOrInline(() -> onTokenFetched(transport, generation, session, Extensions.unwrapCompletion(err), token)));
     }
 
 
-    private void onTokenFetched(WebSocket transport, long generation, Throwable err, String token) {
+    private void onTokenFetched(WebSocket transport, long generation, long session, Throwable err, String token) {
         // The refresh in flight is completed here, unless a refresh command goes out: its callback completes it.
         boolean awaitingCommand = false;
         try {
@@ -458,6 +462,15 @@ final class AuthRefresh {
             // A fetch of a connection which has since been replaced is stale. A fetch which ends while the connection is
             // down has no transport to compare with: it is kept for the next connect, as the generation allows.
             if (host.state() == ClientState.CONNECTED && transport != host.transport()) {
+                return;
+            }
+            // The session ended after the fetch began, with setToken, a disconnect or an invalidated state: the token is
+            // stale in every state, so it is neither sent nor stored. A connected client arms the timer again, so the next
+            // refresh fetches with the credentials in effect now.
+            if (session != sessionGeneration) {
+                if (host.state() == ClientState.CONNECTED) {
+                    scheduleTimer(0L, TimeUnit.MILLISECONDS);
+                }
                 return;
             }
             // The session is over whatever asked for the token: the application removed its refresh token, or the issuer
