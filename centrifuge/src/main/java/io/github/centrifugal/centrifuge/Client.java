@@ -76,12 +76,11 @@ public class Client {
 
     // Runs every step of the client. An exception escaping a step (e.g. thrown by an app
     // event handler) is reported through onError instead of vanishing in the task's
-    // Future, which left the rest of the step silently undone. The worker
-    // thread references only the inner executor, which shuts itself down once the client
-    // is unreachable: a client that is disconnected but never closed is still collected.
+    // Future, which left the rest of the step silently undone. The single worker thread
+    // is stopped by close() only: a client which is disconnected but never closed keeps it.
     private final ExecutorService executor = new ReportingExecutor(Executors.newSingleThreadExecutor());
 
-    /** Wraps every task so an exception it throws is reported, then delegates. */
+    /** Wraps every task with {@link ClientHost#reporting}, then delegates. */
     private final class ReportingExecutor extends java.util.concurrent.AbstractExecutorService {
         private final ExecutorService delegate;
 
@@ -91,25 +90,13 @@ public class Client {
 
         @Override
         public void execute(Runnable task) {
-            this.delegate.execute(() -> {
-                try {
-                    task.run();
-                } catch (Throwable t) {
-                    Client.this.reportUncaught(t);
-                }
-            });
+            this.delegate.execute(Client.this.host.reporting(task));
         }
 
         @Override
         protected <T> java.util.concurrent.RunnableFuture<T> newTaskFor(Runnable task, T value) {
             // submit(): report from inside the task, before FutureTask stores the exception.
-            return super.newTaskFor(() -> {
-                try {
-                    task.run();
-                } catch (Throwable t) {
-                    Client.this.reportUncaught(t);
-                }
-            }, value);
+            return super.newTaskFor(Client.this.host.reporting(task), value);
         }
 
         @Override
@@ -292,16 +279,6 @@ public class Client {
 
     private int _id = 0;
 
-    /** Reports an exception that escaped a step, e.g. thrown by an event handler. */
-    void reportUncaught(Throwable t) {
-        try {
-            this.listener.onError(this, new ErrorEvent(new UnclassifiedError(t)));
-        } catch (Throwable e) {
-            // The error handler threw too: nothing left to report to.
-            e.printStackTrace();
-        }
-    }
-
     /**
      * An exception while handling data from the server (a reply or a push, including an
      * app handler run for it): reported, then the client stops visibly with "bad
@@ -311,7 +288,7 @@ public class Client {
      */
     private void handleDispatchError(Throwable e) {
         e.printStackTrace();
-        this.reportUncaught(e);
+        this.host.reportUnclassified(e);
         this.processDisconnect(DISCONNECTED_BAD_PROTOCOL, "bad protocol (message)", false);
     }
 
@@ -568,7 +545,7 @@ public class Client {
                     sub.moveToSubscribing(SUBSCRIBING_TRANSPORT_CLOSED, "transport closed");
                 } catch (Throwable t) {
                     // A handler threw: the other subscriptions must still move.
-                    this.reportUncaught(t);
+                    this.host.reportUnclassified(t);
                 }
             }
         }
@@ -589,7 +566,7 @@ public class Client {
                 try {
                     this.listener.onSubscribing(this, new ServerSubscribingEvent(channel));
                 } catch (Throwable t) {
-                    this.reportUncaught(t);
+                    this.host.reportUnclassified(t);
                 }
             }
         }
@@ -881,13 +858,13 @@ public class Client {
         // suspended) first lets an open callback already queued run.
         final WebSocket openingWs = this.ws;
         final long openDue = System.nanoTime() / 1_000_000 + this.opts.getTimeout();
-        this.openTimeoutTask = this.scheduler.schedule(() -> this.submitOrDrop(() -> {
+        this.openTimeoutTask = this.scheduler.schedule(() -> Extensions.submitOrIgnore(this.executor, () -> {
             if (Client.this.ws != openingWs || Client.this.wsOpen) {
                 return;
             }
             long late = System.nanoTime() / 1_000_000 - openDue;
             if (late >= LATE_TIMER_MS) {
-                Client.this.openTimeoutTask = Client.this.scheduler.schedule(() -> Client.this.submitOrDrop(() -> {
+                Client.this.openTimeoutTask = Client.this.scheduler.schedule(() -> Extensions.submitOrIgnore(Client.this.executor, () -> {
                     if (Client.this.ws == openingWs && !Client.this.wsOpen) {
                         Client.this.failTransport(new java.util.concurrent.TimeoutException("connect timeout"));
                     }
@@ -919,7 +896,7 @@ public class Client {
         final long due = nowMs() + this.opts.getTimeout();
         ScheduledFuture<?> timer;
         try {
-            timer = this.scheduler.schedule(() -> this.submitOrDrop(() -> this.expire(f, due)),
+            timer = this.scheduler.schedule(() -> Extensions.submitOrIgnore(this.executor, () -> this.expire(f, due)),
                     this.opts.getTimeout(), TimeUnit.MILLISECONDS);
         } catch (RejectedExecutionException e) {
             timer = null;
@@ -938,7 +915,7 @@ public class Client {
                 }
             } catch (Throwable t) {
                 // E.g. an app callback that threw: reported, never called again.
-                this.reportUncaught(t);
+                this.host.reportUnclassified(t);
             }
         });
     }
@@ -949,7 +926,7 @@ public class Client {
         }
         if (nowMs() - due >= LATE_TIMER_MS) {
             try {
-                this.scheduler.schedule(() -> this.submitOrDrop(() -> f.completeExceptionally(new java.util.concurrent.TimeoutException())),
+                this.scheduler.schedule(() -> Extensions.submitOrIgnore(this.executor, () -> f.completeExceptionally(new java.util.concurrent.TimeoutException())),
                         LATE_TIMER_GRACE_MS, TimeUnit.MILLISECONDS);
                 return;
             } catch (RejectedExecutionException ignored) {
@@ -957,14 +934,6 @@ public class Client {
             }
         }
         f.completeExceptionally(new java.util.concurrent.TimeoutException());
-    }
-
-    /** Submits to the executor, dropping the task once the client is closed. */
-    private void submitOrDrop(Runnable task) {
-        try {
-            this.executor.submit(task);
-        } catch (RejectedExecutionException ignored) {
-        }
     }
 
     private void handleConnectionOpen() {

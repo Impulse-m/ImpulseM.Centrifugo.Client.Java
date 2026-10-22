@@ -371,7 +371,6 @@ public final class FakeCentrifugoServer {
         send(currentSocket.get(), reply);
     }
 
-    /** Send a raw push (wrapped in a reply) to the active connection. */
     /**
      * Send several replies (or pushes, wrapped in replies) in one WebSocket frame, as the
      * server does when it batches queued messages.
@@ -392,6 +391,7 @@ public final class FakeCentrifugoServer {
         s.send(ByteString.of(out.toByteArray()));
     }
 
+    /** Send a raw push (wrapped in a reply) to the active connection. */
     public void sendPush(Protocol.Push push) {
         sendReply(Protocol.Reply.newBuilder().setPush(push).build());
     }

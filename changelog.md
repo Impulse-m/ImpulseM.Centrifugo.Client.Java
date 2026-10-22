@@ -26,7 +26,7 @@ Unreleased
 * An rpc call cancelled before it was sent is rejected with `CANCELLED` on every connection. It was `UNSUPPORTED` on a connection without the capability. A call whose resend with a new msg_id is still queued is `CANCELLED` too.
 * An rpc call with an instance whose msg_id was never written is rejected with `CANCELLED` when the client closes or disconnects for good. A call which was written fails with `IOException`, and the server still gets its cancel with the next connect which carries cancels.
 * A timer refresh token whose fetch is superseded by a `refresh()` call is not sent. A token fetched while disconnected, on the connection it was for, is the token of the next connect.
-* The connect listener callbacks (`onConnected`, `onAuth`, `onSubscribed`, `onPublication`, `onUnsubscribed`) run after the connect reply has armed the timers and flushed the queued calls. A callback which throws, an `Error` included, is reported to `onError` after the handshake, and the handshake goes on.
+* The connect listener callbacks (`onConnected`, `onAuth`, `onSubscribed`, `onPublication`, `onUnsubscribed`) run after the connect reply has armed the timers and flushed the queued calls. A callback which throws, an `Error` included, is reported to `onError` as an `UnclassifiedError` after the handshake, and the callbacks which follow it still run. Then the client disconnects with code 2 (`bad protocol`), as for a failure while it handles data from the server; `connect()` starts it again.
 * A cancel whose send fails is kept for the next connect, and reported to `onError` as an `UnclassifiedError`, after the connect reply is handled.
 * An rpc call with a null method or data throws `NullPointerException` at the call.
 * The instance is read when the client is created. A reply which arrives after the call deadline is acknowledged.
@@ -39,6 +39,12 @@ Unreleased
 * `RpcPool` shares its connections per endpoint URL, notifies only the pools and keys with calls waiting when the main client changes, and retires a connection which is stale at its end without an error.
 * `RpcPool.close()` settles a redirect waiting for a fetch slot with `IOException("rpc pool closed")`, as it settles a fetch which is running.
 * `RpcPool` settles a call lost on a retired or stale connection with the connection's loss error and no resend, whatever the token state.
+* A failure thrown by an rpc callback, by a connect listener callback or by any other step of the client is reported to `onError` as an `UnclassifiedError` which wraps it, as upstream reports it. Before, the fork reported the thrown exception itself. Code which matched the raw type must unwrap `UnclassifiedError.getError()`.
+* A subscribe reply with code 109 and no token getter in `SubscriptionOptions` unsubscribes the subscription as unauthorized, and reports a `ConfigurationError` to `onError`. Before, the subscription was sent again without a token.
+* State invalidation keeps a static token. The subscription token is cleared on code 2502 (an unsubscribe push) and on code 3014 (a disconnect), and the connection token on 3014, only when a token getter is set. Without a getter the server decides whether the kept token is still valid.
+* A delta publication which arrives with no base to apply it to is an error: it is reported as an `UnclassifiedError`, and the client disconnects with code 2 (`bad protocol`).
+* `Subscription.subscribe()` on a subscription removed from the client throws `IllegalStateException`.
+* An unsubscribe whose reply carries an error, or which times out while the client is connected, disconnects the client with reason `unsubscribe error` and reconnects it, so the server starts from a clean state.
 
 0.3.1
 =====
