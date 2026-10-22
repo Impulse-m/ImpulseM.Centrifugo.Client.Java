@@ -1316,11 +1316,94 @@ public class AuthTest extends RpcTestBase {
 
 
     @Test
-    public void retryCeilingDoublesPerFailureUpToTheCap() {
-        assertEquals("the first retry keeps the configured maximum", 20000, AuthRefresh.retryCeilingMillis(0, 20000));
-        assertEquals("a second failure doubles the ceiling", 40000, AuthRefresh.retryCeilingMillis(1, 20000));
-        assertEquals("a third failure doubles it again", 80000, AuthRefresh.retryCeilingMillis(2, 20000));
-        assertEquals("the ceiling stops at the cap", AuthRefresh.RETRY_CAP_MILLIS, AuthRefresh.retryCeilingMillis(30, 20000));
-        assertEquals("a configured maximum above the cap is kept", 400000, AuthRefresh.retryCeilingMillis(0, 400000));
+    public void timerRetryCeilingGrowsWithEachFailureUpToTheCap() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        ManualScheduler clock = new ManualScheduler();
+        newAuthClientOnClock(timerGetterOptions(new AtomicBoolean(true), 3200), clock);
+        connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+
+        int seen = clock.requestedDelays().size();
+        clock.advance(1000);
+        List<Long> retries = failTimerRetries(clock, seen, 7);
+
+        // The ceiling of the k-th retry is 100 ms doubled k - 1 times, up to the cap of 3200 ms.
+        long[] ceilings = {100, 200, 400, 800, 1600, 3200, 3200};
+        for (int i = 0; i < ceilings.length; i++) {
+            assertTrue("retry " + (i + 1) + " is within its ceiling, the scheduled delays are " + clock.requestedDelays(),
+                    retries.get(i) <= ceilings[i]);
+        }
+        boolean grewPastFirstCeiling = false;
+        for (int i = 2; i < retries.size(); i++) {
+            grewPastFirstCeiling |= retries.get(i) > 100;
+        }
+        assertTrue("a later retry waits past the first ceiling, which a flat retry never does", grewPastFirstCeiling);
+    }
+
+
+    @Test
+    public void timerRetryCeilingStartsAgainAfterASuccessfulExpiry() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        ManualScheduler clock = new ManualScheduler();
+        AtomicBoolean failing = new AtomicBoolean(true);
+        newAuthClientOnClock(timerGetterOptions(failing, 3200), clock);
+        connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+        int seen = clock.requestedDelays().size();
+        clock.advance(1000);
+        failTimerRetries(clock, seen, 4);
+
+        failing.set(false);
+        answerRefreshWith(Protocol.Reply.newBuilder()
+                .setRefresh(Protocol.RefreshResult.newBuilder().setUser("u1").setAuthClass("authenticated").setExpires(true).setTtl(1)));
+        final int beforeSuccess = clock.requestedDelays().size();
+        clock.advance(lastDelay(clock));
+        awaitCondition("the successful fetch schedules the next expiry", () -> clock.requestedDelays().size() > beforeSuccess);
+
+        failing.set(true);
+        final int beforeFailure = clock.requestedDelays().size();
+        clock.advance(1000);
+        awaitCondition("the failure after the expiry schedules a retry", () -> clock.requestedDelays().size() > beforeFailure);
+        assertTrue("the ceiling starts again at the configured maximum", lastDelay(clock) <= 100);
+    }
+
+
+    private Options timerGetterOptions(final AtomicBoolean failing, int retryCapMillis) {
+        Options options = new Options();
+        options.setToken("token-initial");
+        options.setTokenRetryCap(retryCapMillis);
+        options.setTokenGetter(new ConnectionTokenGetter() {
+            @Override
+            public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
+                if (failing.get()) {
+                    throw new IllegalStateException("getter failed");
+                }
+                cb.Done(null, "token-timer");
+            }
+        });
+        return options;
+    }
+
+
+    // Lets each retry of a failing timer fetch run, one after another, and returns the delays the retries were scheduled with.
+    // The seen delays are those scheduled before the failing fetch ran: each retry is the first delay scheduled after them.
+    private List<Long> failTimerRetries(ManualScheduler clock, int seen, int count) throws InterruptedException {
+        List<Long> retries = new ArrayList<>();
+        int known = seen;
+        for (int i = 0; i < count; i++) {
+            final int wanted = known + 1;
+            awaitCondition("retry " + (i + 1) + " is scheduled", () -> clock.requestedDelays().size() >= wanted);
+            known = clock.requestedDelays().size();
+            long delay = lastDelay(clock);
+            retries.add(delay);
+            clock.advance(delay);
+        }
+        return retries;
+    }
+
+
+    private static long lastDelay(ManualScheduler clock) {
+        List<Long> delays = clock.requestedDelays();
+        return delays.get(delays.size() - 1);
     }
 }
