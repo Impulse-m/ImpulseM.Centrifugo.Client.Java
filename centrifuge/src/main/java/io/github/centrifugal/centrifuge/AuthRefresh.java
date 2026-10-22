@@ -189,6 +189,15 @@ final class AuthRefresh {
     }
 
 
+    /**
+     * Drops the timer token fetched for the session which ends: the logout, the token the application set, the close
+     * or the invalidated state. Runs on the executor. A timer fetch in flight then completes without storing its token.
+     */
+    void invalidateTimerFetch() {
+        refreshGeneration++;
+    }
+
+
     /** Called at the start of every connect attempt, before the connect command is built. */
     void beforeConnect() {
         if (flow != null) {

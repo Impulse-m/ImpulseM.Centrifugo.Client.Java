@@ -376,6 +376,7 @@ public class Client {
      */
     public void disconnect() {
         this.executor.submit(() -> {
+            Client.this.auth.invalidateTimerFetch();
             Client.this.processDisconnect(DISCONNECTED_DISCONNECT_CALLED, "disconnect called", false);
             // A client which is already disconnected returns early above: its calls still waiting for a connection end here.
             Client.this.rpcSession.onTransportLost(false);
@@ -387,6 +388,7 @@ public class Client {
      */
     public void setToken(String token) {
         this.executor.submit(() -> {
+            Client.this.auth.invalidateTimerFetch();
             Client.this.token = token;
             if (Client.this.opts.getTokenGetter() == null) {
                 // The token expired (109) and the app set a new one: without a token
@@ -417,6 +419,7 @@ public class Client {
                 // (e.g. orTimeout/exceptionally re-submits) get queued before
                 // we mark the executor shutdown.
                 WebSocket last = Client.this.ws;
+                Client.this.auth.invalidateTimerFetch();
                 Client.this.processDisconnect(DISCONNECTED_DISCONNECT_CALLED, "client closed", false);
                 Client.this.rpcSession.failOnClose(Client.this.futures.values());
                 Client.this.auth.failWaiting();
@@ -448,6 +451,10 @@ public class Client {
     }
 
     void processDisconnect(int code, String reason, Boolean shouldReconnect) {
+        if (code == DISCONNECTED_STATE_INVALIDATED) {
+            // The invalidated state ends the session the timer fetch was made for, whatever the state of the client.
+            this.auth.invalidateTimerFetch();
+        }
         if (this.getState() == ClientState.DISCONNECTED || this.getState() == ClientState.CLOSED) {
             if (!shouldReconnect) {
                 // Calls made while disconnected wait for a connection: disconnect() and

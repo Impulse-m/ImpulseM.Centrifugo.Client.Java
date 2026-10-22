@@ -559,6 +559,55 @@ public class AuthTest extends RpcTestBase {
 
 
     @Test
+    public void timerTokenFetchedAcrossAnExplicitDisconnectIsDropped() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        ManualScheduler clock = new ManualScheduler();
+        List<TokenCallback> fetches = new CopyOnWriteArrayList<>();
+        newAuthClientOnClock(recordingTokenOptions(fetches), clock);
+        connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+        clock.advance(1000);
+        awaitCondition("timer fetch started", () -> fetches.size() == 1);
+
+        client.disconnect();
+        awaitCondition("disconnected by the app", () -> client.getState() == ClientState.DISCONNECTED);
+        fetches.get(0).Done(null, "token-B");
+        drainExecutor();
+
+        connect(client);
+        assertFalse("the token of the fetch across the logout is not sent", "token-B".equals(lastConnectRequest().getToken()));
+    }
+
+
+    @Test
+    public void timerTokenFetchedAcrossSetTokenIsDropped() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        ManualScheduler clock = new ManualScheduler();
+        List<TokenCallback> fetches = new CopyOnWriteArrayList<>();
+        Options options = recordingTokenOptions(fetches);
+        options.setMinReconnectDelay(1);
+        options.setMaxReconnectDelay(1);
+        newAuthClientOnClock(options, clock);
+        connect(client);
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+        clock.advance(1000);
+        awaitCondition("timer fetch started", () -> fetches.size() == 1);
+        int scheduled = clock.requestedDelays().size();
+        server.closeConnection();
+        awaitCondition("the reconnect is scheduled", () -> clock.requestedDelays().size() > scheduled);
+
+        client.setToken("token-C");
+        drainExecutor();
+        fetches.get(0).Done(null, "token-B");
+        drainExecutor();
+
+        clock.advance(2);
+        awaitCondition("reconnected", () -> client.getState() == ClientState.CONNECTED);
+        assertEquals("token-C", lastConnectRequest().getToken());
+    }
+
+
+    @Test
     public void refreshAfterCloseCallsBackWithAnError() throws Exception {
         newAuthClient(new Options());
         client.close(1000);
