@@ -45,7 +45,8 @@ import okhttp3.Response;
  * a call which its connection lost on a fresh connection, except in three cases where the outcome is known: the
  * connection closed for a frame over its size limit, or as unauthorized, or the connection was retired or went
  * stale (for example after an account switch). Those calls settle with the loss error and are not sent again.
- * So a call may run more than once when the server commits it and the reply is lost. The methods
+ * A lost call also settles with the loss error when its resends reach {@link Builder#retries} or its deadline has
+ * passed. So a call may run more than once when the server commits it and the reply is lost. The methods
  * of the calls must be idempotent; a method which is not should use an exactly-once call on the main client
  * instead. All the state
  * of the pool is confined to one thread of its own, and the callbacks run on that thread, as the
@@ -392,7 +393,8 @@ public final class RpcPool {
          *
          * <p>A pool and its client: the pool follows the client's connect and disconnect. A call made while the
          * client's session has ended as unauthorized fails at once, and a call made after the client connects again goes out.
-         * After a logout the idle connections of the pool are not closed at once: each closes at {@code idleTimeout}.
+         * After a logout the idle connections of the pool are not closed at once: each closes at {@code idleTimeout}, and
+         * with {@code idleTimeout} 0 it stays open until the pool is closed or the server ends it at its token's expiry.
          *
          * <p>The token is handed over unchanged, so the fleet must accept its claims as they are, including any channels or
          * subscriptions it carries. A fleet that refuses such a claim closes the connection with code 102: the pool reports the
@@ -553,7 +555,8 @@ public final class RpcPool {
          * dispatcher, the connection pool, TLS, the proxy and DNS. A redirect fetch runs with none of its interceptors,
          * network interceptors, cookie jar or authenticator, so an application credential of this client is never sent to
          * a redirect URL. A credential of a fetch goes with {@link Redirect.Builder#header}. Optional: without one, the
-         * redirect fetches share a default client of the process, and each connection builds its own.
+         * connections share a client of the process, whose dispatcher has no limit, and the redirect fetches share another
+         * client of the process, with OkHttp's default limits.
          */
         public Builder okHttpClient(OkHttpClient okHttpClient) {
             this.okHttpClient = okHttpClient;
@@ -615,8 +618,12 @@ public final class RpcPool {
     // How long the pool's thread stays without a task before it ends. A pending timer keeps it, whatever this is.
     private static final long POOL_THREAD_KEEP_ALIVE_MILLIS = 1000L;
 
-    // The client of the redirect fetches of the pools without an OkHttp client of their own, created on the first fetch.
+    // The client of the connections of the pools without an OkHttp client of their own, created on the first connection.
     private static OkHttpClient sharedHttpClient;
+
+    // The client of the redirect fetches of the pools without an OkHttp client of their own, created on the first fetch. Its
+    // dispatcher keeps OkHttp's default limits: the limits of the connections' dispatcher are lifted, and must not reach the fetches.
+    private static OkHttpClient sharedFetchHttpClient;
 
     private final EndpointResolver resolver;
     private final Options options;
@@ -757,12 +764,6 @@ public final class RpcPool {
     // The number of calls the pool resent after a connection lost them, read on its thread. For the tests.
     int lostResends() throws Exception {
         return executor.submit(() -> lostResends).get();
-    }
-
-
-    // The number of key queues the pool holds, read on its thread. For the tests.
-    int queueKeys() throws Exception {
-        return executor.submit(() -> queues.size()).get();
     }
 
 
@@ -1879,7 +1880,7 @@ public final class RpcPool {
     // fetch follows no redirect, and carries no interceptor, cookie or credential of the application.
     private OkHttpClient fetchClient() {
         if (fetchHttpClient == null) {
-            OkHttpClient base = httpClient != null ? httpClient : defaultHttpClient();
+            OkHttpClient base = httpClient != null ? httpClient : defaultFetchHttpClient();
             OkHttpClient.Builder builder = base.newBuilder();
             builder.interceptors().clear();
             builder.networkInterceptors().clear();
@@ -1907,6 +1908,15 @@ public final class RpcPool {
             sharedHttpClient = new OkHttpClient.Builder().dispatcher(dispatcher).build();
         }
         return sharedHttpClient;
+    }
+
+
+    // The client of the redirect fetches of the pools given none, shared by the process like the connections' client.
+    private static synchronized OkHttpClient defaultFetchHttpClient() {
+        if (sharedFetchHttpClient == null) {
+            sharedFetchHttpClient = new OkHttpClient();
+        }
+        return sharedFetchHttpClient;
     }
 
 

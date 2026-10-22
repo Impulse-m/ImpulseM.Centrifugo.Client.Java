@@ -9,8 +9,10 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -100,10 +102,10 @@ public class RpcPoolTest extends RpcTestBase {
             pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().endpointKey("key-" + i).build(), into(future));
         }
         awaitCondition("one waiting call per key", () -> pool.stats().getQueued() == 20);
-        assertEquals("each waiting key holds a queue", 20, pool.queueKeys());
+        assertEquals("each waiting key holds a queue", 20, queueKeysOf(pool));
         waiting.add(onWire);
         awaitAll(waiting, true);
-        assertEquals("a key whose queue drained holds no queue", 0, pool.queueKeys());
+        assertEquals("a key whose queue drained holds no queue", 0, queueKeysOf(pool));
     }
 
 
@@ -936,16 +938,35 @@ public class RpcPoolTest extends RpcTestBase {
     }
 
 
-    // The connections of the pool, read once the pool is steady: the pool's own thread owns them, and the test reads the map by reflection.
+    // The connections of the pool. The pool's own thread owns its endpoints, so the map is read by reflection on that thread.
     @SuppressWarnings("unchecked")
     private static List<RpcPoolConnection> connectionsOf(RpcPool pool) throws Exception {
         Field field = RpcPool.class.getDeclaredField("endpoints");
         field.setAccessible(true);
-        List<RpcPoolConnection> all = new ArrayList<>();
-        for (RpcPoolEndpoint endpoint : ((Map<String, RpcPoolEndpoint>) field.get(pool)).values()) {
-            all.addAll(endpoint.connections());
-        }
-        return all;
+        return onPoolThread(pool, () -> {
+            List<RpcPoolConnection> all = new ArrayList<>();
+            for (RpcPoolEndpoint endpoint : ((Map<String, RpcPoolEndpoint>) field.get(pool)).values()) {
+                all.addAll(endpoint.connections());
+            }
+            return all;
+        });
+    }
+
+
+    // The number of key queues the pool holds, read on its own thread by reflection.
+    private static int queueKeysOf(RpcPool pool) throws Exception {
+        Field field = RpcPool.class.getDeclaredField("queues");
+        field.setAccessible(true);
+        return onPoolThread(pool, () -> ((Map<?, ?>) field.get(pool)).size());
+    }
+
+
+    // Runs the read on the executor of the pool, the thread which owns its state, and returns what it reads.
+    private static <T> T onPoolThread(RpcPool pool, Callable<T> read) throws Exception {
+        Field field = RpcPool.class.getDeclaredField("executor");
+        field.setAccessible(true);
+        ScheduledThreadPoolExecutor executor = (ScheduledThreadPoolExecutor) field.get(pool);
+        return executor.submit(read).get();
     }
 
 
