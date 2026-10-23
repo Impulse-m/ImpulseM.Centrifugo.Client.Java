@@ -415,7 +415,7 @@ public class RpcPoolTest extends RpcTestBase {
         pool.rpc("svc.read", EMPTY_PAYLOAD, null, into(waiting));
         awaitCondition("one call on the wire", () -> pool.stats().getInflight() == 1);
         pool.close();
-        assertEquals(ReplyError.CANCELLED, replyErrorOf(waiting).getCode());
+        assertEquals("the waiting call is rejected with the closed code", RpcPool.CLOSED_CODE, replyErrorOf(waiting).getCode());
         assertTrue("the call on the wire fails with the closed connection", failsWithIOException(onWire));
     }
 

@@ -52,7 +52,7 @@ import okhttp3.Response;
  * instead. All the state
  * of the pool is confined to one thread of its own, and the callbacks run on that thread, as the
  * callbacks of a {@link Client} run on its executor. The one exception is a call made after {@link #close()}:
- * its callback runs at once on the calling thread, with {@link ReplyError#CANCELLED}.
+ * its callback runs at once on the calling thread, with the closed code 4.
  */
 public final class RpcPool {
 
@@ -67,6 +67,9 @@ public final class RpcPool {
      * its limit, or a URL the endpoint does not allow. A server never sends this code.
      */
     public static final int REDIRECT_FAILED = 18;
+
+    // The code of a call on a closed pool, the client-closed code of the other SDKs.
+    static final int CLOSED_CODE = 4;
 
     /** Resolves an endpoint key to the endpoints of its connections. */
     public interface EndpointResolver {
@@ -353,6 +356,7 @@ public final class RpcPool {
         private int maxInflightPerConnection = 1;
         private int maxQueued = 64;
         private long idleTimeout = 60_000L;
+        private boolean closeEndedSession = true;
         private boolean removeCancelledTimers = true;
         private int retries = RpcSession.LATER_RESENDS;
         private Function<ReplyError, String> reroute;
@@ -498,6 +502,17 @@ public final class RpcPool {
 
 
         /**
+         * Whether the connections of the pool are retired when the session of the main client ends as unauthorized: an
+         * idle connection closes at once, a busy one when its call settles. True by default, so a logged-out application
+         * keeps no connection with the identity it logged out of. With false, the connections close at the idle timeout.
+         */
+        public Builder closeEndedSession(boolean closeEndedSession) {
+            this.closeEndedSession = closeEndedSession;
+            return this;
+        }
+
+
+        /**
          * Resends of a call, counted together over a lost connection, a later refusal and a reroute. Default 3,
          * the count of the client for a later refusal.
          */
@@ -636,6 +651,7 @@ public final class RpcPool {
     private final int maxInflightPerConnection;
     private final int maxQueued;
     private final long idleTimeoutMillis;
+    private final boolean closeEndedSession;
     private final boolean removeCancelledTimers;
     private final int retries;
     private final Function<ReplyError, String> reroute;
@@ -702,7 +718,7 @@ public final class RpcPool {
         if (source != null && source.mainState() == TokenSource.Phase.CONNECTED) {
             call.generation = source.generation();
         }
-        Extensions.submitOrRun(executor, () -> start(call), () -> call.callback.onDone(cancelled(), null));
+        Extensions.submitOrRun(executor, () -> start(call), () -> call.callback.onDone(closedError(), null));
         return new Call(this, call);
     }
 
@@ -727,8 +743,8 @@ public final class RpcPool {
 
 
     /**
-     * Closes every connection and rejects the calls: the calls waiting for a connection with
-     * {@link ReplyError#CANCELLED}, the calls on the wire with an {@link IOException}. The pool takes no
+     * Closes every connection and rejects the calls: the calls waiting for a connection with the closed code 4, the calls
+     * on the wire with an {@link IOException}. The pool takes no
      * calls afterwards.
      */
     public void close() {
@@ -749,13 +765,50 @@ public final class RpcPool {
 
 
     // The main client's event reached a pool which has calls in a key line: each key with calls waiting is drained, and no other.
+    // With closeEndedSession, the event of an ended session retires the connections of the pool.
     void onMainEvent() {
-        if (closed || waitingKeys.isEmpty()) {
+        if (closed) {
             return;
+        }
+        if (closeEndedSession && source != null && source.mainState() == TokenSource.Phase.ENDED) {
+            retireEndedConnections();
         }
         for (String key : waitingKeys.toArray(new String[0])) {
             pumpKey(key);
         }
+    }
+
+
+    // The session ended as unauthorized: every connection is retired, so an idle one closes now and a busy one when its call settles.
+    private void retireEndedConnections() {
+        for (RpcPoolEndpoint endpoint : endpoints.values()) {
+            for (RpcPoolConnection conn : new ArrayList<>(endpoint.connections())) {
+                retire(conn);
+            }
+        }
+    }
+
+
+    // The pool listens to its source while a call waits for a key, and with closeEndedSession while it holds a connection.
+    private void updateListening() {
+        if (source == null || closed) {
+            return;
+        }
+        if (!waitingKeys.isEmpty() || (closeEndedSession && hasConnections())) {
+            source.listen(this);
+        } else {
+            source.unlisten(this);
+        }
+    }
+
+
+    private boolean hasConnections() {
+        for (RpcPoolEndpoint endpoint : endpoints.values()) {
+            if (!endpoint.connections().isEmpty()) {
+                return true;
+            }
+        }
+        return false;
     }
 
 
@@ -908,6 +961,7 @@ public final class RpcPool {
         this.maxInflightPerConnection = builder.maxInflightPerConnection;
         this.maxQueued = builder.maxQueued;
         this.idleTimeoutMillis = builder.idleTimeout;
+        this.closeEndedSession = builder.closeEndedSession;
         this.removeCancelledTimers = builder.removeCancelledTimers;
         this.retries = builder.retries;
         this.reroute = builder.reroute;
@@ -967,6 +1021,12 @@ public final class RpcPool {
     }
 
 
+    // The error of a call on a closed pool: the client-closed code 4 of the other SDKs, not the cancel code.
+    private static ReplyError closedError() {
+        return new ReplyError(CLOSED_CODE, "rpc pool is closed", false);
+    }
+
+
     // Holds the opens of the endpoint for the next backoff delay, which grows with each close until a connection connects.
     private void hold(RpcPoolEndpoint endpoint) {
         long delayMillis = BACKOFF.duration(endpoint.closes, options.getMinReconnectDelay(), options.getMaxReconnectDelay());
@@ -988,7 +1048,7 @@ public final class RpcPool {
     // and then the placement or the queue bound.
     private void start(RpcPoolCall call) {
         if (closed) {
-            settle(call, null, cancelled());
+            settle(call, null, closedError());
             return;
         }
         if (source != null) {
@@ -1250,6 +1310,7 @@ public final class RpcPool {
     private void open(RpcPoolEndpoint endpoint) {
         RpcPoolConnection conn = new RpcPoolConnection(this, endpoint, options, source);
         endpoint.connections().add(conn);
+        updateListening();
         markIdle(conn);
         conn.connect();
     }
@@ -1519,13 +1580,11 @@ public final class RpcPool {
             }
         }
         if (waiting) {
-            boolean wasEmpty = waitingKeys.isEmpty();
-            if (waitingKeys.add(endpointKey) && wasEmpty && source != null) {
-                source.listen(this);
-            }
-        } else if (waitingKeys.remove(endpointKey) && waitingKeys.isEmpty() && source != null) {
-            source.unlisten(this);
+            waitingKeys.add(endpointKey);
+        } else {
+            waitingKeys.remove(endpointKey);
         }
+        updateListening();
     }
 
 
@@ -1819,6 +1878,7 @@ public final class RpcPool {
         if (source != null) {
             source.forget(conn);
         }
+        updateListening();
         conn.close();
     }
 
@@ -1836,7 +1896,7 @@ public final class RpcPool {
             // A call waiting for a redirect fetch slot counts as in flight: close settles it with the closed error, as it settles a
             // running fetch.
             boolean inFlight = call.connection != null || call.redirectCall != null || call.queue == redirectWaiting;
-            settle(call, null, inFlight ? new IOException("rpc pool closed") : cancelled());
+            settle(call, null, inFlight ? new IOException("rpc pool closed") : closedError());
         }
         for (RpcPoolEndpoint endpoint : endpoints.values()) {
             for (RpcPoolConnection conn : new ArrayList<>(endpoint.connections())) {

@@ -136,6 +136,28 @@ public class RpcPoolTokenTest extends RpcTestBase {
     }
 
 
+    // The session ends as unauthorized while the pool holds an idle connection: with closeEndedSession (the default), the
+    // connection closes at once, not at the idle timeout, which is an hour here.
+    @Test
+    public void poolClosesIdleConnectionsOfAnEndedSession() throws Exception {
+        serveMain();
+        FakeCentrifugoServer endpoint = newPoolServer();
+        serveFleet(endpoint);
+        firstTtl = 1;
+        Storage storage = new Storage("refresh-1");
+        Client main = exchangeClient(storage, null);
+        connect(main);
+        RpcPool pool = build(builderOn(main, endpoint).idleTimeout(3_600_000L));
+        assertEquals("payload", payloadOf(submit(pool)));
+        awaitCondition("one idle connection", () -> pool.stats().getConnections() == 1);
+
+        storage.refreshToken = null;
+
+        awaitCondition("the session ended", () -> main.getState() == ClientState.DISCONNECTED);
+        awaitCondition("the idle connection of the ended session is closed", () -> pool.stats().getConnections() == 0);
+    }
+
+
     // T3
     @Test
     public void holdsUnboundCallUntilMainConnects() throws Exception {
@@ -942,8 +964,8 @@ public class RpcPoolTokenTest extends RpcTestBase {
         recordAnswers(main, answers);
         pool.close();
         assertEquals("rpc pool closed", errorOf(inFlight).getMessage());
-        assertEquals("queued call is cancelled", ReplyError.CANCELLED, ((ReplyError) errorOf(queued)).getCode());
-        assertEquals("call waiting for its connection is cancelled", ReplyError.CANCELLED, ((ReplyError) errorOf(waitingCall)).getCode());
+        assertEquals("queued call is rejected with the closed code", RpcPool.CLOSED_CODE, ((ReplyError) errorOf(queued)).getCode());
+        assertEquals("call waiting for its connection is rejected with the closed code", RpcPool.CLOSED_CODE, ((ReplyError) errorOf(waitingCall)).getCode());
         awaitCondition("the waiting request was answered and left", () -> waitingCountOf(main) == 0);
         awaitCondition("the waiting request was answered unauthorized", () -> answers.size() == 1 && answers.get(0) instanceof UnauthorizedException);
         awaitCondition("the source no longer lists the closed pool", () -> listeningOf(main).isEmpty());
