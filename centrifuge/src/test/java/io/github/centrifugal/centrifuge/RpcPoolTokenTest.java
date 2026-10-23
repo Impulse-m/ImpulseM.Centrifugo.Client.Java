@@ -103,6 +103,32 @@ public class RpcPoolTokenTest extends RpcTestBase {
     }
 
 
+    // The admission order of a call: a closed pool answers closed, an ended session answers unauthorized, a disconnected
+    // main client answers client disconnected, and each of them comes before the options, which here are invalid (a
+    // negative timeout; a zero one is the pool's timeout).
+    @Test
+    public void poolAdmissionOrderIsClosedEndedDisconnectedThenOptions() throws Exception {
+        serveMain();
+        FakeCentrifugoServer endpoint = newPoolServer();
+        serveFleet(endpoint);
+        firstTtl = 1;
+        Storage storage = new Storage("refresh-1");
+        Client main = exchangeClient(storage, null);
+        connect(main);
+        RpcPool pool = build(builderOn(main, endpoint));
+        storage.refreshToken = null;
+        awaitCondition("the session ended", () -> main.getState() == ClientState.DISCONNECTED);
+        assertEquals("the ended session is answered before the options", "unauthorized", errorOf(submitWithTimeout(pool, -1)).getMessage());
+        pool.close();
+        assertEquals("the closed pool is answered before the ended session", "rpc pool is closed", errorOf(submitWithTimeout(pool, -1)).getMessage());
+
+        Client disconnected = clientWithToken(ACCESS_TOKEN);
+        RpcPool other = build(builderOn(disconnected, endpoint));
+        assertEquals("the disconnected main client is answered before the options", "client disconnected", errorOf(submitWithTimeout(other, -1)).getMessage());
+        assertEquals("no connection was opened", 0, connectTokensOf(endpoint).size());
+    }
+
+
     // T2
     @Test
     public void refusesCallAfterLogoutUntilConnectAttempt() throws Exception {
@@ -1545,6 +1571,13 @@ public class RpcPoolTokenTest extends RpcTestBase {
         } catch (IllegalArgumentException expected) {
             assertEquals("tokenFrom is exclusive with token and tokenGetter", expected.getMessage());
         }
+    }
+
+
+    private static CompletableFuture<RPCResult> submitWithTimeout(RpcPool pool, long timeoutMillis) {
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, RpcPool.CallOptions.builder().timeout(timeoutMillis).build(), into(future));
+        return future;
     }
 
 
