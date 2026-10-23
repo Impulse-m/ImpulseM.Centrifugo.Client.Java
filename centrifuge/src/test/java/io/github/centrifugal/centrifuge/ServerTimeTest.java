@@ -3,7 +3,7 @@ package io.github.centrifugal.centrifuge;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
@@ -58,7 +58,7 @@ public class ServerTimeTest extends FakeServerTestBase {
 
     @Test
     public void lateReplyToATimedOutCallDoesNotSetTheOffset() throws Exception {
-        AtomicLong silentId = new AtomicLong();
+        AtomicInteger silentId = new AtomicInteger();
         server.onCommand = cmd -> {
             if (cmd.hasRpc()) {
                 silentId.set(cmd.getId());
@@ -75,7 +75,7 @@ public class ServerTimeTest extends FakeServerTestBase {
             // The call settled with its timeout before the late reply arrives.
         }
 
-        long lateId = silentId.get();
+        int lateId = silentId.get();
         CompletableFuture<Void> applied = new CompletableFuture<>();
         c.getExecutor().execute(() -> {
             try {
