@@ -38,6 +38,10 @@ final class Extensions {
     private static final Pattern INSTANCE_PATTERN = Pattern.compile("[A-Za-z0-9_-]{22,64}");
 
 
+    // A server time further than this from the local clock is ignored: 365 days in milliseconds.
+    static final long MAX_SERVER_TIME_SKEW_MILLIS = 365L * 24L * 60L * 60L * 1000L;
+
+
     /** Whether the bit {@code flag} is set in the bitmask {@code flags}. */
     static boolean hasFlag(long flags, long flag) {
         return (flags & flag) != 0;
@@ -47,10 +51,14 @@ final class Extensions {
     /**
      * Offset of the server clock from the local clock, from the server time of a reply and
      * the local time it arrived at. Null when the reply carries no server time: the proto
-     * zero value (0) means unset.
+     * zero value (0) means unset. Null too when the server time is more than a year away from
+     * the local clock: such a value is not a clock, and the previous offset is kept.
      */
     static Long serverTimeOffsetFrom(long serverTime, long localTime) {
         if (serverTime == 0) {
+            return null;
+        }
+        if (serverTime < localTime - MAX_SERVER_TIME_SKEW_MILLIS || serverTime > localTime + MAX_SERVER_TIME_SKEW_MILLIS) {
             return null;
         }
         return serverTime - localTime;

@@ -21,6 +21,7 @@ import static org.junit.Assert.fail;
 public class ServerTimeTest extends FakeServerTestBase {
     private static final long LOCAL_MILLIS = 1_700_000_000_000L;
     private static final long SERVER_AHEAD_MILLIS = 60_000L;
+    private static final long DAY_MILLIS = 24L * 60L * 60L * 1000L;
 
 
     @Test
@@ -80,6 +81,43 @@ public class ServerTimeTest extends FakeServerTestBase {
             try {
                 c.processReply(Protocol.Reply.newBuilder()
                         .setId(lateId)
+                        .setTime(LOCAL_MILLIS + SERVER_AHEAD_MILLIS)
+                        .build());
+                applied.complete(null);
+            } catch (Exception e) {
+                applied.completeExceptionally(e);
+            }
+        });
+        applied.get(5, TimeUnit.SECONDS);
+
+        assertEquals(LOCAL_MILLIS, c.serverTimeMillis());
+    }
+
+
+    @Test
+    public void serverTimeIgnoresAnImplausibleReplyTime() throws Exception {
+        answerRpcs("", LOCAL_MILLIS + SERVER_AHEAD_MILLIS);
+        Client c = connectWithFixedClock();
+        rpcAndWait(c);
+        long[] implausible = {Long.MAX_VALUE, Long.MIN_VALUE, LOCAL_MILLIS + 400L * DAY_MILLIS};
+
+        for (long time : implausible) {
+            answerRpcs("", time);
+            rpcAndWait(c);
+
+            assertEquals(LOCAL_MILLIS + SERVER_AHEAD_MILLIS, c.serverTimeMillis());
+        }
+    }
+
+
+    @Test
+    public void serverTimeIsTakenOnlyFromReplies() throws Exception {
+        Client c = connectWithFixedClock();
+        CompletableFuture<Void> applied = new CompletableFuture<>();
+        c.getExecutor().execute(() -> {
+            try {
+                // A reply without a command id is a server ping or a push: it never sets the offset.
+                c.processReply(Protocol.Reply.newBuilder()
                         .setTime(LOCAL_MILLIS + SERVER_AHEAD_MILLIS)
                         .build());
                 applied.complete(null);
