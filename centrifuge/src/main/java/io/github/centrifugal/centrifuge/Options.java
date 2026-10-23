@@ -232,6 +232,21 @@ public class Options {
 
     private int tokenRetryCap = 300000;
 
+    /**
+     * Whether a timer refresh refused with 109 (token expired) is not sent again with the same token. When the token
+     * getter returns the refused token, no retry is armed: the client refreshes on its next connect, and the application
+     * is expected to hand out a new token. True by default. Set it to false to retry the same token on the backoff.
+     */
+    public boolean isStopOnRefusedToken() {
+        return stopOnRefusedToken;
+    }
+
+    public void setStopOnRefusedToken(boolean stopOnRefusedToken) {
+        this.stopOnRefusedToken = stopOnRefusedToken;
+    }
+
+    private boolean stopOnRefusedToken = true;
+
     public OkHttpClient getOkHttpClient() {
         return this.okHttpClient;
     }

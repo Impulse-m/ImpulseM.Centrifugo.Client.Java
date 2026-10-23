@@ -49,7 +49,7 @@ final class AuthRefresh {
 
     // A refused transition keeps the connection and its identity, and is reported without a
     // retry. A token which expired is retried by the timer with a fresh token.
-    private static final int PERMISSION_DENIED = 103;
+    static final int PERMISSION_DENIED = 103;
 
     // Server error code of an expired connection token: the timer refresh retries it with a fresh token.
     static final int ERROR_CODE_TOKEN_EXPIRED = 109;
@@ -75,6 +75,10 @@ final class AuthRefresh {
     private final Backoff backoff = new Backoff();
     // The failed timer refreshes in a row, which set the ceiling of the next retry. A successful expiry schedule clears it.
     private int retryStep;
+    // Whether a token refused with 109 by a timer refresh is not sent again, see Options.setStopOnRefusedToken.
+    private final boolean stopOnRefusedToken;
+    // The token the server refused with 109 in the last timer refresh; null when none was refused since the last success.
+    private String refusedTimerToken;
     // Null without a token exchange option: the connection token is then fetched by the token getter.
     private final TokenExchangeFlow flow;
     // The refresh in flight is the one which runs now. The refreshes waiting for it run in order.
@@ -118,11 +122,12 @@ final class AuthRefresh {
     private final AtomicReference<TokenSource> tokenSource = new AtomicReference<>();
 
 
-    AuthRefresh(ClientHost host, int retryMinMillis, int retryMaxMillis, int retryCapMillis) {
+    AuthRefresh(ClientHost host, int retryMinMillis, int retryMaxMillis, int retryCapMillis, boolean stopOnRefusedToken) {
         this.host = host;
         this.retryMinMillis = retryMinMillis;
         this.retryMaxMillis = retryMaxMillis;
         this.retryCapMillis = retryCapMillis;
+        this.stopOnRefusedToken = stopOnRefusedToken;
         this.flow = TokenExchangeFlow.create(host);
     }
 
@@ -389,18 +394,21 @@ final class AuthRefresh {
         // Without a cap above the maximum the step stays 0, so the delay is the flat one of the retry bounds.
         boolean grows = retryCapMillis > retryMaxMillis;
         int step = grows ? retryStep : 0;
-        scheduleTimer(backoff.duration(step, retryMinMillis, retryCeilingMillis(step)), TimeUnit.MILLISECONDS);
+        scheduleTimer(backoff.duration(step, retryMinMillis, retryCeilingMillis(step, retryMaxMillis, retryCapMillis)), TimeUnit.MILLISECONDS);
         if (grows) {
             retryStep = Math.min(retryStep + 1, RETRY_MAX_STEP);
         }
     }
 
 
-    // The ceiling of the retry delay after the given number of failures in a row: the maximum for the first, doubling with
-    // each failure up to the cap. A maximum above the cap is kept.
-    private int retryCeilingMillis(int step) {
-        long grown = (long) retryMaxMillis << step;
-        return (int) Math.max(retryMaxMillis, Math.min(retryCapMillis, grown));
+    /**
+     * The ceiling of a refresh retry delay after the given number of failures in a row: the maximum for the first,
+     * doubling with each failure up to the cap. A maximum above the cap is kept. Shared by the connection and the
+     * subscription refresh retries, so that they cannot disagree.
+     */
+    static int retryCeilingMillis(int step, int maxMillis, int capMillis) {
+        long grown = (long) maxMillis << step;
+        return (int) Math.max(maxMillis, Math.min(capMillis, grown));
     }
 
 
@@ -502,6 +510,11 @@ final class AuthRefresh {
                 host.failUnauthorized();
                 return;
             }
+            // The server refused this token with 109 already: it is not sent again, and no retry is armed.
+            if (stopOnRefusedToken && token.equals(refusedTimerToken)) {
+                host.setRefreshRequired(true);
+                return;
+            }
             commandInFlight = true;
             sendRefreshCommand(token, (Throwable error, Protocol.RefreshResult result) -> runOnExecutorOrInline(() -> finishTimer(transport, token, error, result)));
             awaitingCommand = true;
@@ -533,12 +546,16 @@ final class AuthRefresh {
             if (error == null) {
                 host.storeToken(token);
                 timerSuperseded = false;
+                refusedTimerToken = null;
                 refreshGeneration++;
                 scheduleExpiry(result.getExpires(), result.getTtl());
                 applyAuth(result.getUser(), result.getAuthClass(), false);
                 return;
             }
             failed = true;
+            if (error instanceof ReplyError && ((ReplyError) error).getCode() == ERROR_CODE_TOKEN_EXPIRED) {
+                refusedTimerToken = token;
+            }
             try {
                 host.reportError(new RefreshError(error));
             } finally {

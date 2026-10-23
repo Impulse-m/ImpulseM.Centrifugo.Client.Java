@@ -277,6 +277,96 @@ public class AuthTest extends RpcTestBase {
     }
 
 
+    // The getter returns the token the server refused with 109: its retry fetches it again, and it is not sent again.
+    @Test
+    public void refusedTokenIsNotSentAgainWithStopOnRefusedToken() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        AtomicInteger fetches = new AtomicInteger();
+        Options options = new Options();
+        options.setToken("token-initial");
+        options.setTokenGetter(new ConnectionTokenGetter() {
+            @Override
+            public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
+                fetches.incrementAndGet();
+                cb.Done(null, "same-token");
+            }
+        });
+        ManualScheduler clock = new ManualScheduler();
+        newAuthClientOnClock(options, clock);
+        connect(client);
+        server.onCommand = (Protocol.Command cmd) -> {
+            if (!cmd.hasRefresh()) {
+                return null;
+            }
+            return Protocol.Reply.newBuilder()
+                    .setId(cmd.getId())
+                    .setError(Protocol.Error.newBuilder().setCode(TOKEN_EXPIRED).setMessage("token expired"))
+                    .build();
+        };
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+        clock.advance(1000);
+        awaitCondition("refused refresh sent", () -> refreshTokens().size() == 1);
+        awaitCondition("refusal reported", () -> !errorEvents.isEmpty());
+        drainExecutor();
+        // The refusal armed its retry, the last delay the clock was asked for.
+        int scheduled = clock.requestedDelays().size();
+        long retryDelay = clock.requestedDelays().get(scheduled - 1);
+
+        clock.advance(retryDelay);
+        awaitCondition("the retry fetched the token again", () -> fetches.get() == 2);
+        drainExecutor();
+
+        assertEquals("the refused token is not sent again", 1, refreshTokens().size());
+        assertEquals("no retry is armed after it", scheduled, clock.requestedDelays().size());
+        assertTrue("the next connect refreshes", client.refreshRequired);
+    }
+
+
+    // A token fetch which fails with a transport error is retried on the refresh backoff, not on a flat delay.
+    @Test
+    public void timerRefreshWithATransportErrorIsRetriedWithTheSameBackoff() throws Exception {
+        server.connectResult = expiringResult("u1", "authenticated", 1);
+        AtomicInteger fetches = new AtomicInteger();
+        Options options = new Options();
+        options.setToken("token-initial");
+        options.setTokenGetter(new ConnectionTokenGetter() {
+            @Override
+            public void getConnectionToken(ConnectionTokenEvent event, TokenCallback cb) {
+                if (fetches.incrementAndGet() == 1) {
+                    cb.Done(new IOException("transport down"), null);
+                    return;
+                }
+                cb.Done(null, "token-" + fetches.get());
+            }
+        });
+        ManualScheduler clock = new ManualScheduler();
+        client = new Client(server.url(), options, authListener(), AuthRefresh.RETRY_MIN_MILLIS, AuthRefresh.RETRY_MAX_MILLIS, clock, new Random());
+        connect(client);
+        server.onCommand = (Protocol.Command cmd) -> {
+            if (!cmd.hasRefresh()) {
+                return null;
+            }
+            return Protocol.Reply.newBuilder()
+                    .setId(cmd.getId())
+                    .setRefresh(Protocol.RefreshResult.newBuilder().setUser("u1").setAuthClass("authenticated").setExpires(true).setTtl(1))
+                    .build();
+        };
+        awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
+        clock.advance(1000);
+        awaitCondition("the failed fetch is reported", () -> !errorEvents.isEmpty());
+        drainExecutor();
+        long retryDelay = clock.requestedDelays().get(clock.requestedDelays().size() - 1);
+        assertTrue("the retry waits on the backoff, not a flat delay: " + retryDelay,
+                retryDelay >= AuthRefresh.RETRY_MIN_MILLIS && retryDelay <= AuthRefresh.RETRY_MAX_MILLIS);
+
+        clock.advance(retryDelay);
+        awaitCondition("the retry refreshes with a fresh token", () -> refreshTokens().size() == 1);
+
+        assertEquals(Arrays.asList("token-2"), refreshTokens());
+        assertEquals(ClientState.CONNECTED, client.getState());
+    }
+
+
     @Test
     public void timerRefreshRefusedWithAnotherCodeDisconnectsWithIt() throws Exception {
         server.connectResult = expiringResult("u1", "authenticated", 1);

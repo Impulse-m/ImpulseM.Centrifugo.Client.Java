@@ -248,7 +248,7 @@ public class Client {
         ClientHost host = new ClientHost(this);
         this.host = host;
         this.rpcSession = new RpcSession(host, opts.getMaxPendingRpc(), rpcResendDraws);
-        this.auth = new AuthRefresh(host, authRetryMinMillis, authRetryMaxMillis, opts.getTokenRetryCap());
+        this.auth = new AuthRefresh(host, authRetryMinMillis, authRetryMaxMillis, opts.getTokenRetryCap(), opts.isStopOnRefusedToken());
         this.token = opts.getToken();
         if (opts.getData() != null) {
             this.data = com.google.protobuf.ByteString.copyFrom(opts.getData());
