@@ -65,6 +65,8 @@ public class ServerTimeTest extends FakeServerTestBase {
             }
             return null;
         };
+        // The fake server answers any command it does not hold, so the rpc is held to stay silent.
+        server.deferCommand = cmd -> cmd.hasRpc();
         Client c = connectWithFixedClock();
         CompletableFuture<RPCResult> future = new CompletableFuture<>();
         c.rpc("method", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(100).build(), into(future));
