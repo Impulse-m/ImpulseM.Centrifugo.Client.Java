@@ -2566,7 +2566,7 @@ public class TokenExchangeTest extends RpcTestBase {
 
 
     @Test
-    public void constructorRejectsTokenExchangeWithTokenGetter() throws Exception {
+    public void tokenExchangeAndTokenGetterAreExclusive() throws Exception {
         Options options = exchangeOptions(new Storage("refresh-1"));
         options.setTokenGetter(new ConnectionTokenGetter() {
         });
