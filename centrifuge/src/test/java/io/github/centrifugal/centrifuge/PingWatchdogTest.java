@@ -56,7 +56,7 @@ public class PingWatchdogTest extends RpcTestBase {
     // With no reply after the last one at L, the connection closes at the second empty check, within the bounds of
     // assertClosedWithinBounds, whichever kind the last reply is. Each kind runs on its own connection.
     @Test
-    public void silenceAfterAnyReplyClosesWithinTheBounds() throws Exception {
+    public void silenceAfterAnyReplyClosesWithinOneWindow() throws Exception {
         for (ReplyKind kind : ReplyKind.values()) {
             Client c = connectOnClock();
             assertClosedWithinBounds(c, 5_000L, kind);

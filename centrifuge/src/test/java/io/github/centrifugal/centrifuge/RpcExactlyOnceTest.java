@@ -633,7 +633,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void cancelAfterSendStopsTheCallOnTheServer() throws Exception {
+    public void abortOfASentCallSendsACancelAndRejectsCancelled() throws Exception {
         enableRpcOptions();
         serveDedup();
         Client c = newClient();
@@ -1256,7 +1256,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
     // A call which was never written, queued before the client first connected, goes out as a first send.
     @Test
-    public void aCallQueuedBeforeTheFirstConnectIsSentAsAFirstSend() throws Exception {
+    public void aCallDroppedFromTheBatchBeforeItsWriteIsSentAsAFirstSend() throws Exception {
         enableRpcOptions();
         answerRpcs("ok");
         Client c = newClient();
@@ -1273,7 +1273,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void callsWithoutAnInstanceHaveNoBound() throws Exception {
+    public void withoutAnInstanceThereIsNoBound() throws Exception {
         enableRpcOptions();
         answerRpcs("ok");
         Options options = new Options();
@@ -1360,7 +1360,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void msgIdRefusalIsResentWithANewMsgId() throws Exception {
+    public void aRefusalWithTheNewMsgIdSignalIsSentAgainWithANewId() throws Exception {
         enableRpcOptions();
         AtomicLong serverTime = new AtomicLong(System.currentTimeMillis() - 120_000L);
         refuseCalls(1, MSG_ID_INVALID, Extensions.RPC_RETRY_NEW_MSG_ID, serverTime);
@@ -1434,7 +1434,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void msgIdRefusedThreeTimesSurfacesTheErrorWithItsMetadata() throws Exception {
+    public void threeRefusalsWithTheNewMsgIdSignalSurfaceTheError() throws Exception {
         enableRpcOptions();
         refuseCalls(3, MSG_ID_INVALID, Extensions.RPC_RETRY_NEW_MSG_ID, new AtomicLong(System.currentTimeMillis()));
         Client c = newClient();
@@ -1455,7 +1455,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void laterRefusalIsResentWithTheSameMsgIdAfterTheDelay() throws Exception {
+    public void aRefusalWithTheLaterSignalIsSentAgainWithTheSameMsgIdAfterItsDelay() throws Exception {
         enableRpcOptions();
         refuseCalls(1, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
         ManualScheduler clock = new ManualScheduler();
@@ -1524,7 +1524,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void laterRefusedFourTimesSurfacesTheError() throws Exception {
+    public void fourRefusalsWithTheLaterSignalSurfaceTheError() throws Exception {
         enableRpcOptions();
         refuseCalls(4, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
         Client c = newClient();
@@ -1562,7 +1562,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void temporaryRefusalWithoutTheKeyIsSurfacedAtOnce() throws Exception {
+    public void aRefusalWithNoSignalIsSurfacedAtOnce() throws Exception {
         enableRpcOptions();
         refuseCalls(1, TEMPORARY, null, new AtomicLong(System.currentTimeMillis()));
         Client c = newClient();
@@ -1579,7 +1579,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void laterDelayAcrossADroppedTransportIsResentOnReconnect() throws Exception {
+    public void aResendCrossingALostConnectionGoesOutWithTheReconnect() throws Exception {
         enableRpcOptions();
         refuseCalls(1, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
         // The resend waits its whole 250 ms bound, so the transport drops while the delay runs. A jittered draw
@@ -1662,7 +1662,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void laterRefusalWhoseDelayWouldReachTheDeadlineIsCappedAtTheDeadline() throws Exception {
+    public void theDeadlineDuringTheDelayRejectsWithTimeoutAndSendsACancel() throws Exception {
         enableRpcOptions();
         refuseCalls(1, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
         ManualScheduler clock = new ManualScheduler();

@@ -45,7 +45,7 @@ public class PublishDebounceTest extends RpcTestBase {
 
 
     @Test
-    public void firstPublishIsSentAtOnceAndWindowCoalescesTheRest() throws Exception {
+    public void publishFirstIsSentAtOnceAndWindowCoalescesTheRest() throws Exception {
         startDebounced(DEBOUNCE_MILLIS);
 
         CompletableFuture<PublishResult> first = publish("1");
