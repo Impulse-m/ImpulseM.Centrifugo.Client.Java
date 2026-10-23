@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd" xmlns="http://maven.apache.org/POM/4.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <!-- This module was also published with a richer model, Gradle metadata,  -->
+  <!-- which should be used instead. Do not delete the following line which  -->
+  <!-- is to indicate to Gradle or any Gradle module metadata file consumer  -->
+  <!-- that they should prefer consuming it instead. -->
+  <!-- do_not_remove: published-with-gradle-metadata -->
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.github.Impulse-m</groupId>
+  <artifactId>ImpulseM.Centrifugo.Client.Java</artifactId>
+  <version>1.7.1</version>
+  <name>Centrifuge Java</name>
+  <description>Android and General Java client for Centrifugo server and Centrifuge library</description>
+  <url>https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java</url>
+  <licenses>
+    <license>
+      <name>MIT License</name>
+      <url>http://www.opensource.org/licenses/mit-license.php</url>
+    </license>
+  </licenses>
+  <developers>
+    <developer>
+      <id>FZambia</id>
+      <name>Alexander Emelin</name>
+      <email>frvzmb@gmail.com</email>
+    </developer>
+  </developers>
+  <scm>
+    <connection>scm:git:https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java.git</developerConnection>
+    <url>https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java</url>
+  </scm>
+  <dependencies>
+    <dependency>
+      <groupId>com.squareup.okhttp3</groupId>
+      <artifactId>okhttp</artifactId>
+      <version>4.12.0</version>
+      <scope>compile</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.google.protobuf</groupId>
+      <artifactId>protobuf-javalite</artifactId>
+      <version>3.25.5</version>
+      <scope>runtime</scope>
+    </dependency>
+    <dependency>
+      <groupId>net.sourceforge.streamsupport</groupId>
+      <artifactId>streamsupport-minifuture</artifactId>
+      <version>1.7.4</version>
+      <scope>runtime</scope>
+    </dependency>
+  </dependencies>
+</project>
