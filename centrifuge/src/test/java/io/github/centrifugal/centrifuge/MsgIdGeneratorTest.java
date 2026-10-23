@@ -9,6 +9,7 @@ import org.junit.Test;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 
 /** Unit tests of the msg_id generator. The lanes are scripted, so every msg_id is known. */
@@ -180,6 +181,43 @@ public class MsgIdGeneratorTest {
         long msgId = generator.next((MsgIdGenerator.MAX_SECONDS + 1L) * 1000L);
 
         assertEquals((MsgIdGenerator.MAX_SECONDS << MsgIdGenerator.SEQUENCE_BITS) | 1L, msgId);
+    }
+
+
+    @Test
+    public void generatorRefusesWhenTheLargestSecondIsExhausted() {
+        long lane = 5L;
+        MsgIdGenerator generator = new MsgIdGenerator(lanes((int) lane));
+        long largestMillis = MsgIdGenerator.MAX_SECONDS * 1000L;
+        for (long i = 0L; i < MsgIdGenerator.SEQUENCE_LIMIT - lane; i++) {
+            generator.next(largestMillis);
+        }
+
+        try {
+            generator.next(largestMillis);
+            fail("the largest second has issued every sequence value");
+        } catch (IllegalStateException expected) {
+            // Refused, as the JS SDK (RangeError) and the Swift SDK (configurationError) refuse.
+        }
+    }
+
+
+    @Test
+    public void laneIsDrawnFromTheNineteenBitsRange() {
+        final int[] drawnBound = {0};
+        Random highest = new Random() {
+            @Override
+            public int nextInt(int bound) {
+                drawnBound[0] = bound;
+                return bound - 1;
+            }
+        };
+
+        long highestLane = new MsgIdGenerator(highest).next(SERVER_MILLIS) & (MsgIdGenerator.SEQUENCE_LIMIT - 1);
+
+        assertEquals(1 << 19, drawnBound[0]);
+        assertEquals((1L << 19) - 1L, highestLane);
+        assertEquals(0L, new MsgIdGenerator(lanes(0)).next(SERVER_MILLIS) & (MsgIdGenerator.SEQUENCE_LIMIT - 1));
     }
 
 
