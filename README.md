@@ -1,21 +1,37 @@
 # ImpulseM.Centrifugo.Client.Java
 
-Android and Java client for [this Centrifugo fork](https://github.com/Impulse-m/ImpulseM.Centrifugo) (Docker: `ghcr.io/impulse-m/impulsem.centrifugo`).
+Android and Java client for the [ImpulseM.Centrifugo](https://github.com/Impulse-m/ImpulseM.Centrifugo) server (Docker image `ghcr.io/impulse-m/impulsem.centrifugo`).
 
-A fork of [centrifuge-java](https://github.com/centrifugal/centrifuge-java). The API matches upstream.
+This is a fork of [centrifuge-java](https://github.com/centrifugal/centrifuge-java). The upstream API is kept. The fork adds methods, and changes behaviour where the sections below say so.
 
-Sibling SDKs of the fork:
+**Current version: 1.7.0.** Versions follow semantic versioning from 1.0.0. Release notes are in [changelog.md](changelog.md) and on [GitHub Releases](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/releases).
 
-- JavaScript: [ImpulseM.Centrifugo.Client.JS](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.JS), npm `@impulsem/centrifuge`
-- Swift: [ImpulseM.Centrifugo.Client.Swift](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Swift), Swift Package Manager
+**Install:** Maven coordinates `com.github.Impulse-m:ImpulseM.Centrifugo.Client.Java:1.7.0`, from the repository `https://impulse-m.github.io/ImpulseM.Centrifugo.Client.Java/`. See [Installation](#installation).
 
-There is no v1 release of this library yet – API still evolves. At the moment patch version updates only contain backwards compatible changes, minor version updates can have backwards incompatible API changes.
+What the fork adds:
+
+- [RPC options](#rpc-options): per-call headers, application error fields, server time
+- [Exactly-once calls](#exactly-once-calls): `msg_id` with a connection instance, `rpcCall` and `cancel()`
+- [RPC pool](#rpc-pool-for-large-payloads): large payloads over several connections, with redirects
+- [Token refresh and token exchange](#refreshing-the-connection-token-on-demand): `Client.refresh` and refresh tokens exchanged over the connection
+- [Subscription bandwidth](#subscription-bandwidth): publish debouncing, channel compaction, delta without positioning
+- [Client error codes](#client-error-codes): codes 12 and 15 to 18, set by the client
+
+Sibling repositories:
+
+- [ImpulseM.Centrifugo](https://github.com/Impulse-m/ImpulseM.Centrifugo): the server
+- [ImpulseM.Centrifugo.Core](https://github.com/Impulse-m/ImpulseM.Centrifugo.Core): the Go library the server is built on
+- [ImpulseM.Centrifugo.Protocol](https://github.com/Impulse-m/ImpulseM.Centrifugo.Protocol): the protocol definitions
+- [ImpulseM.Centrifugo.Client.JS](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.JS): JavaScript SDK, npm `@impulsem/centrifuge`
+- [ImpulseM.Centrifugo.Client.Swift](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Swift): Swift SDK, Swift Package Manager
 
 Check out [client SDK API specification](https://centrifugal.dev/docs/transports/client_api) to learn how this SDK behaves. It's recommended to read that before starting to work with this SDK as the spec covers common SDK behavior - describes client and subscription state transitions, main options and methods. Also check out examples folder.
 
 The features implemented by this SDK can be found in [SDK feature matrix](https://centrifugal.dev/docs/transports/client_sdk#sdk-feature-matrix).
 
 > **The latest `centrifuge-java` is compatible with [Centrifugo](https://github.com/centrifugal/centrifugo) server v6, v5 and v4 and [Centrifuge](https://github.com/centrifugal/centrifuge) >= 0.25.0. For Centrifugo v2, Centrifugo v3 and Centrifuge < 0.25.0 you should use `centrifuge-java` v0.1.0.**
+
+The features in the fork sections below need the ImpulseM.Centrifugo server.
 
 ## Installation
 
@@ -29,7 +45,7 @@ repositories {
 }
 
 dependencies {
-    implementation "com.github.Impulse-m:ImpulseM.Centrifugo.Client.Java:1.0.0"
+    implementation "com.github.Impulse-m:ImpulseM.Centrifugo.Client.Java:1.7.0"
 }
 ```
 
@@ -463,7 +479,9 @@ The codes of this section are client-local: a server never sends them.
 
 ## License
 
-Library is available under the MIT license. See LICENSE for details.
+The library is available under the MIT license, see [LICENSE](LICENSE). The upstream copyright notice is kept unchanged there. The changes of the fork are Copyright (c) 2026 the fork contributors, under the same license.
+
+Third-party files which keep their own license are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## For Contributors
 
@@ -471,7 +489,7 @@ This section contains an information for library contributors. You don't need ge
 
 ### Generate proto
 
-The protobuf definitions are located in `centrifuge/main/proto` directory.
+The protobuf definitions are located in `centrifuge/src/main/proto` directory.
 `Protocol` class is generated automatically during project compilation by `protobuf` gradle plugin.
 
 ### Running tests
@@ -491,7 +509,7 @@ make test              # both
 make down              # stop Centrifugo when done
 ```
 
-The Gradle wrapper is pinned at 7.5.1, which supports JDK 8–17. The `Makefile` auto-discovers `openjdk@17` from a Homebrew install (`brew install openjdk@17`); set `JAVA_HOME` yourself if you'd rather pick the JDK explicitly. CI runs both jobs on Ubuntu — see `.github/workflows/ci.yml`.
+The Gradle wrapper is pinned at 8.10.2. The `Makefile` auto-discovers `openjdk@17` from a Homebrew install (`brew install openjdk@17`); set `JAVA_HOME` yourself if you'd rather pick the JDK explicitly. CI runs both jobs on Ubuntu — see `.github/workflows/ci.yml`.
 
 ### Check API signatures
 
