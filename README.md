@@ -4,7 +4,7 @@ Android and Java client for the [ImpulseM.Centrifugo](https://github.com/Impulse
 
 This is a fork of [centrifuge-java](https://github.com/centrifugal/centrifuge-java). The upstream API is kept. The fork adds methods, and changes behaviour where the sections below say so.
 
-**Current version: 1.7.0.** Versions follow semantic versioning from 1.0.0. Release notes are in [changelog.md](changelog.md) and on [GitHub Releases](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/releases).
+**Current version: 1.7.0.** Versions follow semantic versioning from 1.0.0. Release notes are on [GitHub Releases](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/releases).
 
 **Install:** Maven coordinates `com.github.Impulse-m:ImpulseM.Centrifugo.Client.Java:1.7.0`, from the repository `https://impulse-m.github.io/ImpulseM.Centrifugo.Client.Java/`. See [Installation](#installation).
 
