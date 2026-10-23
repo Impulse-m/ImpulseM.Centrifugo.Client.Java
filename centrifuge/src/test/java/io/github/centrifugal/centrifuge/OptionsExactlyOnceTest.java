@@ -41,6 +41,23 @@ public class OptionsExactlyOnceTest {
     }
 
 
+    // Java refuses an invalid instance when the options are set, before any client is created from them.
+    @Test
+    public void invalidInstanceIsRefusedAtCreate() {
+        String tooLong = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyzabcde";
+        String badCharacter = "abcdefghijklmnopqrstuv!";
+        for (String instance : new String[]{tooLong, badCharacter}) {
+            Options opts = new Options();
+            try {
+                opts.setInstance(instance);
+                fail("expected the instance to be refused: " + instance);
+            } catch (IllegalArgumentException expected) {
+                assertEquals("", opts.getInstance());
+            }
+        }
+    }
+
+
     @Test
     public void timeoutIsReadBackAndDefaultsToZero() {
         assertEquals(0L, new RpcOptions.Builder().build().getTimeout());
