@@ -832,7 +832,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
 
     // T27
     @Test
-    public void sourceReferencesOnlyPoolsWithWaitingCalls() throws Exception {
+    public void sourceReferencesOnlyPoolsWithWaitingCallsOrConnections() throws Exception {
         FakeCentrifugoServer endpoint = newPoolServer();
         serveFleet(endpoint);
         server.deferCommand = (Protocol.Command cmd) -> cmd.hasConnect();
@@ -847,7 +847,8 @@ public class RpcPoolTokenTest extends RpcTestBase {
         long before = idle.keyLookups();
         server.releaseDeferredCommands();
         assertEquals("payload", payloadOf(call));
-        assertTrue("the set is empty after the connect", listeningOf(main).isEmpty());
+        // The pool holds its connection now: with closeEndedSession the source keeps listening to it, and the idle pool is not listed.
+        assertEquals("the set holds the pool with its connection", Collections.singleton(waiting), listeningOf(main));
         assertEquals("the idle pool is never drained", before, idle.keyLookups());
         // A pool closed with a waiting call leaves the set.
         server.deferCommand = (Protocol.Command cmd) -> cmd.hasConnect();
