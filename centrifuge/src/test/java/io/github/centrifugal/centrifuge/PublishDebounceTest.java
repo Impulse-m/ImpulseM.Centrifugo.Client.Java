@@ -31,7 +31,8 @@ public class PublishDebounceTest extends RpcTestBase {
     private static final String REFUSED_DATA = "refused";
     private static final int DEBOUNCE_MILLIS = 30;
     // Above Integer.MAX_VALUE, so the window only survives if it is read as unsigned.
-    private static final long LARGE_DEBOUNCE_MILLIS = 3_600_000_000L;
+    // Above 2^31 - 1 ms, and within the unsigned 32-bit wire field: the window is capped at 2^31 - 1 ms.
+    private static final long LARGE_DEBOUNCE_MILLIS = 2_147_483_649L;
     private static final int FAST_RETRY_MIN_MILLIS = 50;
     private static final int FAST_RETRY_MAX_MILLIS = 100;
     private static final int PERMISSION_DENIED_CODE = 103;
@@ -44,7 +45,7 @@ public class PublishDebounceTest extends RpcTestBase {
 
 
     @Test
-    public void firstPublishIsSentAtOnceAndWindowCoalescesTheRest() throws Exception {
+    public void publishFirstIsSentAtOnceAndWindowCoalescesTheRest() throws Exception {
         startDebounced(DEBOUNCE_MILLIS);
 
         CompletableFuture<PublishResult> first = publish("1");
@@ -135,7 +136,7 @@ public class PublishDebounceTest extends RpcTestBase {
 
 
     @Test
-    public void windowAboveSignedIntRangeIsHonoured() throws Exception {
+    public void windowAboveSignedIntRangeIsCapped() throws Exception {
         startDebounced(LARGE_DEBOUNCE_MILLIS);
 
         assertNoError(publish("1"));
@@ -144,7 +145,7 @@ public class PublishDebounceTest extends RpcTestBase {
         syncWithServer();
 
         assertEquals(Arrays.asList("1"), published);
-        assertTrue("the window is the full server value", clock.requestedDelays().contains(LARGE_DEBOUNCE_MILLIS));
+        assertTrue("the window is capped at 2^31 - 1 ms", clock.requestedDelays().contains((long) Integer.MAX_VALUE));
     }
 
 

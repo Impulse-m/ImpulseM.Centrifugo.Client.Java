@@ -274,7 +274,8 @@ public class Subscription {
             this.setEpoch(result.getEpoch());
         }
         this.deltaNegotiated = result.getDelta();
-        this.publishDebounceMillis = result.getPublishDebounce() & 0xFFFFFFFFL;
+        // A window above 2^31 - 1 ms is capped there, as in the other SDKs.
+        this.publishDebounceMillis = Math.min(result.getPublishDebounce() & 0xFFFFFFFFL, Integer.MAX_VALUE);
         // Channel compaction: register the numeric channel ID assigned by the
         // server (0 when not negotiated — also clears a stale ID from a previous
         // subscribe session).
