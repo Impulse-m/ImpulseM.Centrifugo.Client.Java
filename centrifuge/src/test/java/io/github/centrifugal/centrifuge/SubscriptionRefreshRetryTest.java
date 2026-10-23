@@ -140,14 +140,15 @@ public class SubscriptionRefreshRetryTest extends RpcTestBase {
         awaitRefusals(1);
         awaitRetryArmed(clock, FIRST_RETRY_AT_HIGHEST_DRAW);
         drainExecutor();
-        int delaysBeforeRetry = clock.requestedDelays().size();
 
         // The getter returns the same token the server refused, so the retry does not send it again and arms no retry.
         clock.advance(FIRST_RETRY_AT_HIGHEST_DRAW);
         drainExecutor();
 
         assertEquals("the refused token is not sent again", 1, refreshRequests.get());
-        assertEquals("no retry is armed after the refused token", delaysBeforeRetry, clock.requestedDelays().size());
+        // The ping watchdog re-arms its own check inside this advance, so no retry is counted by its delay instead.
+        int retriesPending = clock.pendingWithDelay(FIRST_RETRY_AT_HIGHEST_DRAW) + clock.pendingWithDelay(SECOND_RETRY_AT_HIGHEST_DRAW);
+        assertEquals("no retry is armed after the refused token", 0, retriesPending);
         assertEquals(SubscriptionState.SUBSCRIBED, sub.getState());
     }
 
