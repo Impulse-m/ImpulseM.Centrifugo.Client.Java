@@ -697,6 +697,8 @@ public class RpcPoolTest extends RpcTestBase {
         server.releaseDeferredCommands();
         awaitCondition("the call is written on its connection", () -> pool.stats().getInflight() == 1);
         assertEquals("the written call is no longer queued", 0, pool.stats().getQueued());
+        // The written state is set before the server receives the command: wait until the server holds it.
+        awaitHeld(server);
         server.releaseDeferredCommands();
         assertEquals("payload", new String(future.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
         assertEquals(1, connectsOf(server));
