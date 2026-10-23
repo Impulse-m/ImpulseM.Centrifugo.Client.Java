@@ -150,7 +150,7 @@ public class ServerTimeTest extends RpcTestBase {
     }
 
 
-    private static void assertTimedOut(CompletableFuture<RPCResult> future) throws InterruptedException {
+    private static void assertTimedOut(CompletableFuture<RPCResult> future) throws Exception {
         try {
             future.get(5, TimeUnit.SECONDS);
             fail("the silent call must time out");

@@ -157,7 +157,7 @@ public class SubscriptionRefreshRetryTest extends RpcTestBase {
     }
 
 
-    private void awaitRefusals(int count) throws InterruptedException {
+    private void awaitRefusals(int count) throws Exception {
         awaitCondition("the refresh is refused and reported " + count + " times", () -> refusalsReported.get() == count);
         drainExecutor();
     }
