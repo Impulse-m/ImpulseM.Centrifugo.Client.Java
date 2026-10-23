@@ -23,10 +23,7 @@ public class Subscription {
     final private Map<String, CompletableFuture<Throwable>> futures = new ConcurrentHashMap<>();
     private final Backoff backoff;
     private ScheduledFuture<?> refreshTask;
-    // Consecutive failed token refreshes of this subscription: the step of its next retry delay.
-    private int refreshRetryStep = 0;
-    // The token the server refused with 109 in the last refresh of this subscription; null when none was refused since the last success.
-    private String refusedRefreshToken;
+    private final SubscriptionRefreshRetry refreshRetry;
     private ScheduledFuture<?> resubscribeTask;
     private int resubscribeAttempts = 0;
     private String token;
@@ -60,6 +57,7 @@ public class Subscription {
         this.channel = channel;
         this.listener = listener;
         this.backoff = new Backoff();
+        this.refreshRetry = new SubscriptionRefreshRetry(client);
         this.opts = options;
         this.token = opts.getToken();
         if (opts.getData() != null) {
@@ -159,7 +157,7 @@ public class Subscription {
                     return;
                 }
                 // The server refused this token with 109 already: it is not sent again, and no retry is armed.
-                if (Subscription.this.client.getOpts().isStopOnRefusedToken() && token.equals(Subscription.this.refusedRefreshToken)) {
+                if (Subscription.this.refreshRetry.isRefused(token)) {
                     return;
                 }
                 Subscription.this.token = token;
@@ -174,16 +172,11 @@ public class Subscription {
                     if (errorOrNull != null) {
                         Subscription.this.listener.onError(Subscription.this, new SubscriptionErrorEvent(new SubscriptionRefreshError(errorOrNull)));
                         if (error instanceof ReplyError) {
-                            ReplyError e;
-                            e = (ReplyError) error;
-                            // The same classification as the connection refresh: a retryable refusal is retried,
-                            // a permission refusal keeps the subscription, any other refusal unsubscribes.
-                            if (AuthRefresh.isRetryableRefresh(e)) {
-                                if (e.getCode() == AuthRefresh.ERROR_CODE_TOKEN_EXPIRED) {
-                                    Subscription.this.refusedRefreshToken = token;
-                                }
+                            ReplyError e = (ReplyError) error;
+                            SubscriptionRefreshRetry.Verdict verdict = Subscription.this.refreshRetry.onRefusal(e, token);
+                            if (verdict == SubscriptionRefreshRetry.Verdict.RETRY) {
                                 Subscription.this.scheduleRefreshRetry();
-                            } else if (e.getCode() != AuthRefresh.PERMISSION_DENIED) {
+                            } else if (verdict == SubscriptionRefreshRetry.Verdict.UNSUBSCRIBE) {
                                 Subscription.this._unsubscribe(true, e.getCode(), e.getMessage());
                             }
                             return;
@@ -191,8 +184,7 @@ public class Subscription {
                         Subscription.this.scheduleRefreshRetry();
                         return;
                     }
-                    Subscription.this.refreshRetryStep = 0;
-                    Subscription.this.refusedRefreshToken = null;
+                    Subscription.this.refreshRetry.accepted();
                     if (result.getExpires()) {
                         Subscription.this.refreshTask = Subscription.this.client.getScheduler().schedule(
                                 Subscription.this::sendRefresh,
@@ -205,12 +197,8 @@ public class Subscription {
         });
     }
 
-    // The retry of a failed subscription token refresh. Its delay is the connection's refresh retry, with the failures in
-    // a row of this subscription: the step counts from 0 and is reset by an accepted refresh or a subscribe.
     private void scheduleRefreshRetry() {
-        long delayMillis = this.client.refreshRetryDelayMillis(this.refreshRetryStep);
-        this.refreshRetryStep = Math.min(this.refreshRetryStep + 1, AuthRefresh.RETRY_MAX_STEP);
-        this.refreshTask = this.client.getScheduler().schedule(this::sendRefresh, delayMillis, TimeUnit.MILLISECONDS);
+        this.refreshTask = this.client.getScheduler().schedule(this::sendRefresh, this.refreshRetry.nextDelayMillis(), TimeUnit.MILLISECONDS);
     }
 
     void moveToSubscribing(int code, String reason) {
@@ -312,7 +300,7 @@ public class Subscription {
         }
         this.futures.clear();
 
-        this.refreshRetryStep = 0;
+        this.refreshRetry.resetStep();
         if (result.getExpires()) {
             this.refreshTask = this.client.getScheduler().schedule(
                 Subscription.this::sendRefresh,
