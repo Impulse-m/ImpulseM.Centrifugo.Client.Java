@@ -7,11 +7,11 @@ import java.util.Deque;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
+import java.util.Random;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
 import java8.util.concurrent.CompletableFuture;
@@ -58,7 +58,7 @@ final class AuthRefresh {
     static final int RETRY_MIN_MILLIS = 10000;
     static final int RETRY_MAX_MILLIS = 20000;
     // The failures in a row after which the retry ceiling no longer grows, so the step never overflows.
-    private static final int RETRY_MAX_STEP = 30;
+    static final int RETRY_MAX_STEP = 30;
 
     // Error codes below this one are client errors, which the timer retries with a fresh token.
     private static final int SERVER_ERROR_CODE_MIN = 100;
@@ -72,7 +72,8 @@ final class AuthRefresh {
     private final int retryMaxMillis;
     // The longest ceiling of the retry delay with the cap of the options, see Options.setTokenRetryCap. At or below the maximum, no growth.
     private final int retryCapMillis;
-    private final Backoff backoff = new Backoff();
+    // The random source of the retry delays, shared with the rpc resends in the tests.
+    private final Random draws;
     // The failed timer refreshes in a row, which set the ceiling of the next retry. A successful expiry schedule clears it.
     private int retryStep;
     // Whether a token refused with 109 by a timer refresh is not sent again, see Options.setStopOnRefusedToken.
@@ -122,12 +123,20 @@ final class AuthRefresh {
     private final AtomicReference<TokenSource> tokenSource = new AtomicReference<>();
 
 
-    AuthRefresh(ClientHost host, int retryMinMillis, int retryMaxMillis, int retryCapMillis, boolean stopOnRefusedToken) {
+    AuthRefresh(
+            ClientHost host,
+            int retryMinMillis,
+            int retryMaxMillis,
+            int retryCapMillis,
+            boolean stopOnRefusedToken,
+            Random draws
+    ) {
         this.host = host;
         this.retryMinMillis = retryMinMillis;
         this.retryMaxMillis = retryMaxMillis;
         this.retryCapMillis = retryCapMillis;
         this.stopOnRefusedToken = stopOnRefusedToken;
+        this.draws = draws;
         this.flow = TokenExchangeFlow.create(host);
     }
 
@@ -391,13 +400,29 @@ final class AuthRefresh {
 
 
     private void scheduleRetry() {
-        // Without a cap above the maximum the step stays 0, so the delay is the flat one of the retry bounds.
-        boolean grows = retryCapMillis > retryMaxMillis;
-        int step = grows ? retryStep : 0;
-        scheduleTimer(backoff.duration(step, retryMinMillis, retryCeilingMillis(step, retryMaxMillis, retryCapMillis)), TimeUnit.MILLISECONDS);
-        if (grows) {
-            retryStep = Math.min(retryStep + 1, RETRY_MAX_STEP);
-        }
+        scheduleTimer(retryDelayMillis(retryStep), TimeUnit.MILLISECONDS);
+        retryStep = Math.min(retryStep + 1, RETRY_MAX_STEP);
+    }
+
+
+    /**
+     * The delay of a refresh retry after the given number of failures in a row, in milliseconds. Full jitter over
+     * [minimum, ceiling]: a draw of 0 gives the minimum, the top draw gives the ceiling of {@link #retryCeilingMillis}.
+     * Without a cap above the maximum the step does not count, so the delay is the flat one of the retry bounds.
+     * Shared by the connection and the subscription refresh retries, so that they cannot disagree.
+     */
+    long retryDelayMillis(int step) {
+        return retryDelayMillis(draws, step, retryMinMillis, retryMaxMillis, retryCapMillis);
+    }
+
+
+    /** The retry delay of {@link #retryDelayMillis(int)} for the given bounds and random source. */
+    static long retryDelayMillis(Random random, int step, int minMillis, int maxMillis, int capMillis) {
+        int effectiveStep = capMillis > maxMillis ? step : 0;
+        int ceilingMillis = retryCeilingMillis(effectiveStep, maxMillis, capMillis);
+        long spreadMillis = Math.min(ceilingMillis, (long) minMillis << effectiveStep);
+        long jitterMillis = (long) (random.nextDouble() * (spreadMillis + 1));
+        return Math.min(ceilingMillis, minMillis + jitterMillis);
     }
 
 

@@ -313,7 +313,7 @@ public class RpcPoolRedirectTest extends RpcTestBase {
 
 
     @Test
-    public void poolCloseSettlesAWaitingFetchWithTheClosedError() throws Exception {
+    public void closeSettlesAWaitingFetchWithTheClosedError() throws Exception {
         // The first fetch is held open by the fixture, so the second call waits for the one fetch slot.
         redirects.enqueue(new MockResponse().setBody("held").setBodyDelay(5, TimeUnit.SECONDS));
         pool = new RpcPool.Builder(endpointKey -> Collections.singletonList(server.url()))

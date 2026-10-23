@@ -22,6 +22,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -781,9 +782,15 @@ public final class RpcPool {
 
     // The session ended as unauthorized: every connection is retired, so an idle one closes now and a busy one when its call settles.
     private void retireEndedConnections() {
+        forEachConnection(this::retire);
+    }
+
+
+    // Runs the action on each connection of the endpoints, over a copy of each endpoint's list, since the action takes connections out.
+    private void forEachConnection(Consumer<RpcPoolConnection> action) {
         for (RpcPoolEndpoint endpoint : endpoints.values()) {
             for (RpcPoolConnection conn : new ArrayList<>(endpoint.connections())) {
-                retire(conn);
+                action.accept(conn);
             }
         }
     }
@@ -1898,11 +1905,7 @@ public final class RpcPool {
             boolean inFlight = call.connection != null || call.redirectCall != null || call.queue == redirectWaiting;
             settle(call, null, inFlight ? new IOException("rpc pool closed") : closedError());
         }
-        for (RpcPoolEndpoint endpoint : endpoints.values()) {
-            for (RpcPoolConnection conn : new ArrayList<>(endpoint.connections())) {
-                remove(conn);
-            }
-        }
+        forEachConnection(this::remove);
         for (RpcPoolConnection conn : new ArrayList<>(retiring)) {
             remove(conn);
         }

@@ -682,7 +682,9 @@ final class RpcSession {
         // The payload is not sent again, and a call kept for its late reply holds only what the reply needs.
         call.data = null;
         if (reply == null && call.wireTracked && onWire.get(call.commandId) == call) {
-            // Settled locally while its attempt is on the wire: a late reply is still acked for one call timeout.
+            // Settled locally while its attempt is on the wire: a late reply is still acked for one call timeout,
+            // and it does not set the server time.
+            host.keepLateAttempt(call.commandId);
             keepLate(call);
         } else {
             forgetAttempt(call);

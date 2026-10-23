@@ -1,6 +1,6 @@
 package io.github.centrifugal.centrifuge;
 
-import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
+import java.util.Random;
 
 import org.junit.Test;
 
@@ -10,24 +10,40 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * The delay of a failed refresh retry: 10 s to 20 s at the first failure, doubling with each failure in a row up to
- * the cap of the options (300 s by default). The ceilings are exact; the delays are drawn inside their range.
+ * the cap of the options (300 s by default). The endpoints are pinned with the lowest and the highest draw; the
+ * draws in between stay inside the range.
  */
 public class RefreshRetryDelayTest {
     private static final int MIN_MILLIS = 10_000;
+    private static final int MAX_MILLIS = AuthRefresh.RETRY_MAX_MILLIS;
     private static final int CAP_MILLIS = 300_000;
+    // The lowest draw gives the minimum; the highest draw, just below one, gives the ceiling of the step.
+    private static final double LOWEST_DRAW = 0.0;
+    private static final double HIGHEST_DRAW = 1.0 - 1e-12;
     private static final int DRAWS_PER_STEP = 50;
 
 
     @Test
     public void retryDelayEscalatesAndStopsAtTheCap() {
-        int[] ceilings = {20_000, 40_000, 80_000, 160_000, 300_000, 300_000};
-        Backoff backoff = new Backoff();
+        long[] ceilings = {20_000L, 40_000L, 80_000L, 160_000L, 300_000L, 300_000L};
 
         for (int step = 0; step < ceilings.length; step++) {
-            int ceiling = AuthRefresh.retryCeilingMillis(step, AuthRefresh.RETRY_MAX_MILLIS, CAP_MILLIS);
-            assertEquals("the ceiling after " + step + " failures", ceilings[step], ceiling);
+            assertEquals("the lowest draw after " + step + " failures is the minimum", MIN_MILLIS,
+                    AuthRefresh.retryDelayMillis(drawsAt(LOWEST_DRAW), step, MIN_MILLIS, MAX_MILLIS, CAP_MILLIS));
+            assertEquals("the highest draw after " + step + " failures is the ceiling", ceilings[step],
+                    AuthRefresh.retryDelayMillis(drawsAt(HIGHEST_DRAW), step, MIN_MILLIS, MAX_MILLIS, CAP_MILLIS));
+        }
+    }
+
+
+    @Test
+    public void retryDelayDrawsStayInsideTheRange() {
+        Random random = new Random(42L);
+
+        for (int step = 0; step < 6; step++) {
+            long ceiling = AuthRefresh.retryCeilingMillis(step, MAX_MILLIS, CAP_MILLIS);
             for (int draw = 0; draw < DRAWS_PER_STEP; draw++) {
-                long delay = backoff.duration(step, MIN_MILLIS, ceiling);
+                long delay = AuthRefresh.retryDelayMillis(random, step, MIN_MILLIS, MAX_MILLIS, CAP_MILLIS);
                 assertTrue("the delay after " + step + " failures is inside its range: " + delay,
                         delay >= MIN_MILLIS && delay <= ceiling);
             }
@@ -37,6 +53,18 @@ public class RefreshRetryDelayTest {
 
     @Test
     public void theCapHoldsForAStepBeyondTheDoublings() {
-        assertEquals(CAP_MILLIS, AuthRefresh.retryCeilingMillis(30, AuthRefresh.RETRY_MAX_MILLIS, CAP_MILLIS));
+        assertEquals(CAP_MILLIS, AuthRefresh.retryCeilingMillis(30, MAX_MILLIS, CAP_MILLIS));
+        assertEquals(CAP_MILLIS, AuthRefresh.retryDelayMillis(drawsAt(HIGHEST_DRAW), 30, MIN_MILLIS, MAX_MILLIS, CAP_MILLIS));
+    }
+
+
+    // The draws of the full jitter at a fixed value.
+    private static Random drawsAt(final double draw) {
+        return new Random() {
+            @Override
+            public double nextDouble() {
+                return draw;
+            }
+        };
     }
 }

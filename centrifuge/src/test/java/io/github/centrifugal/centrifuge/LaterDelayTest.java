@@ -74,6 +74,13 @@ public class LaterDelayTest {
     }
 
 
+    // The cap is taken in whole milliseconds, rounded down: with 2.5 ms left the largest resend is 2 ms, never past the deadline.
+    @Test
+    public void laterResendCapRoundsTheRemainingDeadlineDownToWholeMilliseconds() {
+        assertEquals(2_000_000L, RpcSession.laterResendDelayNanos(maximum(), 3, 2_500_000L));
+    }
+
+
     // A random source which always returns the largest value of the range.
     private static Random maximum() {
         return new Random() {

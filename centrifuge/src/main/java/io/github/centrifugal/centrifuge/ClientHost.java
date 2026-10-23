@@ -142,6 +142,13 @@ final class ClientHost {
 
     void removeFuture(int id) {
         client.futures.remove(id);
+        client.lateAttempts.remove(id);
+    }
+
+
+    // The attempt settled locally and is kept for its late reply, which does not set the server time.
+    void keepLateAttempt(int id) {
+        client.lateAttempts.add(id);
     }
 
 

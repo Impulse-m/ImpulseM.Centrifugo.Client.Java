@@ -832,7 +832,7 @@ public class RpcPoolTokenTest extends RpcTestBase {
 
     // T27
     @Test
-    public void sourceReferencesOnlyPoolsWithWaitingCallsOrConnections() throws Exception {
+    public void sourceReferencesOnlyPoolsWithWaitingCalls() throws Exception {
         FakeCentrifugoServer endpoint = newPoolServer();
         serveFleet(endpoint);
         server.deferCommand = (Protocol.Command cmd) -> cmd.hasConnect();

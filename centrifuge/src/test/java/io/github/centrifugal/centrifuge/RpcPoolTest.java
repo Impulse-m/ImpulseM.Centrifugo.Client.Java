@@ -309,7 +309,7 @@ public class RpcPoolTest extends RpcTestBase {
 
 
     @Test
-    public void poolRoutesMoveBeforeLater() throws Exception {
+    public void aMoveWinsOverTheLaterSignal() throws Exception {
         AtomicInteger calls = new AtomicInteger();
         List<String> keys = Collections.synchronizedList(new ArrayList<>());
         server.onCommand = cmd -> {
@@ -338,7 +338,7 @@ public class RpcPoolTest extends RpcTestBase {
 
 
     @Test
-    public void poolLostCallOnMessageSizeCloseIsNotResent() throws Exception {
+    public void aConnectionClosedForItsMessageSizeSettlesWithoutAResend() throws Exception {
         server.onCommand = cmd -> {
             if (!cmd.hasRpc()) {
                 return null;

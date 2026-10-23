@@ -5,11 +5,13 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -18,6 +20,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 import java.util.function.UnaryOperator;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.X509TrustManager;
@@ -57,6 +60,8 @@ public class Client {
     private com.google.protobuf.ByteString data;
     final EventListener listener;
     final Map<Integer, CompletableFuture<Protocol.Reply>> futures = new ConcurrentHashMap<>();
+    // The attempts which settled locally and are kept only for their late replies.
+    final Set<Integer> lateAttempts = Collections.newSetFromMap(new ConcurrentHashMap<Integer, Boolean>());
     private final Map<Integer, Protocol.Command> connectCommands = new ConcurrentHashMap<>();
     private final Map<Integer, Protocol.Command> connectAsyncCommands = new ConcurrentHashMap<>();
     private final ClientHost host;
@@ -138,7 +143,7 @@ public class Client {
     // Server clock minus local clock, from the last reply that carried a server time.
     private volatile long serverTimeOffset = 0;
     // The wall clock of the server time. A test replaces it to know the expected server time exactly.
-    java.util.function.LongSupplier wallClock = System::currentTimeMillis;
+    LongSupplier wallClock = System::currentTimeMillis;
 
     Options getOpts() {
         return opts;
@@ -228,7 +233,7 @@ public class Client {
         return scheduler;
     }
 
-    // The retry bounds, the scheduler and the random delays of the rpc resends are parameters, so that the tests control them.
+    // The retry bounds, the scheduler and the random draws of the rpc resends and the refresh retries are parameters, so that the tests control them.
     Client(
             final String endpoint,
             final Options opts,
@@ -248,7 +253,7 @@ public class Client {
         ClientHost host = new ClientHost(this);
         this.host = host;
         this.rpcSession = new RpcSession(host, opts.getMaxPendingRpc(), rpcResendDraws);
-        this.auth = new AuthRefresh(host, authRetryMinMillis, authRetryMaxMillis, opts.getTokenRetryCap(), opts.isStopOnRefusedToken());
+        this.auth = new AuthRefresh(host, authRetryMinMillis, authRetryMaxMillis, opts.getTokenRetryCap(), opts.isStopOnRefusedToken(), rpcResendDraws);
         this.token = opts.getToken();
         if (opts.getData() != null) {
             this.data = com.google.protobuf.ByteString.copyFrom(opts.getData());
@@ -569,6 +574,7 @@ public class Client {
         // behind forever and accumulate one per in-flight command per reconnect.
         // Matches centrifuge-js, which resets _callbacks in _clearOutgoingRequests.
         this.futures.clear();
+        this.lateAttempts.clear();
 
         if (previousState == ClientState.CONNECTED) {
             for (String channel : new ArrayList<>(this.serverSubs.keySet())) {
@@ -1453,6 +1459,11 @@ public class Client {
         this.processDisconnect(DISCONNECTED_UNAUTHORIZED, "unauthorized", false);
     }
 
+    // The delay of a subscription refresh retry after the given number of its failures in a row, see AuthRefresh.retryDelayMillis.
+    long refreshRetryDelayMillis(int step) {
+        return this.auth.retryDelayMillis(step);
+    }
+
     // A reply without a server time keeps the last offset.
     private void observeServerTime(Protocol.Reply reply) {
         Long offset = Extensions.serverTimeOffsetFrom(reply.getTime(), this.wallClock.getAsLong());
@@ -1467,7 +1478,9 @@ public class Client {
             CompletableFuture<Protocol.Reply> cf = this.futures.get(reply.getId());
             // Only a reply which answers a pending command sets the server time: a late reply to a settled call does not.
             if (cf != null) {
-                this.observeServerTime(reply);
+                if (!this.lateAttempts.contains(reply.getId())) {
+                    this.observeServerTime(reply);
+                }
                 cf.complete(reply);
             }
         } else {

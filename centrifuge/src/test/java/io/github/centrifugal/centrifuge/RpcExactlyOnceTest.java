@@ -633,7 +633,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void abortOfASentCallSendsACancelAndRejectsCancelled() throws Exception {
+    public void cancelAfterSendStopsTheCallOnTheServer() throws Exception {
         enableRpcOptions();
         serveDedup();
         Client c = newClient();
@@ -1254,34 +1254,9 @@ public class RpcExactlyOnceTest extends RpcTestBase {
     }
 
 
+    // A call which was never written, queued before the client first connected, goes out as a first send.
     @Test
-    public void withoutAnInstanceThereIsNoBound() throws Exception {
-        enableRpcOptions();
-        answerRpcs("ok");
-        Options options = new Options();
-        options.setMaxPendingRpc(1);
-        Client c = newClient(options);
-        List<CompletableFuture<RPCResult>> futures = new ArrayList<>();
-        for (int i = 0; i < 40; i++) {
-            CompletableFuture<RPCResult> future = new CompletableFuture<>();
-            futures.add(future);
-            c.rpcCall("m" + i, EMPTY_PAYLOAD, into(future));
-        }
-
-        drainExecutor();
-        for (CompletableFuture<RPCResult> future : futures) {
-            assertFalse("accepted and held, not refused", future.isDone());
-        }
-        connect(c);
-        for (CompletableFuture<RPCResult> future : futures) {
-            future.get(5, TimeUnit.SECONDS);
-        }
-    }
-
-
-    // A call which was never written, queued while the client was not connected, goes out as a first send.
-    @Test
-    public void aCallDroppedFromTheBatchBeforeItsWriteIsSentAsAFirstSend() throws Exception {
+    public void aCallQueuedBeforeTheFirstConnectIsSentAsAFirstSend() throws Exception {
         enableRpcOptions();
         answerRpcs("ok");
         Client c = newClient();
@@ -1305,7 +1280,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
         options.setMaxPendingRpc(1);
         Client c = newClient(options);
         List<CompletableFuture<RPCResult>> futures = new ArrayList<>();
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 40; i++) {
             CompletableFuture<RPCResult> future = new CompletableFuture<>();
             futures.add(future);
             c.rpcCall("m" + i, EMPTY_PAYLOAD, into(future));
@@ -1313,7 +1288,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
         drainExecutor();
         for (CompletableFuture<RPCResult> future : futures) {
-            assertFalse("held, not refused", future.isDone());
+            assertFalse("accepted and held, not refused", future.isDone());
         }
         connect(c);
         for (CompletableFuture<RPCResult> future : futures) {
@@ -1385,7 +1360,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void aRefusalWithTheNewMsgIdSignalIsSentAgainWithANewId() throws Exception {
+    public void msgIdRefusalIsResentWithANewMsgId() throws Exception {
         enableRpcOptions();
         AtomicLong serverTime = new AtomicLong(System.currentTimeMillis() - 120_000L);
         refuseCalls(1, MSG_ID_INVALID, Extensions.RPC_RETRY_NEW_MSG_ID, serverTime);
@@ -1459,7 +1434,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void threeRefusalsWithTheNewMsgIdSignalSurfaceTheError() throws Exception {
+    public void msgIdRefusedThreeTimesSurfacesTheErrorWithItsMetadata() throws Exception {
         enableRpcOptions();
         refuseCalls(3, MSG_ID_INVALID, Extensions.RPC_RETRY_NEW_MSG_ID, new AtomicLong(System.currentTimeMillis()));
         Client c = newClient();
@@ -1480,7 +1455,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void aRefusalWithTheLaterSignalIsSentAgainWithTheSameMsgIdAfterItsDelay() throws Exception {
+    public void laterRefusalIsResentWithTheSameMsgIdAfterTheDelay() throws Exception {
         enableRpcOptions();
         refuseCalls(1, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
         ManualScheduler clock = new ManualScheduler();
@@ -1549,7 +1524,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void fourRefusalsWithTheLaterSignalSurfaceTheError() throws Exception {
+    public void laterRefusedFourTimesSurfacesTheError() throws Exception {
         enableRpcOptions();
         refuseCalls(4, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
         Client c = newClient();
@@ -1587,7 +1562,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void aRefusalWithNoSignalIsSurfacedAtOnce() throws Exception {
+    public void temporaryRefusalWithoutTheKeyIsSurfacedAtOnce() throws Exception {
         enableRpcOptions();
         refuseCalls(1, TEMPORARY, null, new AtomicLong(System.currentTimeMillis()));
         Client c = newClient();
@@ -1604,7 +1579,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void aResendCrossingALostConnectionGoesOutWithTheReconnect() throws Exception {
+    public void laterDelayAcrossADroppedTransportIsResentOnReconnect() throws Exception {
         enableRpcOptions();
         refuseCalls(1, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
         // The resend waits its whole 250 ms bound, so the transport drops while the delay runs. A jittered draw
@@ -1687,7 +1662,7 @@ public class RpcExactlyOnceTest extends RpcTestBase {
 
 
     @Test
-    public void theDeadlineDuringTheDelayRejectsWithTimeoutAndSendsACancel() throws Exception {
+    public void laterRefusalWhoseDelayWouldReachTheDeadlineIsCappedAtTheDeadline() throws Exception {
         enableRpcOptions();
         refuseCalls(1, TEMPORARY, Extensions.RPC_RETRY_LATER, new AtomicLong(System.currentTimeMillis()));
         ManualScheduler clock = new ManualScheduler();
