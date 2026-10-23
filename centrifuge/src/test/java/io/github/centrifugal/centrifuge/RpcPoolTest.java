@@ -49,6 +49,29 @@ public class RpcPoolTest extends RpcTestBase {
     }
 
 
+    // A callback which asks the pool for its stats and closes it runs to its end: the pool's thread answers both at once.
+    @Test
+    public void callbackMayCallStatsAndCloseWithoutHanging() throws Exception {
+        answerRpcs("payload");
+        RpcPool pool = build(builder());
+        CompletableFuture<Void> callbackDone = new CompletableFuture<>();
+        CompletableFuture<RPCResult> answered = new CompletableFuture<>();
+        pool.rpc("svc.read", EMPTY_PAYLOAD, null, (Throwable err, RPCResult res) -> {
+            try {
+                pool.stats();
+                pool.close();
+                callbackDone.complete(null);
+            } catch (RuntimeException e) {
+                callbackDone.completeExceptionally(e);
+            }
+            into(answered).onDone(err, res);
+        });
+
+        callbackDone.get(5, TimeUnit.SECONDS);
+        assertEquals("payload", new String(answered.get(5, TimeUnit.SECONDS).getData(), StandardCharsets.UTF_8));
+    }
+
+
     @Test
     public void aCallIsAnsweredOverAPlainConnection() throws Exception {
         answerRpcs("payload");
@@ -286,7 +309,7 @@ public class RpcPoolTest extends RpcTestBase {
 
 
     @Test
-    public void aMoveWinsOverTheLaterSignal() throws Exception {
+    public void poolRoutesMoveBeforeLater() throws Exception {
         AtomicInteger calls = new AtomicInteger();
         List<String> keys = Collections.synchronizedList(new ArrayList<>());
         server.onCommand = cmd -> {
@@ -315,7 +338,7 @@ public class RpcPoolTest extends RpcTestBase {
 
 
     @Test
-    public void aConnectionClosedForItsMessageSizeSettlesWithoutAResend() throws Exception {
+    public void poolLostCallOnMessageSizeCloseIsNotResent() throws Exception {
         server.onCommand = cmd -> {
             if (!cmd.hasRpc()) {
                 return null;
