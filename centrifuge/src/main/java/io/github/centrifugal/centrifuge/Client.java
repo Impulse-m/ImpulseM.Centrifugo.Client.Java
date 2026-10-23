@@ -345,7 +345,15 @@ public class Client {
     }
 
     int getNextId() {
-        return ++_id;
+        this._id = nextCommandId(this._id);
+        return this._id;
+    }
+
+    // The id after the given one. Ids are uint32 on the wire and kept as their int bit pattern, so the sequence
+    // wraps from 2^32 - 1 (-1 as int) to 1, and 0 is skipped: a reply with id 0 is a push or a ping.
+    static int nextCommandId(final int last) {
+        int next = last + 1;
+        return next == 0 ? 1 : next;
     }
 
     /**
@@ -1474,7 +1482,8 @@ public class Client {
 
     void processReply(Protocol.Reply reply) throws Exception {
         this.watchdog.markReply();
-        if (reply.getId() > 0) {
+        // A command id is unsigned and never 0, so an id above 2^31 is negative as int and still answers its command.
+        if (reply.getId() != 0) {
             CompletableFuture<Protocol.Reply> cf = this.futures.get(reply.getId());
             // Only a reply which answers a pending command sets the server time: a late reply to a settled call does not.
             if (cf != null) {
