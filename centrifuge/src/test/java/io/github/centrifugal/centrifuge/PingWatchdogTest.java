@@ -56,12 +56,21 @@ public class PingWatchdogTest extends RpcTestBase {
     // With no reply after the last one at L, the connection closes at the second empty check, within the bounds of
     // assertClosedWithinBounds, whichever kind the last reply is. Each kind runs on its own connection.
     @Test
-    public void silenceAfterAnyReplyClosesWithinTheBounds() throws Exception {
+    public void silenceAfterAnyReplyClosesWithinOneWindow() throws Exception {
         for (ReplyKind kind : ReplyKind.values()) {
             Client c = connectOnClock();
             assertClosedWithinBounds(c, 5_000L, kind);
             c.close(0L);
         }
+    }
+
+
+    // A push after 90% of the window restarts the watchdog: the close comes a window after the push, not after the first.
+    @Test
+    public void pingWatchdogRestartsOnAnyReply() throws Exception {
+        Client c = connectOnClock();
+        assertClosedWithinBounds(c, windowMillis() * 9 / 10, ReplyKind.PUSH);
+        c.close(0L);
     }
 
 
