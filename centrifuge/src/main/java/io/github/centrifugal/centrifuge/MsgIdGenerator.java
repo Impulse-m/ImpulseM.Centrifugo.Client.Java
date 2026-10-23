@@ -47,12 +47,14 @@ final class MsgIdGenerator {
      * The msg_id of a call written now, for the server time in milliseconds. Greater than the msg_id
      * issued before it, unless the generator was re-synced (see {@link #resync}). The time part never
      * moves back on its own: a server time behind the last time part keeps that time part, and the
-     * sequence goes on.
+     * sequence goes on. A time part above {@link #MAX_SECONDS} is clamped to it.
      *
-     * @throws IllegalStateException when the time part would not fit 33 bits.
+     * @throws IllegalStateException when the largest second has issued every sequence value (the
+     *                               msg_id space is exhausted).
      */
     long next(long serverTimeMillis) {
-        long seconds = Math.max(serverTimeMillis / 1000L, lastSeconds);
+        long requested = Math.min(serverTimeMillis / 1000L, MAX_SECONDS);
+        long seconds = Math.max(requested, lastSeconds);
         long seq;
         if (seconds == lastSeconds) {
             seq = lastSeq + 1;
@@ -60,11 +62,11 @@ final class MsgIdGenerator {
             seq = lane;
         }
         if (seq >= SEQUENCE_LIMIT) {
+            if (seconds == MAX_SECONDS) {
+                throw new IllegalStateException("msg_id space exhausted");
+            }
             seconds++;
             seq = lane;
-        }
-        if (seconds > MAX_SECONDS) {
-            throw new IllegalStateException("msg_id time part does not fit 33 bits");
         }
         lastSeconds = seconds;
         lastSeq = seq;
@@ -82,7 +84,7 @@ final class MsgIdGenerator {
      * seconds the time part covers again. The fresh lane makes a collision with them improbable, not impossible.
      */
     void resync(long replyTimeMillis) {
-        long seconds = replyTimeMillis / 1000L;
+        long seconds = Math.min(replyTimeMillis / 1000L, MAX_SECONDS);
         if (seconds == lastSeconds) {
             return;
         }

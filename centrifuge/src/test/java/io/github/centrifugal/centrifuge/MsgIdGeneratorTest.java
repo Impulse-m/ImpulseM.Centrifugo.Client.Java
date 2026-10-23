@@ -173,11 +173,13 @@ public class MsgIdGeneratorTest {
     }
 
 
-    @Test(expected = IllegalStateException.class)
-    public void timePartBeyondThirtyThreeBitsIsRejected() {
+    @Test
+    public void timePartBeyondThirtyThreeBitsIsClamped() {
         MsgIdGenerator generator = new MsgIdGenerator(lanes(1));
 
-        generator.next((MsgIdGenerator.MAX_SECONDS + 1L) * 1000L);
+        long msgId = generator.next((MsgIdGenerator.MAX_SECONDS + 1L) * 1000L);
+
+        assertEquals((MsgIdGenerator.MAX_SECONDS << MsgIdGenerator.SEQUENCE_BITS) | 1L, msgId);
     }
 
 
