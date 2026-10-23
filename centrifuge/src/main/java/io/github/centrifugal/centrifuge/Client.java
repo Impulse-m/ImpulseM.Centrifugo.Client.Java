@@ -1462,11 +1462,14 @@ public class Client {
     }
 
     void processReply(Protocol.Reply reply) throws Exception {
-        this.observeServerTime(reply);
         this.watchdog.markReply();
         if (reply.getId() > 0) {
             CompletableFuture<Protocol.Reply> cf = this.futures.get(reply.getId());
-            if (cf != null) cf.complete(reply);
+            // Only a reply which answers a pending command sets the server time: a late reply to a settled call does not.
+            if (cf != null) {
+                this.observeServerTime(reply);
+                cf.complete(reply);
+            }
         } else {
             if (reply.hasPush()) {
                 this.handlePush(reply.getPush());

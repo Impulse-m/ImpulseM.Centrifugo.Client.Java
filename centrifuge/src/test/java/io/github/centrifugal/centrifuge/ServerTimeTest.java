@@ -1,11 +1,16 @@
 package io.github.centrifugal.centrifuge;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
+import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.fail;
 
 
 /**
@@ -47,6 +52,44 @@ public class ServerTimeTest extends FakeServerTestBase {
         rpcAndWait(c);
 
         assertEquals(LOCAL_MILLIS + SERVER_AHEAD_MILLIS, c.serverTimeMillis());
+    }
+
+
+    @Test
+    public void lateReplyToATimedOutCallDoesNotSetTheOffset() throws Exception {
+        AtomicLong silentId = new AtomicLong();
+        server.onCommand = cmd -> {
+            if (cmd.hasRpc()) {
+                silentId.set(cmd.getId());
+            }
+            return null;
+        };
+        Client c = connectWithFixedClock();
+        CompletableFuture<RPCResult> future = new CompletableFuture<>();
+        c.rpc("method", EMPTY_PAYLOAD, new RpcOptions.Builder().timeout(100).build(), into(future));
+        try {
+            future.get(5, TimeUnit.SECONDS);
+            fail("the silent call must time out");
+        } catch (ExecutionException expected) {
+            // The call settled with its timeout before the late reply arrives.
+        }
+
+        long lateId = silentId.get();
+        CompletableFuture<Void> applied = new CompletableFuture<>();
+        c.getExecutor().execute(() -> {
+            try {
+                c.processReply(Protocol.Reply.newBuilder()
+                        .setId(lateId)
+                        .setTime(LOCAL_MILLIS + SERVER_AHEAD_MILLIS)
+                        .build());
+                applied.complete(null);
+            } catch (Exception e) {
+                applied.completeExceptionally(e);
+            }
+        });
+        applied.get(5, TimeUnit.SECONDS);
+
+        assertEquals(LOCAL_MILLIS, c.serverTimeMillis());
     }
 
 
