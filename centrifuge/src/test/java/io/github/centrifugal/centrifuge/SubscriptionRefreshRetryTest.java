@@ -1,5 +1,7 @@
 package io.github.centrifugal.centrifuge;
 
+import java.util.Collections;
+import java.util.List;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -51,7 +53,9 @@ public class SubscriptionRefreshRetryTest extends RpcTestBase {
         awaitCondition("the refresh is refused and reported", () -> refusalsReported.get() == 1);
         drainExecutor();
 
-        assertEquals("no retry is armed", scheduledAtSubscribe, clock.requestedDelays().size());
+        // The refresh command itself arms its reply timeout, and nothing else: no retry delay is scheduled.
+        List<Long> armedSinceSubscribe = clock.requestedDelays().subList(scheduledAtSubscribe, clock.requestedDelays().size());
+        assertEquals("no retry is armed, only the refresh command's own timeout", Collections.singletonList((long) client.getOpts().getTimeout()), armedSinceSubscribe);
         assertEquals("the refresh is not sent again", 1, refreshRequests.get());
         assertEquals(SubscriptionState.SUBSCRIBED, sub.getState());
     }
