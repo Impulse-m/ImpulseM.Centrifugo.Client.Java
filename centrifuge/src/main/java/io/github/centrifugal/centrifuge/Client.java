@@ -137,6 +137,8 @@ public class Client {
     volatile boolean rpcOptionsSupported = false;
     // Server clock minus local clock, from the last reply that carried a server time.
     private volatile long serverTimeOffset = 0;
+    // The wall clock of the server time. A test replaces it to know the expected server time exactly.
+    java.util.function.LongSupplier wallClock = System::currentTimeMillis;
 
     Options getOpts() {
         return opts;
@@ -274,7 +276,7 @@ public class Client {
      * that carried one. Local time when no such reply has been seen.
      */
     public long serverTimeMillis() {
-        return Extensions.estimateServerTime(System.currentTimeMillis(), this.serverTimeOffset);
+        return Extensions.estimateServerTime(this.wallClock.getAsLong(), this.serverTimeOffset);
     }
 
     private int _id = 0;
@@ -1453,7 +1455,7 @@ public class Client {
 
     // A reply without a server time keeps the last offset.
     private void observeServerTime(Protocol.Reply reply) {
-        Long offset = Extensions.serverTimeOffsetFrom(reply.getTime(), System.currentTimeMillis());
+        Long offset = Extensions.serverTimeOffsetFrom(reply.getTime(), this.wallClock.getAsLong());
         if (offset != null) {
             this.serverTimeOffset = offset;
         }
