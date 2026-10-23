@@ -50,11 +50,13 @@ public class SubscriptionRefreshRetryTest extends RpcTestBase {
         subscribeWith(clock, drawsAt(HIGHEST_DRAW), TOKEN_EXPIRED, TOKEN_EXPIRED);
         clock.advance(TTL_MILLIS);
         awaitRefusals(1);
+        awaitRetryArmed(clock, FIRST_RETRY_AT_HIGHEST_DRAW);
 
         assertEquals("the first retry is the ceiling of its step", FIRST_RETRY_AT_HIGHEST_DRAW, lastDelay(clock));
         clock.advance(FIRST_RETRY_AT_HIGHEST_DRAW);
         awaitRefreshRequests(2);
         awaitRefusals(2);
+        awaitRetryArmed(clock, SECOND_RETRY_AT_HIGHEST_DRAW);
 
         assertEquals("the second consecutive failure doubles the ceiling", SECOND_RETRY_AT_HIGHEST_DRAW, lastDelay(clock));
     }
@@ -66,15 +68,18 @@ public class SubscriptionRefreshRetryTest extends RpcTestBase {
         subscribeWith(clock, drawsAt(HIGHEST_DRAW), TOKEN_EXPIRED, TOKEN_EXPIRED, ACCEPTED, TOKEN_EXPIRED);
         clock.advance(TTL_MILLIS);
         awaitRefusals(1);
+        awaitRetryArmed(clock, FIRST_RETRY_AT_HIGHEST_DRAW);
         clock.advance(FIRST_RETRY_AT_HIGHEST_DRAW);
         awaitRefreshRequests(2);
         awaitRefusals(2);
+        awaitRetryArmed(clock, SECOND_RETRY_AT_HIGHEST_DRAW);
         clock.advance(SECOND_RETRY_AT_HIGHEST_DRAW);
         awaitRefreshRequests(3);
         // The accepted refresh resets the step, so the next failure starts again at the first ceiling.
         clock.advance(TTL_MILLIS);
         awaitRefreshRequests(4);
         awaitRefusals(3);
+        awaitRetryArmed(clock, FIRST_RETRY_AT_HIGHEST_DRAW);
 
         assertEquals(FIRST_RETRY_AT_HIGHEST_DRAW, lastDelay(clock));
     }
@@ -86,6 +91,7 @@ public class SubscriptionRefreshRetryTest extends RpcTestBase {
         Subscription sub = subscribeWith(clock, drawsAt(LOWEST_DRAW), TOKEN_EXPIRED);
         clock.advance(TTL_MILLIS);
         awaitRefusals(1);
+        awaitRetryArmed(clock, FIRST_RETRY_AT_LOWEST_DRAW);
 
         assertEquals("the retry waits on the refresh backoff", FIRST_RETRY_AT_LOWEST_DRAW, lastDelay(clock));
         clock.advance(FIRST_RETRY_AT_LOWEST_DRAW);
@@ -116,6 +122,7 @@ public class SubscriptionRefreshRetryTest extends RpcTestBase {
         Subscription sub = subscribeWith(clock, drawsAt(HIGHEST_DRAW), CLIENT_ERROR);
         clock.advance(TTL_MILLIS);
         awaitRefusals(1);
+        awaitRetryArmed(clock, FIRST_RETRY_AT_HIGHEST_DRAW);
 
         assertEquals(FIRST_RETRY_AT_HIGHEST_DRAW, lastDelay(clock));
         clock.advance(FIRST_RETRY_AT_HIGHEST_DRAW);
@@ -131,6 +138,7 @@ public class SubscriptionRefreshRetryTest extends RpcTestBase {
         Subscription sub = subscribeWith(clock, drawsAt(HIGHEST_DRAW), TOKEN_EXPIRED);
         clock.advance(TTL_MILLIS);
         awaitRefusals(1);
+        awaitRetryArmed(clock, FIRST_RETRY_AT_HIGHEST_DRAW);
         drainExecutor();
         int delaysBeforeRetry = clock.requestedDelays().size();
 
@@ -158,6 +166,13 @@ public class SubscriptionRefreshRetryTest extends RpcTestBase {
     private static long lastDelay(ManualScheduler clock) {
         List<Long> delays = clock.requestedDelays();
         return delays.get(delays.size() - 1);
+    }
+
+
+    // A refusal is reported before its retry is scheduled, and both run on the thread of the reply. The test waits
+    // until the retry of the given delay is armed, so it reads the delays only after that scheduling.
+    private static void awaitRetryArmed(final ManualScheduler clock, final long delayMillis) throws InterruptedException {
+        awaitCondition("the retry of " + delayMillis + " ms is armed", () -> clock.pendingWithDelay(delayMillis) == 1);
     }
 
 
