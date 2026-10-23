@@ -1,6 +1,6 @@
 # Third-party notices
 
-The library itself is under the MIT license, see [LICENSE](LICENSE). The files below come from other projects. Each one keeps the license header it had upstream, and nothing here changes that header.
+The library itself is under the MIT license, see [LICENSE](LICENSE). The files below come from other projects. Each source file keeps the license header it had upstream, and nothing here changes that header. `Fossil.java` had no header upstream, so the BSD 2-Clause notice of its source is added at its top. The test data files have no header, so the license text below covers them.
 
 | Component | Files in this repository | License | Source |
 |---|---|---|---|
@@ -8,7 +8,7 @@ The library itself is under the MIT license, see [LICENSE](LICENSE). The files b
 | Fossil delta decoder | `centrifuge/src/main/java/io/github/centrifugal/centrifuge/Fossil.java` | BSD 2-Clause | https://github.com/dchest/fossil-delta-js |
 | Fossil delta test data | `centrifuge/src/test/resources/data/1` to `data/5` | BSD 2-Clause | https://github.com/dchest/fossil-delta-js (`test/data`) |
 
-The Apache License 2.0 text, which the Gradle wrapper files require to be carried with them, is in [licenses/Apache-2.0.txt](licenses/Apache-2.0.txt). It is the `LICENSE` file of https://github.com/gradle/gradle, copied unchanged, so its appendix is the unfilled boilerplate.
+The Apache License 2.0 text, which the Gradle wrapper files require to be carried with them, is in [licenses/Apache-2.0.txt](licenses/Apache-2.0.txt). It is the `LICENSE` file of https://github.com/gradle/gradle, copied unchanged. The text has no appendix and no copyright line of its own.
 
 `Fossil.java` decodes and applies deltas in the Fossil SCM delta format. Its code follows the JavaScript port `fossil-delta-js` by Dmitry Chestnykh, which is itself based on the original C version by D. Richard Hipp. The test data in `centrifuge/src/test/resources/data/1` to `data/5` (`origin`, `target` and `delta` files) is byte-identical to the test data of the same port. Both keep the BSD 2-Clause license below, copied verbatim from https://github.com/dchest/fossil-delta-js/blob/master/LICENSE.
 

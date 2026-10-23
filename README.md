@@ -479,7 +479,7 @@ The codes of this section are client-local: a server never sends them.
 
 ## License
 
-The library is available under the MIT license, see [LICENSE](LICENSE). The upstream copyright notice is kept unchanged there. The changes of the fork are Copyright (c) 2026 the fork contributors, under the same license.
+The library is available under the MIT license, see [LICENSE](LICENSE), which keeps the upstream copyright notice unchanged. The binary jar, which is the Maven artifact too, carries the `LICENSE` and the [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) under `META-INF/`.
 
 Third-party files which keep their own license are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
@@ -521,7 +521,7 @@ Regenerate API signature with the following command and include an updated `api.
 ./gradlew :centrifuge:metalavaGenerateSignature
 ```
 
-Also indicate a breaking change in changelog.
+Also indicate a breaking change in the pull request description, so it appears in the release notes on GitHub Releases.
 
 To verify API compatibility locally, run the following command:
 ```shell

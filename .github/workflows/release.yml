@@ -117,6 +117,27 @@ jobs:
       - name: Assemble library
         run: ./gradlew :centrifuge:assemble --no-daemon
 
+      - name: Check the license notices in the library jar
+        run: |
+          checked=0
+          for jar in centrifuge/build/libs/*.jar; do
+            case "$jar" in
+              *-sources.jar|*-javadoc.jar) continue ;;
+            esac
+            checked=$((checked + 1))
+            jar tf "$jar" > "$RUNNER_TEMP/jar-entries.txt"
+            for entry in META-INF/LICENSE META-INF/THIRD_PARTY_NOTICES.md; do
+              if ! grep -qx "$entry" "$RUNNER_TEMP/jar-entries.txt"; then
+                echo "::error::${jar} has no ${entry}."
+                exit 1
+              fi
+            done
+          done
+          if [ "$checked" -eq 0 ]; then
+            echo "::error::No library jar was built."
+            exit 1
+          fi
+
       - name: Upload library archive
         uses: actions/upload-artifact@v4
         with:

@@ -39,6 +39,18 @@ java {
     targetCompatibility = JavaVersion.VERSION_1_8
 }
 
+// The binary jar carries the license of the library and the notices of the
+// third-party code it contains (the Fossil delta port, BSD 2-Clause), so they
+// reach every consumer of the Maven artifacts, not only the repository.
+jar {
+    from(rootProject.file('LICENSE')) {
+        into 'META-INF'
+    }
+    from(rootProject.file('THIRD_PARTY_NOTICES.md')) {
+        into 'META-INF'
+    }
+}
+
 // protobuf-gradle-plugin 0.9.x already wires the generated proto sources
 // into `sourceSets.main.java` and the corresponding task dependencies. We
 // only need to declare the integrationTest source set here.
