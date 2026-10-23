@@ -626,15 +626,22 @@ final class RpcSession {
     // The delay of the resend after the given number of later resends: full jitter, uniform in
     // [0, 250 ms * 2^resends] in milliseconds, both ends included.
     static long laterDelayMillis(Random random, int resends) {
-        int boundMillis = (int) (LATER_BASE_MILLIS << resends);
+        return laterDelayMillis(random, resends, Long.MAX_VALUE);
+    }
+
+
+    // The same draw with its range capped at capMillis: the cap limits the range of the draw, not the drawn value.
+    private static long laterDelayMillis(Random random, int resends, long capMillis) {
+        int boundMillis = (int) Math.max(0L, Math.min(LATER_BASE_MILLIS << resends, capMillis));
         return random.nextInt(boundMillis + 1);
     }
 
 
-    // The delay of a later resend in nanoseconds, capped at the time left to the deadline: a resend due after the deadline
-    // falls on the deadline. The main client and the RPC pool take the later rule from here, so the two cannot disagree.
+    // The delay of a later resend in nanoseconds, drawn over [0, min(250 ms * 2^resends, remaining deadline)] in
+    // whole milliseconds: a resend due after the deadline falls on the deadline. The main client and the RPC pool
+    // take the later rule from here, so the two cannot disagree.
     static long laterResendDelayNanos(Random random, int resends, long remainingNanos) {
-        return Math.min(TimeUnit.MILLISECONDS.toNanos(laterDelayMillis(random, resends)), remainingNanos);
+        return TimeUnit.MILLISECONDS.toNanos(laterDelayMillis(random, resends, remainingNanos / 1_000_000L));
     }
 
 

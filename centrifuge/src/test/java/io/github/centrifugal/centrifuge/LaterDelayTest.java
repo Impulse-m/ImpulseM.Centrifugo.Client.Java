@@ -36,6 +36,44 @@ public class LaterDelayTest {
     }
 
 
+    // The cap limits the range of the draw: with 300 ms left, the third resend draws over 301 values, not 1001.
+    @Test
+    public void laterResendDrawRangeIsCappedAtTheRemainingDeadline() {
+        final int[] drawn = {-1};
+        RpcSession.laterResendDelayNanos(new Random() {
+            @Override
+            public int nextInt(int bound) {
+                drawn[0] = bound;
+                return 0;
+            }
+        }, 2, 300_000_000L);
+
+        assertEquals(301, drawn[0]);
+    }
+
+
+    // The intermediate draw is kept as drawn when it lies inside the capped range.
+    @Test
+    public void laterResendIntermediateDrawIsNotChangedByTheCap() {
+        long delayNanos = RpcSession.laterResendDelayNanos(new Random() {
+            @Override
+            public int nextInt(int bound) {
+                return 150;
+            }
+        }, 2, 300_000_000L);
+
+        assertEquals(150_000_000L, delayNanos);
+    }
+
+
+    // With draw 1 the delay is the remaining deadline, not the bound of the resend.
+    @Test
+    public void laterResendDelayIsCappedAtTheRemainingDeadline() {
+        assertEquals(300_000_000L, RpcSession.laterResendDelayNanos(maximum(), 1, 300_000_000L));
+        assertEquals(500_000_000L, RpcSession.laterResendDelayNanos(maximum(), 1, 2_000_000_000L));
+    }
+
+
     // A random source which always returns the largest value of the range.
     private static Random maximum() {
         return new Random() {
