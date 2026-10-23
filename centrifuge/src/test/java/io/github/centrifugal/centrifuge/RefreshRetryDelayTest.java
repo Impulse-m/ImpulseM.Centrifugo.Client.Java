@@ -17,7 +17,8 @@ public class RefreshRetryDelayTest {
     private static final int MIN_MILLIS = 10_000;
     private static final int MAX_MILLIS = AuthRefresh.RETRY_MAX_MILLIS;
     private static final int CAP_MILLIS = 300_000;
-    // The lowest draw gives the minimum; the highest draw, just below one, gives the ceiling of the step.
+    // The lowest draw gives the minimum; the highest draw, just below one, gives the minimum plus the spread of the
+    // step (10 s * 2^step), capped at the ceiling of the step.
     private static final double LOWEST_DRAW = 0.0;
     private static final double HIGHEST_DRAW = 1.0 - 1e-12;
     private static final int DRAWS_PER_STEP = 50;
@@ -25,12 +26,14 @@ public class RefreshRetryDelayTest {
 
     @Test
     public void retryDelayEscalatesAndStopsAtTheCap() {
-        long[] ceilings = {20_000L, 40_000L, 80_000L, 160_000L, 300_000L, 300_000L};
+        // The highest draw after each step: min(ceiling, 10 s + min(ceiling, 10 s * 2^step)).
+        long[] highestDraws = {20_000L, 30_000L, 50_000L, 90_000L, 170_000L, 300_000L};
 
-        for (int step = 0; step < ceilings.length; step++) {
+        for (int step = 0; step < highestDraws.length; step++) {
             assertEquals("the lowest draw after " + step + " failures is the minimum", MIN_MILLIS,
                     AuthRefresh.retryDelayMillis(drawsAt(LOWEST_DRAW), step, MIN_MILLIS, MAX_MILLIS, CAP_MILLIS));
-            assertEquals("the highest draw after " + step + " failures is the ceiling", ceilings[step],
+            assertEquals("the highest draw after " + step + " failures is the minimum plus its spread, capped at the ceiling",
+                    highestDraws[step],
                     AuthRefresh.retryDelayMillis(drawsAt(HIGHEST_DRAW), step, MIN_MILLIS, MAX_MILLIS, CAP_MILLIS));
         }
     }

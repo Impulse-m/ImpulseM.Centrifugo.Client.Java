@@ -37,6 +37,9 @@ public class SubscriptionRefreshRetryTest extends RpcTestBase {
 
     private final AtomicInteger refreshRequests = new AtomicInteger();
     private final AtomicInteger refusalsReported = new AtomicInteger();
+    private final AtomicInteger tokenFetches = new AtomicInteger();
+    // Whether the token getter returns the same token on every fetch. A refused token is then not sent again.
+    private boolean sameTokenOnEveryFetch = false;
     // The delays the clock was asked for once the subscription is subscribed: a refusal must add none for a permission refusal.
     private int scheduledAtSubscribe;
 
@@ -124,6 +127,7 @@ public class SubscriptionRefreshRetryTest extends RpcTestBase {
     @Test
     public void subscriptionRefreshDoesNotResendARefusedToken() throws Exception {
         ManualScheduler clock = new ManualScheduler();
+        sameTokenOnEveryFetch = true;
         Subscription sub = subscribeWith(clock, drawsAt(HIGHEST_DRAW), TOKEN_EXPIRED);
         clock.advance(TTL_MILLIS);
         awaitRefusals(1);
@@ -205,7 +209,7 @@ public class SubscriptionRefreshRetryTest extends RpcTestBase {
         subOpts.setTokenGetter(new SubscriptionTokenGetter() {
             @Override
             public void getSubscriptionToken(SubscriptionTokenEvent event, TokenCallback cb) {
-                cb.Done(null, "token");
+                cb.Done(null, sameTokenOnEveryFetch ? "token" : "token-" + tokenFetches.incrementAndGet());
             }
         });
         Subscription sub = client.newSubscription("ch", subOpts, new SubscriptionEventListener() {
