@@ -34,6 +34,22 @@ final class ManualScheduler extends AbstractExecutorService implements Scheduled
     }
 
 
+    /**
+     * The delays in milliseconds of the tasks scheduled so far, in order, without the tasks of the given delay. A client
+     * schedules its command timeouts on the clock too, so a test which counts the timers of the client passes the timeout
+     * the client was configured with, and reads the timers which are not timeouts.
+     */
+    public synchronized List<Long> requestedDelaysExcept(long delayMillis) {
+        List<Long> delays = new ArrayList<>();
+        for (Long delay : requestedMillis) {
+            if (delay.longValue() != delayMillis) {
+                delays.add(delay);
+            }
+        }
+        return delays;
+    }
+
+
     /** The number of tasks scheduled with the delay which neither ran nor were cancelled. */
     public synchronized int pendingWithDelay(long delayMillis) {
         int count = 0;

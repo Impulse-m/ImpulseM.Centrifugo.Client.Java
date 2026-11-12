@@ -257,11 +257,15 @@ public class AuthTest extends RpcTestBase {
         server.connectResult = expiringResult("u1", "authenticated", 1);
         List<Long> fetchTimes = new CopyOnWriteArrayList<>();
         ManualScheduler clock = new ManualScheduler();
-        newAuthClientOnClock(optionsWithTokenGetter(fetchTimes), clock);
+        Options options = optionsWithTokenGetter(fetchTimes);
+        // Above every retry delay of this test, so no retry can take the value of a command timeout.
+        options.setTimeout(60000);
+        newAuthClientOnClock(options, clock);
         connect(client);
         awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
         refuseRefreshes();
-        int scheduled = clock.requestedDelays().size();
+        drainExecutor();
+        int scheduled = clock.requestedDelaysExcept(options.getTimeout()).size();
 
         clock.advance(1000);
         awaitCondition("refused refresh sent", () -> refreshTokens().size() == 1);
@@ -270,7 +274,7 @@ public class AuthTest extends RpcTestBase {
         // has run everything queued before this call, a retry is either scheduled or it is not.
         drainExecutor();
 
-        assertEquals("no retry is scheduled", scheduled, clock.requestedDelays().size());
+        assertEquals("no retry is scheduled", scheduled, clock.requestedDelaysExcept(options.getTimeout()).size());
         assertEquals("the refused refresh is not sent again", 1, refreshTokens().size());
         assertEquals("the token is not fetched again", 1, fetchTimes.size());
         assertEquals(ClientState.CONNECTED, client.getState());
@@ -291,6 +295,8 @@ public class AuthTest extends RpcTestBase {
                 cb.Done(null, "same-token");
             }
         });
+        // Above every retry delay of this test, so no retry can take the value of a command timeout.
+        options.setTimeout(60000);
         ManualScheduler clock = new ManualScheduler();
         newAuthClientOnClock(options, clock);
         connect(client);
@@ -308,16 +314,17 @@ public class AuthTest extends RpcTestBase {
         awaitCondition("refused refresh sent", () -> refreshTokens().size() == 1);
         awaitCondition("refusal reported", () -> !errorEvents.isEmpty());
         drainExecutor();
-        // The refusal armed its retry, the last delay the clock was asked for.
-        int scheduled = clock.requestedDelays().size();
-        long retryDelay = clock.requestedDelays().get(scheduled - 1);
+        // The refusal armed its retry, the last delay the clock was asked for besides the command timeouts.
+        List<Long> delays = clock.requestedDelaysExcept(options.getTimeout());
+        int scheduled = delays.size();
+        long retryDelay = delays.get(scheduled - 1);
 
         clock.advance(retryDelay);
         awaitCondition("the retry fetched the token again", () -> fetches.get() == 2);
         drainExecutor();
 
         assertEquals("the refused token is not sent again", 1, refreshTokens().size());
-        assertEquals("no retry is armed after it", scheduled, clock.requestedDelays().size());
+        assertEquals("no retry is armed after it", scheduled, clock.requestedDelaysExcept(options.getTimeout()).size());
         assertTrue("the next connect refreshes", client.refreshRequired);
     }
 
@@ -355,7 +362,7 @@ public class AuthTest extends RpcTestBase {
         clock.advance(1000);
         awaitCondition("the failed fetch is reported", () -> !errorEvents.isEmpty());
         drainExecutor();
-        long retryDelay = clock.requestedDelays().get(clock.requestedDelays().size() - 1);
+        long retryDelay = lastDelay(clock, options.getTimeout());
         assertTrue("the retry waits on the backoff, not a flat delay: " + retryDelay,
                 retryDelay >= AuthRefresh.RETRY_MIN_MILLIS && retryDelay <= AuthRefresh.RETRY_MAX_MILLIS);
 
@@ -605,9 +612,9 @@ public class AuthTest extends RpcTestBase {
         clock.advance(1000);
         awaitCondition("timer fetch started", () -> fetches.size() == 1);
 
-        int scheduled = clock.requestedDelays().size();
+        int scheduled = clock.requestedDelaysExcept(options.getTimeout()).size();
         server.closeConnection();
-        awaitCondition("the reconnect is scheduled", () -> clock.requestedDelays().size() > scheduled);
+        awaitCondition("the reconnect is scheduled", () -> clock.requestedDelaysExcept(options.getTimeout()).size() > scheduled);
         fetches.get(0).Done(null, "token-next");
         awaitCondition("the token of the fetch is kept for the next connect", () -> "token-next".equals(client.token));
 
@@ -630,9 +637,9 @@ public class AuthTest extends RpcTestBase {
         awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
         clock.advance(1000);
         awaitCondition("timer fetch started", () -> fetches.size() == 1);
-        int scheduled = clock.requestedDelays().size();
+        int scheduled = clock.requestedDelaysExcept(options.getTimeout()).size();
         server.closeConnection();
-        awaitCondition("the reconnect is scheduled", () -> clock.requestedDelays().size() > scheduled);
+        awaitCondition("the reconnect is scheduled", () -> clock.requestedDelaysExcept(options.getTimeout()).size() > scheduled);
         answerRefreshes("u2", "authenticated");
 
         CompletableFuture<AuthResult> refreshFuture = refresh(client, "token-2");
@@ -682,9 +689,9 @@ public class AuthTest extends RpcTestBase {
         awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
         clock.advance(1000);
         awaitCondition("timer fetch started", () -> fetches.size() == 1);
-        int scheduled = clock.requestedDelays().size();
+        int scheduled = clock.requestedDelaysExcept(options.getTimeout()).size();
         server.closeConnection();
-        awaitCondition("the reconnect is scheduled", () -> clock.requestedDelays().size() > scheduled);
+        awaitCondition("the reconnect is scheduled", () -> clock.requestedDelaysExcept(options.getTimeout()).size() > scheduled);
 
         client.setToken("token-C");
         drainExecutor();
@@ -702,19 +709,20 @@ public class AuthTest extends RpcTestBase {
         server.connectResult = expiringResult("u1", "authenticated", 1);
         ManualScheduler clock = new ManualScheduler();
         List<TokenCallback> fetches = new CopyOnWriteArrayList<>();
-        newAuthClientOnClock(recordingTokenOptions(fetches), clock);
+        Options options = recordingTokenOptions(fetches);
+        newAuthClientOnClock(options, clock);
         connect(client);
         awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
         clock.advance(1000);
         awaitCondition("timer fetch started", () -> fetches.size() == 1);
-        int scheduled = clock.requestedDelays().size();
+        int scheduled = clock.requestedDelaysExcept(options.getTimeout()).size();
 
         client.setToken("token-C");
         drainExecutor();
         fetches.get(0).Done(null, "token-B");
         drainExecutor();
 
-        awaitCondition("the timer is armed again", () -> clock.requestedDelays().size() > scheduled);
+        awaitCondition("the timer is armed again", () -> clock.requestedDelaysExcept(options.getTimeout()).size() > scheduled);
         syncWithServer();
         assertFalse("no refresh carries the token of the stale fetch", refreshTokens().contains("token-B"));
         assertTrue("no refresh is sent for the stale fetch", refreshTokens().isEmpty());
@@ -1488,13 +1496,14 @@ public class AuthTest extends RpcTestBase {
     public void timerRetryCeilingGrowsWithEachFailureUpToTheCap() throws Exception {
         server.connectResult = expiringResult("u1", "authenticated", 1);
         ManualScheduler clock = new ManualScheduler();
-        newAuthClientOnClock(timerGetterOptions(new AtomicBoolean(true), 3200), clock);
+        Options options = timerGetterOptions(new AtomicBoolean(true), 3200);
+        newAuthClientOnClock(options, clock);
         connect(client);
         awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
 
-        int seen = clock.requestedDelays().size();
+        int seen = clock.requestedDelaysExcept(options.getTimeout()).size();
         clock.advance(1000);
-        List<Long> retries = failTimerRetries(clock, seen, 7);
+        List<Long> retries = failTimerRetries(clock, options.getTimeout(), seen, 7);
 
         // The ceiling of the k-th retry is 100 ms doubled k - 1 times, up to the cap of 3200 ms.
         long[] ceilings = {100, 200, 400, 800, 1600, 3200, 3200};
@@ -1516,13 +1525,15 @@ public class AuthTest extends RpcTestBase {
         ManualScheduler clock = new ManualScheduler();
         Options options = timerGetterOptions(new AtomicBoolean(true));
         assertEquals("the default retry cap is 5 minutes", 300000, options.getTokenRetryCap());
+        // Above every retry ceiling of this test (12800 ms at the eighth failure), so no retry can take the value of a command timeout.
+        options.setTimeout(60000);
         newAuthClientOnClock(options, clock);
         connect(client);
         awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
 
-        int seen = clock.requestedDelays().size();
+        int seen = clock.requestedDelaysExcept(options.getTimeout()).size();
         clock.advance(1000);
-        List<Long> retries = failTimerRetries(clock, seen, 8);
+        List<Long> retries = failTimerRetries(clock, options.getTimeout(), seen, 8);
 
         // Without a cap set, the ceiling of the k-th retry is 100 ms doubled k - 1 times, with no limit below 300000 ms.
         for (int i = 0; i < retries.size(); i++) {
@@ -1544,12 +1555,15 @@ public class AuthTest extends RpcTestBase {
         server.connectResult = expiringResult("u1", "authenticated", 1);
         ManualScheduler clock = new ManualScheduler();
         AtomicBoolean failing = new AtomicBoolean(true);
-        newAuthClientOnClock(timerGetterOptions(failing, 3200), clock);
+        Options options = timerGetterOptions(failing, 3200);
+        final long timeoutMillis = options.getTimeout();
+        newAuthClientOnClock(options, clock);
         connect(client);
         awaitCondition("the timer is scheduled one ttl after the connect", () -> clock.requestedDelays().contains(1000L));
-        int seen = clock.requestedDelays().size();
+        drainExecutor();
+        int seen = clock.requestedDelaysExcept(timeoutMillis).size();
         clock.advance(1000);
-        failTimerRetries(clock, seen, 4);
+        failTimerRetries(clock, timeoutMillis, seen, 4);
 
         // Each cycle is a successful fetch, then one failure after its expiry. The success resets the failure step, which the
         // test reads from the field: the first retry after a success draws from the bounds of the configured maximum, at most
@@ -1558,18 +1572,19 @@ public class AuthTest extends RpcTestBase {
             failing.set(false);
             answerRefreshWith(Protocol.Reply.newBuilder()
                     .setRefresh(Protocol.RefreshResult.newBuilder().setUser("u1").setAuthClass("authenticated").setExpires(true).setTtl(1)));
-            final int beforeSuccess = clock.requestedDelays().size();
-            clock.advance(lastDelay(clock));
-            awaitCondition("the successful fetch schedules the next expiry", () -> clock.requestedDelays().size() > beforeSuccess);
+            final int beforeSuccess = clock.requestedDelaysExcept(timeoutMillis).size();
+            clock.advance(lastDelay(clock, timeoutMillis));
+            // The success is awaited by the expiry it schedules: the command timeout of the fetch is not the next expiry.
+            awaitCondition("the successful fetch schedules the next expiry", () -> clock.requestedDelaysExcept(timeoutMillis).size() > beforeSuccess);
             assertEquals("cycle " + cycle + ": the success resets the failure step", 0, retryStepOf(client));
 
             failing.set(true);
-            final int beforeFailure = clock.requestedDelays().size();
+            final int beforeFailure = clock.requestedDelaysExcept(timeoutMillis).size();
             clock.advance(1000);
-            awaitCondition("the failure after the expiry schedules a retry", () -> clock.requestedDelays().size() > beforeFailure);
+            awaitCondition("the failure after the expiry schedules a retry", () -> clock.requestedDelaysExcept(timeoutMillis).size() > beforeFailure);
             awaitCondition("cycle " + cycle + ": one failure counts one step", () -> retryStepOf(client) == 1);
             assertTrue("cycle " + cycle + ": the ceiling starts again at the configured maximum, the delays are " + clock.requestedDelays(),
-                    lastDelay(clock) <= 100);
+                    lastDelay(clock, timeoutMillis) <= 100);
         }
     }
 
@@ -1612,23 +1627,33 @@ public class AuthTest extends RpcTestBase {
 
     // Lets each retry of a failing timer fetch run, one after another, and returns the delays the retries were scheduled with.
     // The seen delays are those scheduled before the failing fetch ran: each retry is the first delay scheduled after them.
-    private List<Long> failTimerRetries(ManualScheduler clock, int seen, int count) throws InterruptedException {
+    // The command timeouts of the fetch are left out: a failing fetch schedules its timeout before its retry.
+    private List<Long> failTimerRetries(
+            ManualScheduler clock,
+            final long timeoutMillis,
+            int seen,
+            int count
+    ) throws InterruptedException {
         List<Long> retries = new ArrayList<>();
         int known = seen;
         for (int i = 0; i < count; i++) {
             final int wanted = known + 1;
-            awaitCondition("retry " + (i + 1) + " is scheduled", () -> clock.requestedDelays().size() >= wanted);
-            known = clock.requestedDelays().size();
-            long delay = lastDelay(clock);
+            awaitCondition("retry " + (i + 1) + " is scheduled", () -> clock.requestedDelaysExcept(timeoutMillis).size() >= wanted);
+            known = clock.requestedDelaysExcept(timeoutMillis).size();
+            long delay = lastDelay(clock, timeoutMillis);
             retries.add(delay);
             clock.advance(delay);
         }
+        // The last retry fails on the executor after the clock moved, and arms the next one: the caller finds that one pending.
+        final int armed = known + 1;
+        awaitCondition("the retry after the last one is scheduled", () -> clock.requestedDelaysExcept(timeoutMillis).size() >= armed);
         return retries;
     }
 
 
-    private static long lastDelay(ManualScheduler clock) {
-        List<Long> delays = clock.requestedDelays();
+    // The delay of the last task scheduled, without the command timeouts of the client.
+    private static long lastDelay(ManualScheduler clock, long timeoutMillis) {
+        List<Long> delays = clock.requestedDelaysExcept(timeoutMillis);
         return delays.get(delays.size() - 1);
     }
 }

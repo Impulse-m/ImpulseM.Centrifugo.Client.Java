@@ -631,7 +631,10 @@ public class TokenExchangeTest extends RpcTestBase {
                 cb.onDone(new UnauthorizedException(), null);
             }
         };
-        newExchangeClient(exchangeOptions(storage), clock);
+        Options options = exchangeOptions(storage);
+        // The horizon is 5000 ms: the default timeout is 5000 too, so a timeout would satisfy the check below. A timeout of 200 ms does not.
+        options.setTimeout(200);
+        newExchangeClient(options, clock);
 
         client.connect();
         awaitCondition("refusal reported", () -> !errors.isEmpty());
@@ -764,13 +767,14 @@ public class TokenExchangeTest extends RpcTestBase {
         // runs after the grace has passed: its first refusal of the same value opens the run, and gets its one re-presentation.
         ManualScheduler clock = new ManualScheduler();
         HoldingThenRefusing storage = new HoldingThenRefusing("refresh-1");
-        newExchangeClient(exchangeOptions(storage), clock);
+        Options options = exchangeOptions(storage);
+        newExchangeClient(options, clock);
         client.connect();
         awaitCondition("first exchange started", () -> storage.held != null);
-        int delaysBefore = clock.requestedDelays().size();
+        int delaysBefore = clock.requestedDelaysExcept(options.getTimeout()).size();
 
         server.closeConnection();
-        awaitCondition("connection lost", () -> clock.requestedDelays().size() > delaysBefore);
+        awaitCondition("connection lost", () -> clock.requestedDelaysExcept(options.getTimeout()).size() > delaysBefore);
         storage.held.onDone(new UnauthorizedException(), null);
         drainExecutor();
         assertNull(horizonOf());
@@ -817,7 +821,8 @@ public class TokenExchangeTest extends RpcTestBase {
             }
             return null;
         };
-        newExchangeClient(exchangeOptions(storage), clock);
+        Options options = exchangeOptions(storage);
+        newExchangeClient(options, clock);
         client.connect();
         awaitCondition("connected", () -> connected.size() == 1);
         long delay = renewalDelay(clock);
@@ -826,7 +831,7 @@ public class TokenExchangeTest extends RpcTestBase {
         clock.advance(delay);
         awaitCondition("refusal reported", () -> errors.size() == 1);
         awaitCondition("retry armed", () -> {
-            long last = lastRequestedDelay(clock);
+            long last = lastRequestedDelay(clock, options.getTimeout());
             return last >= RETRY_MIN_MILLIS && last <= RETRY_MAX_MILLIS;
         });
         assertNotNull(horizonOf());
@@ -871,7 +876,10 @@ public class TokenExchangeTest extends RpcTestBase {
                 super.exchange(event, cb);
             }
         };
-        newExchangeClient(exchangeOptions(storage), clock);
+        Options options = exchangeOptions(storage);
+        // The grace of this test is 5 seconds, so its horizon is 5000 ms: the timeout is set off that value.
+        options.setTimeout(6000);
+        newExchangeClient(options, clock);
         client.connect();
         awaitCondition("connected", () -> connected.size() == 1);
         long delay = renewalDelay(clock);
@@ -882,7 +890,7 @@ public class TokenExchangeTest extends RpcTestBase {
         awaitCondition("refusal reported", () -> errors.size() == 1);
         // The retry of the refused renewal is armed after the error is reported: the transport is lost only once it is.
         awaitCondition("retry armed", () -> {
-            long last = lastRequestedDelay(clock);
+            long last = lastRequestedDelay(clock, options.getTimeout());
             return last >= RETRY_MIN_MILLIS && last <= RETRY_MAX_MILLIS;
         });
         assertTrue(disconnects.isEmpty());
@@ -1417,7 +1425,7 @@ public class TokenExchangeTest extends RpcTestBase {
         newExchangeClient(options, clock);
         client.connect();
         awaitCondition("first exchange started", () -> storage.held != null);
-        int delaysBefore = clock.requestedDelays().size();
+        int delaysBefore = clock.requestedDelaysExcept(options.getTimeout()).size();
 
         clock.advance(options.getTimeout());
 
@@ -1425,12 +1433,12 @@ public class TokenExchangeTest extends RpcTestBase {
         assertTrue(errors.get(0) instanceof TokenError);
         assertTrue(connected.isEmpty());
         // The connection stays open for the failure backoff, and closes once it has run: its first step is 5 to 10 seconds.
-        awaitCondition("close scheduled", () -> clock.requestedDelays().size() == delaysBefore + 1);
+        awaitCondition("close scheduled", () -> clock.requestedDelaysExcept(options.getTimeout()).size() == delaysBefore + 1);
         assertEquals(1, kinds().stream().filter("connect"::equals).count());
-        long closeDelay = clock.requestedDelays().get(delaysBefore);
+        long closeDelay = clock.requestedDelaysExcept(options.getTimeout()).get(delaysBefore);
         assertTrue(closeDelay >= BOOTSTRAP_RETRY_MIN_MILLIS && closeDelay <= 2 * BOOTSTRAP_RETRY_MIN_MILLIS);
         clock.advance(closeDelay);
-        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() == delaysBefore + 2);
+        awaitCondition("reconnect scheduled", () -> clock.requestedDelaysExcept(options.getTimeout()).size() == delaysBefore + 2);
         clock.advance(60000);
         awaitCondition("connected", () -> connected.size() == 1);
         assertEquals(Arrays.asList("refresh-1", "refresh-1"), storage.exchanged);
@@ -1464,35 +1472,35 @@ public class TokenExchangeTest extends RpcTestBase {
 
         // The first stall: the connection closes after the first step of the failure backoff, 5 to 10 seconds.
         awaitCondition("first exchange started", () -> storage.exchanged.size() == 1);
-        final int firstStallFrom = clock.requestedDelays().size();
+        final int firstStallFrom = clock.requestedDelaysExcept(options.getTimeout()).size();
         clock.advance(options.getTimeout());
         // The error is reported before the close is scheduled, so the schedule is awaited.
-        awaitCondition("first close scheduled", () -> clock.requestedDelays().size() == firstStallFrom + 1);
+        awaitCondition("first close scheduled", () -> clock.requestedDelaysExcept(options.getTimeout()).size() == firstStallFrom + 1);
         assertEquals(1, tokenErrorCount());
-        long firstClose = lastDelay(clock);
+        long firstClose = lastDelay(clock, options.getTimeout());
         assertTrue(firstClose >= BOOTSTRAP_RETRY_MIN_MILLIS && firstClose <= 2 * BOOTSTRAP_RETRY_MIN_MILLIS);
         assertEquals(1, kinds().stream().filter("connect"::equals).count());
-        final int firstReconnectFrom = clock.requestedDelays().size();
+        final int firstReconnectFrom = clock.requestedDelaysExcept(options.getTimeout()).size();
         clock.advance(firstClose);
-        awaitCondition("first close reconnects", () -> clock.requestedDelays().size() == firstReconnectFrom + 1);
+        awaitCondition("first close reconnects", () -> clock.requestedDelaysExcept(options.getTimeout()).size() == firstReconnectFrom + 1);
         clock.advance(RETRY_MAX_MILLIS);
 
         // The second stall, on the next connect: the step escalates, so its backoff is 5 to 15 seconds.
         awaitCondition("second exchange started", () -> storage.exchanged.size() == 2);
-        final int secondStallFrom = clock.requestedDelays().size();
+        final int secondStallFrom = clock.requestedDelaysExcept(options.getTimeout()).size();
         clock.advance(options.getTimeout());
-        awaitCondition("second close scheduled", () -> clock.requestedDelays().size() == secondStallFrom + 1);
+        awaitCondition("second close scheduled", () -> clock.requestedDelaysExcept(options.getTimeout()).size() == secondStallFrom + 1);
         assertEquals(2, tokenErrorCount());
         assertEquals(2, ((Integer) fieldOf(fieldOf(client.auth, "flow"), "bootstrapAttempt")).intValue());
-        long secondClose = lastDelay(clock);
+        long secondClose = lastDelay(clock, options.getTimeout());
         assertTrue(secondClose >= BOOTSTRAP_RETRY_MIN_MILLIS && secondClose <= 3 * BOOTSTRAP_RETRY_MIN_MILLIS);
         assertEquals(2, kinds().stream().filter("connect"::equals).count());
 
         // The third connect succeeds: the completed bootstrap resets the escalation.
         stalling.set(false);
-        final int secondReconnectFrom = clock.requestedDelays().size();
+        final int secondReconnectFrom = clock.requestedDelaysExcept(options.getTimeout()).size();
         clock.advance(secondClose);
-        awaitCondition("second close reconnects", () -> clock.requestedDelays().size() == secondReconnectFrom + 1);
+        awaitCondition("second close reconnects", () -> clock.requestedDelaysExcept(options.getTimeout()).size() == secondReconnectFrom + 1);
         clock.advance(RETRY_MAX_MILLIS);
         awaitCondition("connected", () -> connected.size() == 1);
         assertEquals(0, ((Integer) fieldOf(fieldOf(client.auth, "flow"), "bootstrapAttempt")).intValue());
@@ -1512,16 +1520,20 @@ public class TokenExchangeTest extends RpcTestBase {
         newExchangeClient(options, clock);
         client.connect();
         awaitCondition("refresh sent", () -> refreshTokens().size() == 1);
-        int delaysBefore = clock.requestedDelays().size();
+        // The refresh command is unanswered: its timeout is on the clock, so the clock moves past it, as real time did.
+        final long timeoutMillis = options.getTimeout();
+        int delaysBefore = clock.requestedDelaysExcept(timeoutMillis).size();
+
+        clock.advance(timeoutMillis);
 
         awaitCondition("timeout reported", () -> !errors.isEmpty());
         assertTrue(errors.get(0) instanceof TokenError);
-        awaitCondition("close scheduled", () -> clock.requestedDelays().size() == delaysBefore + 1);
+        awaitCondition("close scheduled", () -> clock.requestedDelaysExcept(timeoutMillis).size() == delaysBefore + 1);
         assertTrue(connected.isEmpty());
         // The app logs out while the client waits: the next bootstrap finds no refresh token.
         storage.refreshToken = null;
-        clock.advance(clock.requestedDelays().get(delaysBefore));
-        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() == delaysBefore + 2);
+        clock.advance(clock.requestedDelaysExcept(timeoutMillis).get(delaysBefore));
+        awaitCondition("reconnect scheduled", () -> clock.requestedDelaysExcept(timeoutMillis).size() == delaysBefore + 2);
         clock.advance(60000);
 
         awaitCondition("connected", () -> connected.size() == 1);
@@ -1613,9 +1625,9 @@ public class TokenExchangeTest extends RpcTestBase {
             clock.advance(60000);
         }
         awaitCondition("third retry scheduled", () -> bootstrapDelays(clock).size() == 3);
-        int delaysBefore = clock.requestedDelays().size();
+        int delaysBefore = clock.requestedDelaysExcept(options.getTimeout()).size();
         server.closeConnection();
-        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() > delaysBefore);
+        awaitCondition("reconnect scheduled", () -> clock.requestedDelaysExcept(options.getTimeout()).size() > delaysBefore);
         clock.advance(RETRY_MAX_MILLIS);
 
         // The attempts count on across the abandoned bootstrap: the new one's first failure takes the fourth step.
@@ -1904,13 +1916,14 @@ public class TokenExchangeTest extends RpcTestBase {
         answerIdentity(false, 0);
         StallingStorage storage = new StallingStorage("refresh-1");
         ManualScheduler clock = new ManualScheduler();
-        newExchangeClient(exchangeOptions(storage), clock);
+        Options options = exchangeOptions(storage);
+        newExchangeClient(options, clock);
         client.connect();
         awaitCondition("first exchange started", () -> storage.held != null);
-        int delaysBefore = clock.requestedDelays().size();
+        int delaysBefore = clock.requestedDelaysExcept(options.getTimeout()).size();
 
         server.closeConnection();
-        awaitCondition("connection lost", () -> clock.requestedDelays().size() > delaysBefore);
+        awaitCondition("connection lost", () -> clock.requestedDelaysExcept(options.getTimeout()).size() > delaysBefore);
         // The reconnect is not run: the late reply is the only one, and the application still holds the used token.
         assertEquals("refresh-1", storage.load());
         storage.held.onDone(null, new TokenExchangeResult("access-stale", "refresh-2"));
@@ -2150,10 +2163,13 @@ public class TokenExchangeTest extends RpcTestBase {
         answerIdentity(false, 0);
         StallingStorage storage = new StallingStorage("refresh-1");
         ManualScheduler clock = new ManualScheduler();
-        newExchangeClient(exchangeOptions(storage), clock);
+        Options options = exchangeOptions(storage);
+        // Below the bootstrap backoff of the close, which is 5 to 10 seconds, so no close delay takes the value of a timeout.
+        options.setTimeout(200);
+        newExchangeClient(options, clock);
         client.connect();
         awaitCondition("exchange started", () -> storage.held != null);
-        int delaysBefore = clock.requestedDelays().size();
+        int delaysBefore = clock.requestedDelaysExcept(options.getTimeout()).size();
 
         // The socket is closed before the refresh command is written: the write is refused, so its outcome is unknown.
         // The peer does not answer the close frame, so the disconnect cannot overtake the exchange's result on the executor.
@@ -2166,9 +2182,9 @@ public class TokenExchangeTest extends RpcTestBase {
         assertTrue(refreshTokens().isEmpty());
         assertTrue(connected.isEmpty());
         // The connection stays open for the failure backoff, then closes, and the reconnect bootstraps again.
-        awaitCondition("close scheduled", () -> clock.requestedDelays().size() == delaysBefore + 1);
-        clock.advance(clock.requestedDelays().get(delaysBefore));
-        awaitCondition("reconnect scheduled", () -> clock.requestedDelays().size() == delaysBefore + 2);
+        awaitCondition("close scheduled", () -> clock.requestedDelaysExcept(options.getTimeout()).size() == delaysBefore + 1);
+        clock.advance(clock.requestedDelaysExcept(options.getTimeout()).get(delaysBefore));
+        awaitCondition("reconnect scheduled", () -> clock.requestedDelaysExcept(options.getTimeout()).size() == delaysBefore + 2);
         clock.advance(60000);
 
         awaitCondition("connected", () -> connected.size() == 1);
@@ -2878,9 +2894,9 @@ public class TokenExchangeTest extends RpcTestBase {
     }
 
 
-    // The delay of the last task the clock was asked to run.
-    private static long lastDelay(ManualScheduler clock) {
-        List<Long> delays = clock.requestedDelays();
+    // The delay of the last task the clock was asked to run, without the command timeouts of the client.
+    private static long lastDelay(ManualScheduler clock, long timeoutMillis) {
+        List<Long> delays = clock.requestedDelaysExcept(timeoutMillis);
         return delays.get(delays.size() - 1);
     }
 
@@ -2904,9 +2920,9 @@ public class TokenExchangeTest extends RpcTestBase {
     }
 
 
-    // The delay of the task scheduled last, or -1 when none was.
-    private static long lastRequestedDelay(ManualScheduler clock) {
-        List<Long> delays = clock.requestedDelays();
+    // The delay of the task scheduled last, or -1 when none was, without the command timeouts of the client.
+    private static long lastRequestedDelay(ManualScheduler clock, long timeoutMillis) {
+        List<Long> delays = clock.requestedDelaysExcept(timeoutMillis);
         return delays.isEmpty() ? -1L : delays.get(delays.size() - 1);
     }
 
