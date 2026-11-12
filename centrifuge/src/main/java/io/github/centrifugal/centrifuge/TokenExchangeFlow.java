@@ -15,7 +15,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
-import java8.util.concurrent.CompletableFuture;
 import okhttp3.WebSocket;
 
 
@@ -294,21 +293,30 @@ final class TokenExchangeFlow {
 
 
     /**
-     * Writes a plain command on the transport and completes with its reply. The command carries no message
+     * Writes a plain command on the transport and hands its reply to the listener, once. The command carries no message
      * id, is not retransmitted, and is not held for the connected state. Fails with IOException when the
      * transport is not the current one, or when it refuses the command. Runs on the executor.
      */
-    static CompletableFuture<Protocol.Reply> writePlain(
+    static void writePlain(
             final ClientHost host,
             final WebSocket transport,
-            Protocol.Command.Builder builder
+            Protocol.Command.Builder builder,
+            final CallFuture.Listener<Protocol.Reply> listener
     ) {
-        CompletableFuture<Protocol.Reply> future = new CompletableFuture<>();
         if (host.transport() != transport) {
-            future.completeExceptionally(new IOException());
-            return future;
+            listener.onDone(null, new IOException());
+            return;
         }
         final int id = host.nextCommandId();
+        CallFuture<Protocol.Reply> future = new CallFuture<>();
+        // The client timeout fails the command, and the listener runs once, after the entry of the command is removed.
+        host.settle(future, (Protocol.Reply reply) -> {
+            host.removeFuture(id);
+            listener.onDone(reply, null);
+        }, (Throwable err) -> {
+            host.removeFuture(id);
+            listener.onDone(null, err);
+        });
         host.addFuture(id, future);
         try {
             if (!host.sendCommand(builder.setId(id).build())) {
@@ -317,8 +325,6 @@ final class TokenExchangeFlow {
         } catch (IOException e) {
             future.completeExceptionally(e);
         }
-        return future.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS)
-                .whenComplete((Protocol.Reply reply, Throwable err) -> host.removeFuture(id));
     }
 
 
@@ -343,7 +349,7 @@ final class TokenExchangeFlow {
                         .setMethod(method)
                         .setData(com.google.protobuf.ByteString.copyFrom(data)));
         final ResultCallback<RPCResult> classified = classifyRefusal(cb, refusalTypes);
-        writePlain(host, transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> {
+        writePlain(host, transport, builder, (Protocol.Reply reply, Throwable err) -> {
             host.runOrInline(() -> RpcSession.deliver(host, classified, reply, err));
         });
     }
@@ -597,7 +603,7 @@ final class TokenExchangeFlow {
         b.tokenSet = true;
         Protocol.Command.Builder builder = Protocol.Command.newBuilder()
                 .setRefresh(Protocol.RefreshRequest.newBuilder().setToken(accessToken));
-        writePlain(host, b.transport, builder).whenComplete((Protocol.Reply reply, Throwable err) -> {
+        writePlain(host, b.transport, builder, (Protocol.Reply reply, Throwable err) -> {
             host.runOrInline(() -> onRefreshed(b, reply, err));
         });
     }
@@ -607,7 +613,7 @@ final class TokenExchangeFlow {
         if (!isCurrent(b)) {
             return;
         }
-        Throwable failure = err != null ? Extensions.unwrapCompletion(err) : null;
+        Throwable failure = err;
         if (failure == null && reply.getError().getCode() != 0) {
             failure = host.replyError(reply);
         }

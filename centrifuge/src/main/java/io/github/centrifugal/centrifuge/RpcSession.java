@@ -21,8 +21,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import com.google.protobuf.UnsafeByteOperations;
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
-import java8.util.concurrent.CompletableFuture;
-
 
 /**
  * The exactly-once rpc calls of one client. A call waits in the queue until it is written to a
@@ -237,8 +235,8 @@ final class RpcSession {
      * The client is closed: the futures still pending fail, and so do the calls which wait for a
      * connection, as a transport loss without a reconnect does.
      */
-    void failOnClose(Collection<CompletableFuture<Protocol.Reply>> pendingFutures) {
-        for (CompletableFuture<Protocol.Reply> f : pendingFutures) {
+    void failOnClose(Collection<CallFuture<Protocol.Reply>> pendingFutures) {
+        for (CallFuture<Protocol.Reply> f : pendingFutures) {
             f.completeExceptionally(new IOException());
         }
         onTransportLost(false);
@@ -260,7 +258,7 @@ final class RpcSession {
         // resends the call here, and the call is not kept with the msg_id it was refused with.
         for (RpcCall call : new ArrayList<>(onWire.values())) {
             if (answerQueued(call)) {
-                finishAttempt(call, call.attempt.getNow(null), null);
+                finishAttempt(call, call.attemptReply, null);
             }
         }
         List<RpcCall> lost = new ArrayList<>();
@@ -420,8 +418,13 @@ final class RpcSession {
                 .build();
         // Each attempt has a future of its own, which the transport settles. A refusal which is sent
         // again settles the attempt only, not the call.
-        CompletableFuture<Protocol.Reply> attempt = new CompletableFuture<>();
-        attempt.whenComplete((Protocol.Reply reply, Throwable error) -> settleAttempt(call, reply, error));
+        CallFuture<Protocol.Reply> attempt = new CallFuture<>();
+        call.attemptAnswered = false;
+        attempt.whenComplete((Protocol.Reply reply, Throwable error) -> {
+            call.attemptReply = reply;
+            call.attemptAnswered = reply != null;
+            settleAttempt(call, reply, error);
+        });
         call.attempt = attempt;
         host.addFuture(id, attempt);
         onWire.put(id, call);
@@ -511,7 +514,7 @@ final class RpcSession {
                 .setId(id)
                 .setRpc(req)
                 .build();
-        CompletableFuture<Protocol.Reply> reply = new CompletableFuture<>();
+        CallFuture<Protocol.Reply> reply = new CallFuture<>();
         reply.whenComplete((Protocol.Reply answer, Throwable error) -> Extensions.submitOrIgnore(host.executor(), () -> forgetCancel(id)));
         host.addFuture(id, reply);
         CancelCommand command = new CancelCommand(msgId, acks);
@@ -690,7 +693,7 @@ final class RpcSession {
             forgetAttempt(call);
         }
         if (reply == null) {
-            if (call.wireTracked && !call.answered && Extensions.unwrapCompletion(error) instanceof TimeoutException && !answerQueued(call)) {
+            if (call.wireTracked && !call.answered && error instanceof TimeoutException && !answerQueued(call)) {
                 // The server may still run a sent call, so the deadline cancels it as cancel() does.
                 sendCancel(call.msgId);
             }
@@ -704,7 +707,7 @@ final class RpcSession {
     // Whether the server answered the last attempt of the call, and the answer waits for the executor. The
     // server ran or refused the call then, so a deadline sends no cancel for it.
     private static boolean answerQueued(RpcCall call) {
-        return call.attempt != null && call.attempt.isDone() && !call.attempt.isCompletedExceptionally();
+        return call.attempt != null && call.attemptAnswered;
     }
 
 
@@ -805,7 +808,7 @@ final class RpcSession {
     // session is gone with the executor.
     static void deliver(ClientHost host, ResultCallback<RPCResult> callback, Protocol.Reply reply, Throwable error) {
         if (reply == null) {
-            callback.onDone(Extensions.unwrapCompletion(error), null);
+            callback.onDone(error, null);
             return;
         }
         if (reply.getError().getCode() != 0) {

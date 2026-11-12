@@ -6,7 +6,6 @@ import java.util.concurrent.ScheduledExecutorService;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
-import java8.util.concurrent.CompletableFuture;
 import okhttp3.WebSocket;
 
 
@@ -135,7 +134,7 @@ final class ClientHost {
     }
 
 
-    void addFuture(int id, CompletableFuture<Protocol.Reply> future) {
+    void addFuture(int id, CallFuture<Protocol.Reply> future) {
         client.futures.put(id, future);
     }
 
@@ -152,8 +151,14 @@ final class ClientHost {
     }
 
 
-    void enqueueCommand(Protocol.Command cmd, CompletableFuture<Protocol.Reply> future) {
+    void enqueueCommand(Protocol.Command cmd, CallFuture<Protocol.Reply> future) {
         client.enqueueCommandFuture(cmd, future);
+    }
+
+
+    /** Settles the future once: the client timeout fails it, and the handlers run as {@link Client#settle} runs them. */
+    <T> void settle(CallFuture<T> f, CallFuture.Consumer<T> onResult, CallFuture.Consumer<Throwable> onError) {
+        client.settle(f, onResult, onError);
     }
 
 

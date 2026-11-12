@@ -8,7 +8,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
-import java8.util.concurrent.CompletableFuture;
 
 
 /**
@@ -30,7 +29,7 @@ public final class RpcCall {
 
     // The fields below are the state of the call on the client's executor thread.
     // The future is created with the call, so a cancel can complete it before the call starts.
-    final CompletableFuture<Protocol.Reply> future = new CompletableFuture<>();
+    final CallFuture<Protocol.Reply> future = new CallFuture<>();
     long msgId;
     int commandId;
     // Holds a slot of the bound on the calls of the client, taken at submit and given back when the call
@@ -53,7 +52,12 @@ public final class RpcCall {
     ScheduledFuture<?> deadlineTask;
     // The attempt on the wire: its future completes with the answer of the transport, and the executor
     // clears the field once it has decided on the answer.
-    CompletableFuture<Protocol.Reply> attempt;
+    CallFuture<Protocol.Reply> attempt;
+    // The attempt was answered by the server, so its future completed with a reply and not with an error of the transport.
+    // Set by the attempt's listener, which runs once the future is complete.
+    volatile boolean attemptAnswered;
+    // The reply the attempt was answered with. Written by the attempt's listener before attemptAnswered, and read only after it.
+    Protocol.Reply attemptReply;
     // The resend which waits for its delay, cancelled with the call. The generation tells the timer of
     // a resend from the timer of a later one.
     ScheduledFuture<?> resendTask;

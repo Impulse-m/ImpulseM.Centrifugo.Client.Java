@@ -22,7 +22,7 @@ import java.util.function.BooleanSupplier;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
-import java8.util.concurrent.CompletionException;
+import java.util.concurrent.CompletionException;
 
 import okhttp3.WebSocket;
 import org.junit.Before;

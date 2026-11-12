@@ -14,7 +14,6 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
-import java8.util.concurrent.CompletableFuture;
 import okhttp3.WebSocket;
 
 
@@ -468,7 +467,7 @@ final class AuthRefresh {
         }
         // The getter may never answer, so the fetch is bounded by the client timeout. A late answer is ignored.
         // A getter which throws fails the fetch as an error does, so the refresh still completes.
-        CompletableFuture<String> fetched = new CompletableFuture<>();
+        CallFuture<String> fetched = new CallFuture<>();
         try {
             timerTokenGetter().getConnectionToken(new ConnectionTokenEvent(), (Throwable err, String token) -> {
                 if (err != null) {
@@ -480,8 +479,9 @@ final class AuthRefresh {
         } catch (RuntimeException | Error e) {
             fetched.completeExceptionally(e);
         }
-        fetched.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS)
-                .whenComplete((String token, Throwable err) -> runOnExecutorOrInline(() -> onTokenFetched(transport, generation, session, Extensions.unwrapCompletion(err), token)));
+        // The client timeout fails the fetch, and one listener delivers the outcome, as the other calls do.
+        host.settle(fetched, (String token) -> runOnExecutorOrInline(() -> onTokenFetched(transport, generation, session, null, token)),
+                (Throwable err) -> runOnExecutorOrInline(() -> onTokenFetched(transport, generation, session, Extensions.unwrapCompletion(err), null)));
     }
 
 
@@ -690,16 +690,9 @@ final class AuthRefresh {
                 .setRefresh(req)
                 .build();
 
-        CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
-        // One stage delivers the outcome, so a callback which throws is never called a second time.
-        f.orTimeout(host.timeoutMillis(), TimeUnit.MILLISECONDS).handle((Protocol.Reply reply, Throwable e) -> {
-            if (e != null) {
-                runOnExecutorOrInline(() -> {
-                    host.cleanCommand(cmd);
-                    cb.onDone(Extensions.unwrapCompletion(e), null);
-                });
-                return null;
-            }
+        CallFuture<Protocol.Reply> f = new CallFuture<>();
+        // One listener delivers the outcome, so a callback which throws is never called a second time.
+        host.settle(f, (Protocol.Reply reply) -> {
             host.cleanCommand(cmd);
             if (reply.getError().getCode() != 0) {
                 cb.onDone(host.replyError(reply), null);
@@ -707,13 +700,15 @@ final class AuthRefresh {
                 Protocol.RefreshResult replyResult = reply.getRefresh();
                 cb.onDone(null, replyResult);
             }
-            return null;
-        });
+        }, (Throwable e) -> runOnExecutorOrInline(() -> {
+            host.cleanCommand(cmd);
+            cb.onDone(e, null);
+        }));
 
         try {
             host.enqueueCommand(cmd, f);
         } catch (RuntimeException e) {
-            // The command could not be sent: the stage above delivers the failure once, as it does a failed reply.
+            // The command could not be sent: the listener above delivers the failure once, as it does a failed reply.
             f.completeExceptionally(e);
         }
     }

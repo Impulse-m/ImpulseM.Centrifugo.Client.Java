@@ -1,6 +1,9 @@
 Unreleased
 ==========
 
+* From upstream 0.8.1: the client no longer depends on `streamsupport-minifuture`. An application which excluded that module from the dependency can drop the exclusion.
+* A `CompletionException` of the JDK which a token getter or a `TokenExchange` callback reports is unwrapped to its cause, as the one of streamsupport is.
+* A refresh callback which throws on a successful refresh is reported to `onError` as an `UnclassifiedError`. Before, the exception was dropped.
 * Token exchange: `Options.setTokenExchange` lets the client obtain and renew its connection token over the connection, from a refresh token the application persists through `TokenExchange` (`load`, `store`, `exchange`). The anonymous connect is completed by an exchange on the same socket before the connection is reported connected, and every rotated refresh token is stored before its access token is used. Exclusive with `setTokenGetter`: a client created with both throws `IllegalArgumentException`.
 * With a token exchange the connection token is renewed at a random moment between 70% and 90% of its TTL, so connections which started together spread their renewals. `TokenExchange.earlyRenewal()` widens the window to 60% to 90%. Issuers can add TTL jitter of their own on top of it. Without the option the refresh timer runs at the full TTL, as before.
 * A failed timer token fetch or refresh is retried with a delay which doubles per failure in a row, up to `Options.setTokenRetryCap`. By default the cap is 300000 ms (5 minutes), so a getter which keeps failing no longer gets a retry every 10 to 20 seconds. A value at or below 20000 restores the flat retry. A successful refresh restarts the delay.
@@ -45,6 +48,11 @@ Unreleased
 * A delta publication which arrives with no base to apply it to is an error: it is reported as an `UnclassifiedError`, and the client disconnects with code 2 (`bad protocol`).
 * `Subscription.subscribe()` on a subscription removed from the client throws `IllegalStateException`.
 * An unsubscribe whose reply carries an error, or which times out while the client is connected, disconnects the client with reason `unsubscribe error` and reconnects it, so the server starts from a clean state.
+
+0.8.1
+=====
+
+* Remove the `streamsupport-minifuture` dependency (GPL-2.0 with Classpath Exception). Pending calls now use a small internal future. The public API and the supported Android versions do not change.
 
 0.3.1
 =====

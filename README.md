@@ -59,14 +59,6 @@ repositories {
 
 Released versions are listed in [GitHub Releases](https://github.com/Impulse-m/ImpulseM.Centrifugo.Client.Java/releases). Each release is also available in the Maven repository above, with sources and Javadoc jars alongside the library.
 
-This library depends on `streamsupport-minifuture`. In case your project has a dependency to `streamsupport-cfuture` and you have a class name conflicts, you can exclude minifuture safely. Example for Gradle:
-
-```
-implementation('com.github.Impulse-m:ImpulseM.Centrifugo.Client.Java:{version}') {
-    exclude group: 'net.sourceforge.streamsupport', module: 'streamsupport-minifuture'
-}
-```
-
 ## Javadoc
 
 Javadoc is published as `ImpulseM.Centrifugo.Client.Java-{version}-javadoc.jar` in the Maven repository above.

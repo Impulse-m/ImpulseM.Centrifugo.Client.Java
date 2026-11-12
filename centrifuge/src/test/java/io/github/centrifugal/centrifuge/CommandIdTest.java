@@ -1,9 +1,10 @@
 package io.github.centrifugal.centrifuge;
 
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
-import java8.util.concurrent.CompletableFuture;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
@@ -28,7 +29,9 @@ public class CommandIdTest extends RpcTestBase {
         Client c = newClient(new Options());
         connect(c);
         final int id = (int) 0x80000001L;
-        CompletableFuture<Protocol.Reply> future = new CompletableFuture<>();
+        CallFuture<Protocol.Reply> future = new CallFuture<>();
+        AtomicReference<Protocol.Reply> answer = new AtomicReference<>();
+        future.whenComplete((Protocol.Reply reply, Throwable error) -> answer.set(reply));
         CompletableFuture<Void> routed = new CompletableFuture<>();
         c.getExecutor().execute(() -> {
             try {
@@ -42,6 +45,6 @@ public class CommandIdTest extends RpcTestBase {
         routed.get(WAIT_MILLIS, TimeUnit.MILLISECONDS);
 
         assertTrue("the reply above 2^31 completed its call", future.isDone());
-        assertEquals(id, future.get().getId());
+        assertEquals(id, answer.get().getId());
     }
 }

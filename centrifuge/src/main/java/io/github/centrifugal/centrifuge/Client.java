@@ -28,7 +28,6 @@ import javax.net.ssl.X509TrustManager;
 import io.github.centrifugal.centrifuge.internal.backoff.Backoff;
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
-import java8.util.concurrent.CompletableFuture;
 import okhttp3.Credentials;
 import okhttp3.Headers;
 import okhttp3.OkHttpClient;
@@ -59,7 +58,7 @@ public class Client {
     String token;
     private com.google.protobuf.ByteString data;
     final EventListener listener;
-    final Map<Integer, CompletableFuture<Protocol.Reply>> futures = new ConcurrentHashMap<>();
+    final Map<Integer, CallFuture<Protocol.Reply>> futures = new ConcurrentHashMap<>();
     // The attempts which settled locally and are kept only for their late replies.
     final Set<Integer> lateAttempts = Collections.newSetFromMap(new ConcurrentHashMap<Integer, Boolean>());
     private final Map<Integer, Protocol.Command> connectCommands = new ConcurrentHashMap<>();
@@ -431,7 +430,7 @@ public class Client {
             this.executor.submit(() -> {
                 // Tear down the connection synchronously on the executor thread
                 // so any future-cleanup tasks scheduled by processDisconnect
-                // (e.g. orTimeout/exceptionally re-submits) get queued before
+                // (e.g. re-submits from call error handlers) get queued before
                 // we mark the executor shutdown.
                 WebSocket last = Client.this.ws;
                 Client.this.auth.invalidateTimerFetch();
@@ -551,7 +550,7 @@ public class Client {
 
     private void failPendingCalls() {
         // From a copy: a failure handler may register a new call.
-        for (CompletableFuture<Protocol.Reply> f : new ArrayList<>(this.futures.values())) {
+        for (CallFuture<Protocol.Reply> f : new ArrayList<>(this.futures.values())) {
             f.completeExceptionally(new IOException());
         }
     }
@@ -914,8 +913,8 @@ public class Client {
      * handler got the timeout as a second callback, and it failed a call on
      * its own thread although the reply was already waiting.
      */
-    <T> void settle(CompletableFuture<T> f, java8.util.function.Consumer<T> onResult,
-                    java8.util.function.Function<Throwable, Void> onError) {
+    <T> void settle(CallFuture<T> f, CallFuture.Consumer<T> onResult,
+                    CallFuture.Consumer<Throwable> onError) {
         final long due = nowMs() + this.opts.getTimeout();
         ScheduledFuture<?> timer;
         try {
@@ -933,8 +932,7 @@ public class Client {
                 if (error == null) {
                     onResult.accept(result);
                 } else {
-                    onError.apply(error instanceof java8.util.concurrent.CompletionException && error.getCause() != null
-                            ? error.getCause() : error);
+                    onError.accept(error);
                 }
             } catch (Throwable t) {
                 // E.g. an app callback that threw: reported, never called again.
@@ -943,7 +941,7 @@ public class Client {
         });
     }
 
-    private <T> void expire(CompletableFuture<T> f, long due) {
+    private <T> void expire(CallFuture<T> f, long due) {
         if (f.isDone()) {
             return;
         }
@@ -1038,7 +1036,7 @@ public class Client {
                 .setSubscribe(req)
                 .build();
 
-        CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
+        CallFuture<Protocol.Reply> f = new CallFuture<>();
         this.futures.put(cmd.getId(), f);
         this.settle(f, reply -> {
             if (Client.this.getState() != ClientState.CONNECTED) {
@@ -1058,7 +1056,6 @@ public class Client {
                 Client.this.futures.remove(cmd.getId());
                 Client.this.processDisconnect(CONNECTING_SUBSCRIBE_TIMEOUT, "subscribe timeout", true);
             });
-            return null;
         });
         this.ws.send(ByteString.of(this.serializeCommand(cmd)));
     }
@@ -1098,7 +1095,7 @@ public class Client {
                 .build();
 
         final WebSocket unsubscribeWs = this.ws;
-        CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
+        CallFuture<Protocol.Reply> f = new CallFuture<>();
         this.futures.put(cmd.getId(), f);
         this.settle(f, reply -> {
             this.futures.remove(cmd.getId());
@@ -1116,7 +1113,6 @@ public class Client {
                 Client.this.futures.remove(cmd.getId());
                 Client.this.processDisconnect(CONNECTING_UNSUBSCRIBE_ERROR, "unsubscribe error", true);
             });
-            return null;
         });
 
         this.ws.send(ByteString.of(this.serializeCommand(cmd)));
@@ -1369,7 +1365,7 @@ public class Client {
             Protocol.Command cmd = entry.getValue();
             boolean sent = this.ws.send(ByteString.of(this.serializeCommand(cmd)));
             if (!sent) {
-                CompletableFuture<Protocol.Reply> f = this.futures.get(cmd.getId());
+                CallFuture<Protocol.Reply> f = this.futures.get(cmd.getId());
                 if (f != null) {
                     f.completeExceptionally(new IOException());
                 }
@@ -1381,7 +1377,7 @@ public class Client {
 
         for (Map.Entry<Integer, Protocol.Command> entry : this.connectAsyncCommands.entrySet()) {
             Protocol.Command cmd = entry.getValue();
-            CompletableFuture<Protocol.Reply> f = this.futures.get(cmd.getId());
+            CallFuture<Protocol.Reply> f = this.futures.get(cmd.getId());
             boolean sent = this.ws.send(ByteString.of(this.serializeCommand(cmd)));
             if (!sent) {
                 if (f != null) {
@@ -1434,7 +1430,7 @@ public class Client {
                 .build();
 
         final WebSocket connectWs = this.ws;
-        CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
+        CallFuture<Protocol.Reply> f = new CallFuture<>();
         this.futures.put(cmd.getId(), f);
         this.settle(f, reply -> {
             this.futures.remove(cmd.getId());
@@ -1444,8 +1440,9 @@ public class Client {
                 this.handleDispatchError(e);
             }
         }, e -> {
-            // A timeout completes the future on the CompletableFuture delay
-            // scheduler thread - hop to the executor like other command failures.
+            // Deferred to a separate executor task: a failure from failPendingCalls()
+            // arrives in the middle of processDisconnect, which must finish before
+            // this handler reports the error and disconnects again.
             this.executor.submit(() -> {
                 Client.this.futures.remove(cmd.getId());
                 // Failed because the connection was already torn down (disconnect
@@ -1457,7 +1454,6 @@ public class Client {
                 Client.this.handleConnectionError(e);
                 Client.this.processDisconnect(CONNECTING_TRANSPORT_CLOSED, "transport closed", true);
             });
-            return null;
         });
 
         this.ws.send(ByteString.of(this.serializeCommand(cmd)));
@@ -1484,7 +1480,7 @@ public class Client {
         this.watchdog.markReply();
         // A command id is unsigned and never 0, so an id above 2^31 is negative as int and still answers its command.
         if (reply.getId() != 0) {
-            CompletableFuture<Protocol.Reply> cf = this.futures.get(reply.getId());
+            CallFuture<Protocol.Reply> cf = this.futures.get(reply.getId());
             // Only a reply which answers a pending command sets the server time: a late reply to a settled call does not.
             if (cf != null) {
                 if (!this.lateAttempts.contains(reply.getId())) {
@@ -1698,7 +1694,7 @@ public class Client {
                 .setSend(req)
                 .build();
 
-        CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
+        CallFuture<Protocol.Reply> f = new CallFuture<>();
         this.futures.put(cmd.getId(), f);
         this.settle(f, reply -> {
             this.cleanCommandFuture(cmd);
@@ -1708,7 +1704,6 @@ public class Client {
                 this.cleanCommandFuture(cmd);
                 cb.onDone(e);
             });
-            return null;
         });
 
         if (this.getState() != ClientState.CONNECTED) {
@@ -1723,7 +1718,7 @@ public class Client {
         }
     }
 
-    void enqueueCommandFuture(Protocol.Command cmd, CompletableFuture<Protocol.Reply> f) {
+    void enqueueCommandFuture(Protocol.Command cmd, CallFuture<Protocol.Reply> f) {
         this.futures.put(cmd.getId(), f);
         if (this.getState() != ClientState.CONNECTED) {
             this.connectCommands.put(cmd.getId(), cmd);
@@ -1821,7 +1816,7 @@ public class Client {
                 .setPublish(req)
                 .build();
 
-        CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
+        CallFuture<Protocol.Reply> f = new CallFuture<>();
         this.settle(f, reply -> {
             this.cleanCommandFuture(cmd);
             if (reply.getError().getCode() != 0) {
@@ -1835,7 +1830,6 @@ public class Client {
                 Client.this.cleanCommandFuture(cmd);
                 cb.onDone(e, null);
             });
-            return null;
         });
 
         this.enqueueCommandFuture(cmd, f);
@@ -1867,7 +1861,7 @@ public class Client {
                 .setHistory(req)
                 .build();
 
-        CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
+        CallFuture<Protocol.Reply> f = new CallFuture<>();
         this.settle(f, reply -> {
             this.cleanCommandFuture(cmd);
             if (reply.getError().getCode() != 0) {
@@ -1895,7 +1889,6 @@ public class Client {
                 Client.this.cleanCommandFuture(cmd);
                 cb.onDone(e, null);
             });
-            return null;
         });
 
         this.enqueueCommandFuture(cmd, f);
@@ -1915,7 +1908,7 @@ public class Client {
                 .setPresence(req)
                 .build();
 
-        CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
+        CallFuture<Protocol.Reply> f = new CallFuture<>();
         this.settle(f, reply -> {
             this.cleanCommandFuture(cmd);
             if (reply.getError().getCode() != 0) {
@@ -1936,7 +1929,6 @@ public class Client {
                 Client.this.cleanCommandFuture(cmd);
                 cb.onDone(e, null);
             });
-            return null;
         });
 
         this.enqueueCommandFuture(cmd, f);
@@ -1956,7 +1948,7 @@ public class Client {
                 .setPresenceStats(req)
                 .build();
 
-        CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
+        CallFuture<Protocol.Reply> f = new CallFuture<>();
         this.settle(f, reply -> {
             this.cleanCommandFuture(cmd);
             if (reply.getError().getCode() != 0) {
@@ -1973,7 +1965,6 @@ public class Client {
                 Client.this.cleanCommandFuture(cmd);
                 cb.onDone(e, null);
             });
-            return null;
         });
 
         this.enqueueCommandFuture(cmd, f);
@@ -2003,7 +1994,7 @@ public class Client {
                 .setSubRefresh(req)
                 .build();
 
-        CompletableFuture<Protocol.Reply> f = new CompletableFuture<>();
+        CallFuture<Protocol.Reply> f = new CallFuture<>();
         this.settle(f, reply -> {
             this.cleanCommandFuture(cmd);
             if (reply.getError().getCode() != 0) {
@@ -2017,7 +2008,6 @@ public class Client {
                 Client.this.cleanCommandFuture(cmd);
                 cb.onDone(e, null);
             });
-            return null;
         });
 
         this.enqueueCommandFuture(cmd, f);

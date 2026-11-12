@@ -6,8 +6,6 @@ import java.util.regex.Pattern;
 
 import io.github.centrifugal.centrifuge.internal.protocol.Protocol;
 
-import java8.util.concurrent.CompletionException;
-
 
 /**
  * Helpers for the protocol extensions of the server fork: connect flag bits and
@@ -34,6 +32,12 @@ final class Extensions {
     static final String RPC_RETRY_LATER = "later";
 
     private static final String UNSUPPORTED_RPC_MESSAGE = "rpc headers are not supported by the server";
+
+    // The wrappers of a failed stage, matched by name: the JDK class is missing on Android before API 24, where an
+    // instanceof would fail, and the streamsupport class is one an application may still use, though the client
+    // no longer depends on it.
+    private static final String JDK_COMPLETION_EXCEPTION = "java.util.concurrent.CompletionException";
+    private static final String STREAMSUPPORT_COMPLETION_EXCEPTION = "java8.util.concurrent.CompletionException";
 
     private static final Pattern INSTANCE_PATTERN = Pattern.compile("[A-Za-z0-9_-]{22,64}");
 
@@ -95,11 +99,15 @@ final class Extensions {
 
 
     /**
-     * The failure a dependent stage wrapped in a {@link CompletionException}, or the failure itself
-     * when nothing was wrapped.
+     * The cause of a CompletionException that an application passed in, of the JDK or of streamsupport, or the
+     * failure itself when it is not one. The client itself never wraps its failures.
      */
     static Throwable unwrapCompletion(Throwable error) {
-        if (error instanceof CompletionException && error.getCause() != null) {
+        if (error == null || error.getCause() == null) {
+            return error;
+        }
+        String name = error.getClass().getName();
+        if (JDK_COMPLETION_EXCEPTION.equals(name) || STREAMSUPPORT_COMPLETION_EXCEPTION.equals(name)) {
             return error.getCause();
         }
         return error;
